@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "common",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/skandragon/freenet-freebird"
+
+[workspace.dependencies]
+# Serialization
+ciborium = "0.2.2"
+serde = { version = "1.0", features = ["derive"] }
+
+# Cryptography
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }
+blake3 = "1.5"
+bs58 = "0.5"
+ghostkey_lib = "0.2.0"
+
+# getrandom: NEVER enable a backend feature ("js") at the workspace level.
+# Contract and delegate WASM runs under wasmtime, which cannot resolve
+# wasm-bindgen placeholder imports (see freenet/river#241). Crates that
+# compile ghostkey_lib to wasm32 declare their own getrandom dep with
+# features = ["custom"] and never register a backend — the verification
+# paths call no RNG.
+getrandom = { version = "0.2" }
+
+# Utilities
+data-encoding = "2"
+base64 = "0.22"
+
+# Freenet
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
+freenet-scaffold = "0.2.2"
+freenet-scaffold-macro = "0.2.2"
+
+# Internal
+freebird-core = { path = "common" }
+
+# Dev
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+rand = "0.8.5"
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.release.package."*"]
+opt-level = 'z'
+
+# Used by `dx build --release` for the UI; contracts/delegates build with
+# --profile release so their bytes (and keys) are unaffected by this.
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1

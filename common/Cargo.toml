@@ -1,0 +1,30 @@
+[package]
+name = "freebird-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core library for Freebird - microblogging on Freenet"
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+bs58.workspace = true
+ghostkey_lib.workspace = true
+data-encoding.workspace = true
+freenet-stdlib.workspace = true
+freenet-scaffold.workspace = true
+freenet-scaffold-macro.workspace = true
+
+[features]
+default = []
+# Mint full master→notary→ghostkey chains for tests. Pulls rand via
+# ghostkey_lib's keygen paths — native-only; never enable in a wasm build.
+test-fixtures = []
+
+[dev-dependencies]
+proptest.workspace = true
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
