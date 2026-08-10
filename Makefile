@@ -17,10 +17,11 @@ WASM_DIR := target/$(WASM_TARGET)/release
 all: test contracts delegate ui
 
 contracts:
-	$(CARGO) build -p feed-contract -p inbox-contract --target $(WASM_TARGET) --release
+	$(CARGO) build -p feed-contract -p inbox-contract -p avatar-contract --target $(WASM_TARGET) --release
 	$(MAKE) check-imports W=$(WASM_DIR)/feed_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/inbox_contract.wasm
-	cp $(WASM_DIR)/feed_contract.wasm $(WASM_DIR)/inbox_contract.wasm ui/contracts/
+	$(MAKE) check-imports W=$(WASM_DIR)/avatar_contract.wasm
+	cp $(WASM_DIR)/feed_contract.wasm $(WASM_DIR)/inbox_contract.wasm $(WASM_DIR)/avatar_contract.wasm ui/contracts/
 
 delegate:
 	$(CARGO) build -p freebird-delegate --target $(WASM_TARGET) --release

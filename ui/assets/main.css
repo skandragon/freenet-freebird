@@ -113,6 +113,7 @@ button.link {
   vertical-align: -0.35rem;
 }
 .avatar.lg { width: 2.2rem; height: 2.2rem; vertical-align: -0.6rem; }
+img.avatar { object-fit: cover; }
 .muted { color: var(--muted); font-size: 0.85rem; }
 .error { color: var(--danger); font-size: 0.85rem; }
 .replying-to { margin: 0.1rem 0; }

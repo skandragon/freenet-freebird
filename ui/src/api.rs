@@ -132,6 +132,14 @@ fn feed_container(author: &VerifyingKey) -> ContractContainer {
     )))
 }
 
+fn avatar_container(author: &VerifyingKey) -> ContractContainer {
+    let params = freebird_core::to_cbor(&keys::avatar_params(author)).expect("params");
+    ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(keys::AVATAR_CONTRACT_WASM.to_vec())),
+        Parameters::from(params),
+    )))
+}
+
 fn inbox_container(owner: &VerifyingKey) -> ContractContainer {
     let params = freebird_core::to_cbor(&keys::inbox_params(owner)).expect("params");
     ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
@@ -181,6 +189,39 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
         key: keys::inbox_instance_id(&vk),
         return_contract_code: false,
         subscribe: true,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
+/// GET someone's avatar. Write-rarely contract: no subscription, session
+/// cache in AVATARS (issue #10).
+pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
+    let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
+    AVATARS.write().entry(author).or_insert(None);
+    track(keys::avatar_key(&vk), TrackedKind::Avatar(author));
+    send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: keys::avatar_instance_id(&vk),
+        return_contract_code: false,
+        subscribe: false,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
+/// PUT our own avatar; Put creates the contract on first upload and the
+/// contract's LWW merge handles every later one.
+pub async fn put_own_avatar(
+    author: &VerifyingKey,
+    avatar: &freebird_core::avatar::AuthorizedAvatar,
+) -> Result<(), String> {
+    let state = freebird_core::to_cbor(avatar)?;
+    track(keys::avatar_key(author), TrackedKind::Avatar(author.to_bytes()));
+    send(ClientRequest::ContractOp(ContractRequest::Put {
+        contract: avatar_container(author),
+        state: WrappedState::new(state),
+        related_contracts: RelatedContracts::default(),
+        subscribe: false,
         blocking_subscribe: false,
     }))
     .await
@@ -378,6 +419,29 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                 }
             }
         }
+        TrackedKind::Avatar(author) => {
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+            // State and delta are both one full signed avatar; the blob is
+            // untrusted input — full check before it ever reaches an <img>.
+            match freebird_core::from_cbor::<freebird_core::avatar::AuthorizedAvatar>(bytes) {
+                Ok(incoming) => {
+                    if let Err(e) = freebird_core::avatar::check_avatar(&incoming, &vk) {
+                        log(&format!("rejected invalid avatar for {key}: {e}"));
+                        return;
+                    }
+                    let mut avatars = AVATARS.write();
+                    let entry = avatars.entry(author).or_insert(None);
+                    let newer = entry.as_ref().is_none_or(|held| {
+                        freebird_core::avatar::order_key(&incoming)
+                            > freebird_core::avatar::order_key(held)
+                    });
+                    if newer {
+                        *entry = Some(incoming);
+                    }
+                }
+                Err(e) => log(&format!("bad avatar state: {e}")),
+            }
+        }
         TrackedKind::Inbox(author) => {
             let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
             let params = keys::inbox_params(&vk);
@@ -489,6 +553,7 @@ fn dispatch_ghostkey(payload: &[u8]) {
 pub enum TrackedKind {
     Feed([u8; 32]),
     Inbox([u8; 32]),
+    Avatar([u8; 32]),
 }
 
 pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> =

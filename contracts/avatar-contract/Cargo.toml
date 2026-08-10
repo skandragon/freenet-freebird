@@ -1,0 +1,29 @@
+[package]
+name = "avatar-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freebird per-author avatar contract"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[dependencies]
+serde.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+freenet-stdlib.workspace = true
+freebird-core.workspace = true
+# See feed-contract: ghostkey_lib (via freebird-core) pulls rand; "custom"
+# compiles a stub getrandom backend so wasmtime can instantiate the module
+# (freenet/river#241). Do NOT add `rand` or a getrandom backend feature here.
+getrandom = { workspace = true, features = ["custom"] }
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

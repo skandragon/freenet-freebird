@@ -171,6 +171,26 @@ pub async fn publish_profile(name: String, bio: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Sign and publish a profile picture to our avatar contract (issue #10).
+/// The caller supplies bytes already inside the size cap.
+pub async fn publish_avatar(content_type: String, data: Vec<u8>) -> Result<(), String> {
+    let sk = signing_key()?;
+    let avatar = freebird_core::avatar::AvatarV1 {
+        content_type,
+        data,
+        time: keys::now_ms(),
+    };
+    let authorized = freebird_core::avatar::AuthorizedAvatar::new(avatar, &sk);
+    // Same check the contract runs — fail here with a real message instead
+    // of a rejected update.
+    freebird_core::avatar::check_avatar(&authorized, &sk.verifying_key())?;
+    api::put_own_avatar(&sk.verifying_key(), &authorized).await?;
+    AVATARS
+        .write()
+        .insert(sk.verifying_key().to_bytes(), Some(authorized));
+    Ok(())
+}
+
 pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
     let sk = signing_key()?;
     let current = own_feed().ok_or("feed not loaded")?;

@@ -1,6 +1,7 @@
 //! Key material and contract-address derivation.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use freebird_core::avatar::AvatarParametersV1;
 use freebird_core::feed::{FeedParametersV1, MAX_FUTURE_MS};
 use freebird_core::inbox::InboxParametersV1;
 use freebird_core::types::{AuthorizedPost, PostId, PostV1};
@@ -9,6 +10,7 @@ use ghostkey_lib::armorable::Armorable;
 
 pub const FEED_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/feed_contract.wasm");
 pub const INBOX_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract.wasm");
+pub const AVATAR_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/avatar_contract.wasm");
 pub const FREEBIRD_DELEGATE_WASM: &[u8] = include_bytes!("../contracts/freebird_delegate.wasm");
 
 /// The Freenet Ghost Key master verifying key — the compiled-in trust anchor
@@ -32,6 +34,10 @@ pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV1 {
     }
 }
 
+pub fn avatar_params(author: &VerifyingKey) -> AvatarParametersV1 {
+    AvatarParametersV1 { author: *author }
+}
+
 fn contract_key(wasm: &[u8], params_cbor: Vec<u8>) -> ContractKey {
     ContractKey::from_params_and_code(
         Parameters::from(params_cbor),
@@ -49,12 +55,21 @@ pub fn inbox_key(owner: &VerifyingKey) -> ContractKey {
     contract_key(INBOX_CONTRACT_WASM, params)
 }
 
+pub fn avatar_key(author: &VerifyingKey) -> ContractKey {
+    let params = freebird_core::to_cbor(&avatar_params(author)).expect("params serialize");
+    contract_key(AVATAR_CONTRACT_WASM, params)
+}
+
 pub fn feed_instance_id(author: &VerifyingKey) -> ContractInstanceId {
     *feed_key(author).id()
 }
 
 pub fn inbox_instance_id(owner: &VerifyingKey) -> ContractInstanceId {
     *inbox_key(owner).id()
+}
+
+pub fn avatar_instance_id(author: &VerifyingKey) -> ContractInstanceId {
+    *avatar_key(author).id()
 }
 
 #[cfg(target_arch = "wasm32")]

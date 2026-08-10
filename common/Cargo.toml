@@ -9,6 +9,7 @@ description = "Core library for Freebird - microblogging on Freenet"
 [dependencies]
 ciborium.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 ed25519-dalek.workspace = true
 blake3.workspace = true
 bs58.workspace = true

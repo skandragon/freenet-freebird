@@ -15,6 +15,7 @@ ciborium.workspace = true
 serde.workspace = true
 serde_json = "1"
 bs58.workspace = true
+base64.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand.workspace = true
 # Browser build: the js backend is fine here (and only here) — the UI runs
@@ -39,4 +40,7 @@ web-sys = { version = "0.3", features = [
     "console",
     "Navigator",
     "Clipboard",
+    "HtmlImageElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
 ] }

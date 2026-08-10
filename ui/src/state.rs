@@ -30,6 +30,12 @@ pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
 pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV1>> =
     Signal::global(BTreeMap::new);
 
+/// Avatars by author key. `None` value = fetched (or fetching) but absent —
+/// render the identicon. Write-rarely contract: fetch-on-view, no
+/// subscription, cached here for the session.
+pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>> =
+    Signal::global(BTreeMap::new);
+
 /// Result of asking the freebird delegate for `posting_key`:
 /// None = not answered yet; Some(None) = no account stored (onboard);
 /// Some(Some(seed)) = existing account.

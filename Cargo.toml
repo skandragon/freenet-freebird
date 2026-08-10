@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "common",
+    "contracts/avatar-contract",
     "contracts/feed-contract",
     "contracts/inbox-contract",
     "delegates/freebird-delegate",
@@ -18,6 +19,9 @@ repository = "https://github.com/skandragon/freenet-freebird"
 # Serialization
 ciborium = "0.2.2"
 serde = { version = "1.0", features = ["derive"] }
+# Compact CBOR byte strings for the avatar blob (Vec<u8> alone serializes as
+# an int array, roughly doubling wire size).
+serde_bytes = "0.11"
 
 # Cryptography
 ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }

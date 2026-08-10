@@ -52,6 +52,12 @@ pub fn short_key(author: &[u8; 32]) -> String {
     full.chars().take(8).collect()
 }
 
+/// Stable diff key for a post rendered in a list. Without keys Dioxus diffs
+/// positionally, so open reply/thread state sticks to the slot, not the post.
+fn post_key(author: &[u8; 32], id: &freebird_core::types::PostId) -> String {
+    format!("{}:{}", bs58::encode(author).into_string(), bs58::encode(id.0).into_string())
+}
+
 fn author_name(author: &[u8; 32]) -> String {
     FEEDS
         .read()
@@ -106,6 +112,106 @@ fn identicon_style(author: &[u8; 32]) -> String {
     let h1 = (((author[0] as u16) << 8 | author[1] as u16) % 360) as u16;
     let h2 = (h1 + 40 + (author[2] % 140) as u16) % 360;
     format!("background: linear-gradient(135deg, hsl({h1},65%,55%), hsl({h2},65%,38%))")
+}
+
+/// Profile picture with the identicon as fallback while loading or absent.
+/// Fetches the author's avatar contract on first view (session-cached).
+#[component]
+fn Avatar(author: [u8; 32], #[props(default)] lg: bool) -> Element {
+    use_effect(move || {
+        if !AVATARS.read().contains_key(&author) {
+            spawn(async move {
+                let _ = api::fetch_avatar(author).await;
+            });
+        }
+    });
+    let src = AVATARS.read().get(&author).cloned().flatten().map(|a| {
+        use base64::Engine;
+        format!(
+            "data:{};base64,{}",
+            a.avatar.content_type,
+            base64::engine::general_purpose::STANDARD.encode(&a.avatar.data)
+        )
+    });
+    let class = if lg { "avatar lg" } else { "avatar" };
+    match src {
+        Some(src) => rsx! { img { class: class, src: src, alt: "" } },
+        None => rsx! { span { class: class, style: identicon_style(&author) } },
+    }
+}
+
+/// Center-crop to a square, downscale to ≤256px, re-encode as JPEG so any
+/// normal photo lands under the avatar contract's size cap.
+#[cfg(target_arch = "wasm32")]
+async fn shrink_to_avatar(bytes: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+    use base64::Engine;
+    use wasm_bindgen::JsCast;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let mime = freebird_core::avatar::sniff_mime(&bytes)
+        .ok_or("not a png, jpeg, webp, or gif image")?;
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
+    let img: web_sys::HtmlImageElement = document
+        .create_element("img")
+        .map_err(|_| "create img")?
+        .dyn_into()
+        .map_err(|_| "img cast")?;
+    img.set_src(&format!("data:{mime};base64,{}", b64.encode(&bytes)));
+    wasm_bindgen_futures::JsFuture::from(img.decode())
+        .await
+        .map_err(|_| "image failed to decode")?;
+    let (w, h) = (img.natural_width(), img.natural_height());
+    if w == 0 || h == 0 {
+        return Err("empty image".into());
+    }
+    let side = w.min(h);
+    let out = side.min(256);
+    let canvas: web_sys::HtmlCanvasElement = document
+        .create_element("canvas")
+        .map_err(|_| "create canvas")?
+        .dyn_into()
+        .map_err(|_| "canvas cast")?;
+    canvas.set_width(out);
+    canvas.set_height(out);
+    let ctx: web_sys::CanvasRenderingContext2d = canvas
+        .get_context("2d")
+        .ok()
+        .flatten()
+        .ok_or("no 2d context")?
+        .dyn_into()
+        .map_err(|_| "context cast")?;
+    ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+        &img,
+        ((w - side) / 2) as f64,
+        ((h - side) / 2) as f64,
+        side as f64,
+        side as f64,
+        0.0,
+        0.0,
+        out as f64,
+        out as f64,
+    )
+    .map_err(|_| "draw failed")?;
+    // JPEG: the one canvas encoder every browser honors with a quality knob.
+    let url = canvas
+        .to_data_url_with_type_and_encoder_options("image/jpeg", &wasm_bindgen::JsValue::from_f64(0.85))
+        .map_err(|_| "encode failed")?;
+    let data = b64
+        .decode(
+            url.strip_prefix("data:image/jpeg;base64,")
+                .ok_or("unexpected canvas output")?,
+        )
+        .map_err(|e| format!("decode canvas output: {e}"))?;
+    if data.len() > freebird_core::avatar::MAX_AVATAR_BYTES {
+        return Err("image too large even after resizing".into());
+    }
+    Ok(("image/jpeg".into(), data))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn shrink_to_avatar(_bytes: Vec<u8>) -> Result<(String, Vec<u8>), String> {
+    Err("image processing unavailable".into())
 }
 
 fn is_verified(author: &[u8; 32]) -> bool {
@@ -325,7 +431,7 @@ fn Home() -> Element {
                 if let Some(target) = pending {
                     if Some(target) != own_author() {
                         div { class: "card follow-banner",
-                            span { class: "avatar", style: identicon_style(&target) }
+                            Avatar { author: target }
                             span {
                                 "Follow "
                                 strong { "{author_name(&target)}" }
@@ -450,6 +556,15 @@ fn Timeline() -> Element {
             })
             .collect();
         all.sort_by(|a, b| (b.1.post.time, b.1.post.id).cmp(&(a.1.post.time, a.1.post.id)));
+        // A reply whose parent is in the timeline is reachable via the
+        // parent's thread — showing it top-level too duplicates it.
+        let ids: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
+            all.iter().map(|(a, p)| (*a, p.post.id)).collect();
+        all.retain(|(_, p)| {
+            p.post
+                .in_reply_to
+                .is_none_or(|r| !ids.contains(&(r.author, r.post)))
+        });
         all.truncate(100);
         all
     };
@@ -460,7 +575,7 @@ fn Timeline() -> Element {
                 p { class: "muted", "Nothing here yet. Peep something above, or add an author's address in the Following box." }
             }
             for (author, post) in posts {
-                PostCard { author, post: post.clone() }
+                PostCard { key: "{post_key(&author, &post.post.id)}", author, post: post.clone() }
             }
         }
     }
@@ -491,7 +606,7 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost) -> Element {
     rsx! {
         article { class: "card post",
             div { class: "post-head",
-                span { class: "avatar", style: identicon_style(&author) }
+                Avatar { author }
                 strong { "{name}" }
                 if verified { span { class: "check", title: "Ghost Key verified", "✔" } }
                 span { class: "muted", "@{short_key(&author)} · {ago(post.post.time)}" }
@@ -522,8 +637,8 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost) -> Element {
 fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
     let post_id = freebird_core::types::PostId(post_id_bytes.clone().try_into().unwrap_or([0; 16]));
 
-    // Pointers targeting this post, resolved into (replier_key, post).
-    let replies: Vec<([u8; 32], Option<AuthorizedPost>)> = {
+    // Pointers targeting this post, resolved into (replier_key, reply_id, post).
+    let replies: Vec<([u8; 32], freebird_core::types::PostId, Option<AuthorizedPost>)> = {
         let inboxes = INBOXES.read();
         let feeds = FEEDS.read();
         inboxes
@@ -555,7 +670,7 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
                                 })
                                 .cloned()
                         });
-                        Some((replier, found))
+                        Some((replier, p.ptr.reply_post, found))
                     })
                     .collect()
             })
@@ -598,10 +713,12 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
                     p { class: "muted", "Checking for replies…" }
                 }
             }
-            for (replier, reply) in replies {
-                match reply {
-                    Some(post) => rsx! { PostCard { author: replier, post } },
-                    None => rsx! { p { class: "muted", "loading reply from @{short_key(&replier)}…" } },
+            for (replier, reply_id, reply) in replies {
+                div { key: "{post_key(&replier, &reply_id)}",
+                    match reply {
+                        Some(post) => rsx! { PostCard { author: replier, post } },
+                        None => rsx! { p { class: "muted", "loading reply from @{short_key(&replier)}…" } },
+                    }
                 }
             }
         }
@@ -617,7 +734,7 @@ fn MyAccount() -> Element {
     rsx! {
         section { class: "card",
             h3 {
-                span { class: "avatar", style: identicon_style(&author) }
+                Avatar { author }
                 " {author_name(&author)}"
                 if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
             }
@@ -645,7 +762,7 @@ fn FollowBox() -> Element {
             for f in follows {
                 div { class: "follow-row",
                     span {
-                        span { class: "avatar", style: identicon_style(&f) }
+                        Avatar { author: f }
                         " {author_name(&f)}"
                         if is_verified(&f) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                     }
@@ -820,6 +937,8 @@ fn ProfilePage() -> Element {
     let mut name = use_signal(String::new);
     let mut bio = use_signal(String::new);
     let mut edit_error = use_signal(String::new);
+    let mut pic_busy = use_signal(|| false);
+    let mut pic_error = use_signal(String::new);
 
     let Some(author) = own_author() else {
         return rsx! {};
@@ -834,7 +953,7 @@ fn ProfilePage() -> Element {
             }
             section { class: "card",
                 h2 {
-                    span { class: "avatar lg", style: identicon_style(&author) }
+                    Avatar { author, lg: true }
                     " {author_name(&author)}"
                     if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                 }
@@ -843,6 +962,35 @@ fn ProfilePage() -> Element {
                         p { "{f.profile.profile.bio}" }
                     }
                 }
+                p { class: "muted keyline", "Profile picture (shown on your posts; auto-cropped square):" }
+                input {
+                    r#type: "file",
+                    accept: "image/png,image/jpeg,image/webp,image/gif",
+                    aria_label: "Upload profile picture",
+                    disabled: *pic_busy.read(),
+                    onchange: move |e| {
+                        let Some(file) = e.files().into_iter().next() else { return };
+                        pic_error.set(String::new());
+                        pic_busy.set(true);
+                        spawn(async move {
+                            let result = async {
+                                let bytes = file
+                                    .read_bytes()
+                                    .await
+                                    .map_err(|e| format!("read failed: {e}"))?;
+                                let (ct, data) = shrink_to_avatar(bytes.to_vec()).await?;
+                                actions::publish_avatar(ct, data).await
+                            }
+                            .await;
+                            if let Err(e) = result {
+                                pic_error.set(e);
+                            }
+                            pic_busy.set(false);
+                        });
+                    },
+                }
+                if *pic_busy.read() { p { class: "muted", "Uploading picture…" } }
+                if !pic_error.read().is_empty() { p { class: "error", "{pic_error}" } }
                 p { class: "muted keyline", "Your address:" }
                 code { class: "keyline", "{full_key}" }
                 CopyButton { text: full_key.clone(), label: "copy address" }
