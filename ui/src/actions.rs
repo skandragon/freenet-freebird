@@ -8,13 +8,20 @@ use freebird_core::delegate_api::FreebirdDelegateRequest;
 use freebird_core::feed::{AttestationSlot, FeedStateV1, FeedStateV1Delta, PostsV1};
 use freebird_core::inbox::{AuthorizedReplyPointer, InboxStateV1Delta, ReplierCred, ReplyPointer};
 use freebird_core::types::{
-    AuthorizedFollows, AuthorizedProfile, FollowsV1, PostRef, ProfileV1,
+    AuthorizedFollows, AuthorizedProfile, FollowsV1, PostId, PostRef, ProfileV1,
 };
 
 use crate::api;
 use crate::ghostkey::{self, GhostkeyRequest};
 use crate::keys;
 use crate::state::*;
+
+/// Sentinel `target_post` marking an inbox pointer as a follow announcement
+/// (issue #12), not a reply. Reuses the deployed reply-pointer shape — the
+/// contract never checks that target_post names a real post — so the inbox
+/// contract bytes (and every derived address) stay unchanged. Real PostIds
+/// are blake3 output; colliding with this ASCII tag is a 2^-128 event.
+pub const FOLLOW_ANNOUNCE_TARGET: PostId = PostId(*b"freebird:follow!");
 
 fn empty_delta() -> FeedStateV1Delta {
     FeedStateV1Delta {
@@ -105,17 +112,22 @@ pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Resu
 
     if let Some(target) = in_reply_to {
         if let Some(att) = own_feed().and_then(|f| f.attestation.0) {
-            send_reply_pointer(&sk, att, target, &post).await?;
+            send_inbox_pointer(&sk, att, target.author, target.post, post.post.id, post.post.time)
+                .await?;
         }
     }
     Ok(())
 }
 
-async fn send_reply_pointer(
+/// Drop an attested pointer into `target_author`'s inbox: a reply pointer, or
+/// a follow announcement when `target_post` is FOLLOW_ANNOUNCE_TARGET.
+async fn send_inbox_pointer(
     sk: &SigningKey,
     attestation: AttestationV1,
-    target: PostRef,
-    reply: &freebird_core::types::AuthorizedPost,
+    target_author: [u8; 32],
+    target_post: PostId,
+    reply_post: PostId,
+    time: u64,
 ) -> Result<(), String> {
     let fingerprint = attestation.fingerprint();
     let replier = sk.verifying_key().to_bytes();
@@ -126,16 +138,16 @@ async fn send_reply_pointer(
     let ptr = ReplyPointer {
         replier,
         fingerprint,
-        target_post: target.post,
-        reply_post: reply.post.id,
-        time: reply.post.time,
+        target_post,
+        reply_post,
+        time,
     };
     let authorized = AuthorizedReplyPointer::new(ptr, sk);
     let delta = InboxStateV1Delta {
         creds: Some([(replier, cred)].into_iter().collect()),
         pointers: Some(vec![authorized]),
     };
-    api::update_inbox(target.author, delta).await
+    api::update_inbox(target_author, delta).await
 }
 
 fn apply_own_posts(posts: Vec<freebird_core::types::AuthorizedPost>) {
@@ -213,6 +225,19 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
     }
     if follow {
         api::fetch_feed(target).await.ok();
+        // Announce the follow into the target's inbox (#12). Best-effort
+        // hint: their UI re-verifies against our signed follow list before
+        // showing us. Anonymous accounts (no attestation) follow invisibly.
+        if let Some(att) = current.attestation.0.clone() {
+            let time = keys::now_ms();
+            let announce_id = PostId::compute(&sk.verifying_key(), time, "follow", &None);
+            if let Err(e) =
+                send_inbox_pointer(&sk, att, target, FOLLOW_ANNOUNCE_TARGET, announce_id, time)
+                    .await
+            {
+                api::log(&format!("follow announcement failed: {e}"));
+            }
+        }
     }
     Ok(())
 }
