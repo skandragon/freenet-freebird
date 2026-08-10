@@ -223,6 +223,56 @@ fn is_verified(author: &[u8; 32]) -> bool {
         .unwrap_or(false)
 }
 
+/// One inbox pointer (reply or follow announcement), abstracted over the v2
+/// inbox and the legacy v1 inbox read during the migration window (#23).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct InboxPointer {
+    replier: [u8; 32],
+    target_post: freebird_core::types::PostId,
+    reply_post: freebird_core::types::PostId,
+    time: u64,
+}
+
+/// All pointers in `owner`'s inbox(es): v2 first, then legacy v1, deduped by
+/// (replier, reply_post) — a replier present in both generations counts
+/// once. Only pointers whose credential is present are trusted (both
+/// contracts enforce this; re-checked here because full states arrive from
+/// untrusted peers).
+fn merged_pointers(owner: &[u8; 32]) -> Vec<InboxPointer> {
+    let mut out: Vec<InboxPointer> = Vec::new();
+    let mut seen: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
+        Default::default();
+    if let Some(inbox) = INBOXES.read().get(owner) {
+        for p in &inbox.pointers.pointers {
+            if inbox.creds.creds.contains_key(&p.ptr.replier)
+                && seen.insert((p.ptr.replier, p.ptr.reply_post))
+            {
+                out.push(InboxPointer {
+                    replier: p.ptr.replier,
+                    target_post: p.ptr.target_post,
+                    reply_post: p.ptr.reply_post,
+                    time: p.ptr.time,
+                });
+            }
+        }
+    }
+    if let Some(inbox) = LEGACY_INBOXES.read().get(owner) {
+        for p in &inbox.pointers.pointers {
+            if inbox.creds.creds.contains_key(&p.ptr.replier)
+                && seen.insert((p.ptr.replier, p.ptr.reply_post))
+            {
+                out.push(InboxPointer {
+                    replier: p.ptr.replier,
+                    target_post: p.ptr.target_post,
+                    reply_post: p.ptr.reply_post,
+                    time: p.ptr.time,
+                });
+            }
+        }
+    }
+    out
+}
+
 fn ago(time: u64) -> String {
     let now = keys::now_ms();
     let delta_s = now.saturating_sub(time) / 1000;
@@ -360,11 +410,13 @@ pub fn App() -> Element {
 
     // Refresh our directory listing's last_active once per session, so an
     // active listed author never ages to the bottom of the eviction order.
+    // Anonymous authors refresh too (#23) — for them it's also what keeps
+    // their bounded-share slot alive.
     let mut listing_refreshed = use_signal(|| false);
     use_effect(move || {
         let listed = *PUBLIC_LISTING.read() == Some(true);
-        let verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
-        if listed && verified && !*listing_refreshed.peek() {
+        let has_account = ACCOUNT.read().is_some();
+        if listed && has_account && !*listing_refreshed.peek() {
             listing_refreshed.set(true);
             spawn(async {
                 if let Err(e) = actions::set_public_listing(true).await {
@@ -621,7 +673,6 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
     let mut notice = use_signal(String::new);
     let limit = freebird_core::feed::MAX_POST_BYTES;
     let is_reply = in_reply_to.is_some();
-    let own_verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
     let over = text.read().len() > limit;
 
     let mut submit = move || {
@@ -629,7 +680,6 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
         if content.is_empty() || text.peek().len() > limit {
             return;
         }
-        let verified_now = own_author().map(|a| is_verified(&a)).unwrap_or(false);
         error.set(String::new());
         notice.set(String::new());
         spawn(async move {
@@ -637,11 +687,7 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
                 Ok(()) => {
                     text.set(String::new());
                     if is_reply {
-                        notice.set(if verified_now {
-                            "Reply posted to the thread.".into()
-                        } else {
-                            "Reply posted to your feed.".into()
-                        });
+                        notice.set("Reply posted to the thread.".into());
                     }
                 }
                 Err(e) => error.set(e),
@@ -662,12 +708,6 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
                         submit();
                     }
                 },
-            }
-            if is_reply && !own_verified {
-                p { class: "muted",
-                    "This reply will post to your own feed, where your followers see it. \
-                     It won't appear in this thread — that takes a verified account."
-                }
             }
             div { class: "compose-row",
                 span { class: if over { "error" } else { "muted" }, "{text.read().len()}/{limit} bytes" }
@@ -742,17 +782,10 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thr
         post: post.post.id,
     };
     let thread_href = View::Thread(post_ref).to_hash();
-    let reply_count = INBOXES
-        .read()
-        .get(&author)
-        .map(|i| {
-            i.pointers
-                .pointers
-                .iter()
-                .filter(|p| p.ptr.target_post == post.post.id)
-                .count()
-        })
-        .unwrap_or(0);
+    let reply_count = merged_pointers(&author)
+        .iter()
+        .filter(|p| p.target_post == post.post.id)
+        .count();
 
     rsx! {
         article { class: "card post",
@@ -790,63 +823,46 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thr
 fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
     let post_id = freebird_core::types::PostId(post_id_bytes.clone().try_into().unwrap_or([0; 16]));
 
-    // Pointers targeting this post, resolved into (replier_key, reply_id, post).
+    // Pointers targeting this post — v2 and legacy inbox merged — resolved
+    // into (replier_key, reply_id, post).
     let replies: Vec<([u8; 32], freebird_core::types::PostId, Option<AuthorizedPost>)> = {
-        let inboxes = INBOXES.read();
         let feeds = FEEDS.read();
-        inboxes
-            .get(&author)
-            .map(|inbox| {
-                inbox
-                    .pointers
-                    .pointers
-                    .iter()
-                    .filter(|p| p.ptr.target_post == post_id)
-                    .filter_map(|p| {
-                        inbox.creds.creds.get(&p.ptr.replier)?;
-                        let replier = p.ptr.replier;
-                        let found = feeds.get(&replier).and_then(|f| f.as_ref()).and_then(|f| {
-                            f.posts
-                                .posts
-                                .iter()
-                                .find(|x| x.post.id == p.ptr.reply_post)
-                                // The reply must actually claim THIS post as
-                                // its parent — a pointer alone must not let
-                                // anyone graft an arbitrary peep into a
-                                // stranger's thread.
-                                .filter(|x| {
-                                    x.post.in_reply_to
-                                        == Some(PostRef {
-                                            author,
-                                            post: post_id,
-                                        })
+        merged_pointers(&author)
+            .into_iter()
+            .filter(|p| p.target_post == post_id)
+            .map(|p| {
+                let replier = p.replier;
+                let found = feeds.get(&replier).and_then(|f| f.as_ref()).and_then(|f| {
+                    f.posts
+                        .posts
+                        .iter()
+                        .find(|x| x.post.id == p.reply_post)
+                        // The reply must actually claim THIS post as its
+                        // parent — a pointer alone must not let anyone graft
+                        // an arbitrary peep into a stranger's thread.
+                        .filter(|x| {
+                            x.post.in_reply_to
+                                == Some(PostRef {
+                                    author,
+                                    post: post_id,
                                 })
-                                .cloned()
-                        });
-                        Some((replier, p.ptr.reply_post, found))
-                    })
-                    .collect()
+                        })
+                        .cloned()
+                });
+                (replier, p.reply_post, found)
             })
-            .unwrap_or_default()
+            .collect()
     };
 
     // Fetch replier feeds we don't have yet.
     use_effect(move || {
         let missing: Vec<[u8; 32]> = {
-            let inboxes = INBOXES.read();
             let feeds = FEEDS.read();
-            inboxes
-                .get(&author)
-                .map(|inbox| {
-                    inbox
-                        .pointers
-                        .pointers
-                        .iter()
-                        .map(|p| p.ptr.replier)
-                        .filter(|k| !feeds.contains_key(k))
-                        .collect()
-                })
-                .unwrap_or_default()
+            merged_pointers(&author)
+                .into_iter()
+                .map(|p| p.replier)
+                .filter(|k| !feeds.contains_key(k))
+                .collect()
         };
         for replier in missing {
             spawn(async move {
@@ -855,13 +871,14 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
         }
     });
 
-    let inbox_loaded = INBOXES.read().contains_key(&author);
+    let inbox_loaded =
+        INBOXES.read().contains_key(&author) || LEGACY_INBOXES.read().contains_key(&author);
 
     rsx! {
         div { class: "thread",
             if replies.is_empty() {
                 if inbox_loaded {
-                    p { class: "muted", "No verified replies yet." }
+                    p { class: "muted", "No replies yet." }
                 } else {
                     p { class: "muted", "Checking for replies…" }
                 }
@@ -1007,8 +1024,8 @@ fn MyAccount() -> Element {
     }
 }
 
-/// Public-directory opt-in (issue #11): attestation-gated, so anonymous
-/// accounts stay follower-only. Lives on the profile page.
+/// Public-directory opt-in (issue #11): open to everyone (issue #23) —
+/// verified listings just can't be crowded out. Lives on the profile page.
 #[component]
 fn PublicListingToggle(author: [u8; 32]) -> Element {
     let mut listing_error = use_signal(String::new);
@@ -1016,27 +1033,23 @@ fn PublicListingToggle(author: [u8; 32]) -> Element {
 
     rsx! {
         p { class: "muted keyline", "Discovery:" }
-        if is_verified(&author) {
-            label { class: "toggle",
-                input {
-                    r#type: "checkbox",
-                    checked: listed,
-                    onchange: move |e| {
-                        let on = e.checked();
-                        listing_error.set(String::new());
-                        spawn(async move {
-                            if let Err(err) = actions::set_public_listing(on).await {
-                                listing_error.set(err);
-                            }
-                        });
-                    },
-                }
-                "List me publicly in Discover"
+        label { class: "toggle",
+            input {
+                r#type: "checkbox",
+                checked: listed,
+                onchange: move |e| {
+                    let on = e.checked();
+                    listing_error.set(String::new());
+                    spawn(async move {
+                        if let Err(err) = actions::set_public_listing(on).await {
+                            listing_error.set(err);
+                        }
+                    });
+                },
             }
-            if !listing_error.read().is_empty() { p { class: "error", "{listing_error}" } }
-        } else {
-            p { class: "muted", "Get a check mark to list yourself publicly in Discover." }
+            "List me publicly in Discover"
         }
+        if !listing_error.read().is_empty() { p { class: "error", "{listing_error}" } }
     }
 }
 
@@ -1058,21 +1071,25 @@ fn Discover() -> Element {
         }
     });
 
-    let loaded = DIRECTORY.read().is_some();
-    // Newest-active first.
-    let listings: Vec<([u8; 32], u64)> = DIRECTORY
-        .read()
-        .as_ref()
-        .map(|d| {
-            let mut v: Vec<([u8; 32], u64)> = d
-                .listings
-                .values()
-                .map(|l| (l.listing.author, l.listing.last_active))
-                .collect();
-            v.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
-            v
-        })
-        .unwrap_or_default();
+    let loaded = DIRECTORY.read().is_some() || LEGACY_DIRECTORY.read().is_some();
+    // v2 merged with the legacy v1 directory (dual-read window, #23): v2
+    // wins per author; newest-active first.
+    let listings: Vec<([u8; 32], u64)> = {
+        let mut by_author: std::collections::BTreeMap<[u8; 32], u64> = Default::default();
+        if let Some(d) = LEGACY_DIRECTORY.read().as_ref() {
+            for l in d.listings.values() {
+                by_author.insert(l.listing.author, l.listing.last_active);
+            }
+        }
+        if let Some(d) = DIRECTORY.read().as_ref() {
+            for l in d.listings.values() {
+                by_author.insert(l.listing.author, l.listing.last_active);
+            }
+        }
+        let mut v: Vec<([u8; 32], u64)> = by_author.into_iter().collect();
+        v.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
+        v
+    };
 
     // Fetch a sample of listed authors' feeds (names, avatars, latest peeps)
     // through the existing fetch_feed plumbing.
@@ -1205,21 +1222,20 @@ fn FollowBox() -> Element {
     }
 }
 
-/// Verified followers (issue #12): follow announcements in the inbox are
+/// Confirmed followers (issue #12): follow announcements in the inbox are
 /// hints only. A follower shows once their fetched feed proves `owner` is in
 /// their signed follow list — no forged "X follows you", and unfollows age
-/// out because the claim re-verifies against the live list.
-fn verified_followers(
-    inbox: &freebird_core::inbox::InboxStateV1,
+/// out because the claim re-verifies against the live list. Anonymous
+/// followers announce and appear like anyone else (issue #23).
+fn confirmed_followers(
+    pointers: &[InboxPointer],
     feeds: &std::collections::BTreeMap<[u8; 32], Option<FeedStateV1>>,
     owner: &[u8; 32],
 ) -> Vec<[u8; 32]> {
-    let mut out: Vec<[u8; 32]> = inbox
-        .pointers
-        .pointers
+    let mut out: Vec<[u8; 32]> = pointers
         .iter()
-        .filter(|p| p.ptr.target_post == actions::FOLLOW_ANNOUNCE_TARGET)
-        .map(|p| p.ptr.replier)
+        .filter(|p| p.target_post == actions::FOLLOW_ANNOUNCE_TARGET)
+        .map(|p| p.replier)
         .collect();
     out.sort();
     out.dedup();
@@ -1238,12 +1254,9 @@ fn FollowersBox() -> Element {
         return rsx! {};
     };
     let followers = {
-        let inboxes = INBOXES.read();
+        let pointers = merged_pointers(&author);
         let feeds = FEEDS.read();
-        inboxes
-            .get(&author)
-            .map(|i| verified_followers(i, &feeds, &author))
-            .unwrap_or_default()
+        confirmed_followers(&pointers, &feeds, &author)
     };
     let own_follows: std::collections::BTreeSet<[u8; 32]> = FEEDS
         .read()
@@ -1256,20 +1269,13 @@ fn FollowersBox() -> Element {
     // Fetch announcers' feeds we don't have yet, to verify their claims.
     use_effect(move || {
         let missing: Vec<[u8; 32]> = {
-            let inboxes = INBOXES.read();
             let feeds = FEEDS.read();
-            inboxes
-                .get(&author)
-                .map(|i| {
-                    i.pointers
-                        .pointers
-                        .iter()
-                        .filter(|p| p.ptr.target_post == actions::FOLLOW_ANNOUNCE_TARGET)
-                        .map(|p| p.ptr.replier)
-                        .filter(|k| !feeds.contains_key(k))
-                        .collect()
-                })
-                .unwrap_or_default()
+            merged_pointers(&author)
+                .into_iter()
+                .filter(|p| p.target_post == actions::FOLLOW_ANNOUNCE_TARGET)
+                .map(|p| p.replier)
+                .filter(|k| !feeds.contains_key(k))
+                .collect()
         };
         for k in missing {
             spawn(async move {
@@ -1283,8 +1289,8 @@ fn FollowersBox() -> Element {
             h3 { "Followers ({followers.len()})" }
             if followers.is_empty() {
                 p { class: "muted",
-                    "No verified followers yet. Only followers with a check mark \
-                     announce themselves; anonymous followers stay invisible."
+                    "No followers yet. Followers appear here once their follow \
+                     announcement reaches your inbox."
                 }
             }
             for f in followers {
@@ -1356,12 +1362,13 @@ fn VerifyBox() -> Element {
         section { class: "card",
             h3 { "Verification" }
             if verified {
-                p { span { class: "check", "✔" } " This account has earned the Prized Checkmark. Your replies land in other people's threads." }
+                p { span { class: "check", "✔" } " This account has earned the Prized Checkmark. Your replies and listings can never be crowded out." }
             } else {
                 p { class: "muted",
-                    "Anonymous accounts peep freely to their own feed, but replies are only \
-                     visible to followers. A Ghost Key adds a check mark and puts your replies \
-                     in the thread."
+                    "Anonymous accounts have full run of Freebird — peep, reply into \
+                     threads, get listed in Discover. A Ghost Key adds the check mark \
+                     and makes your presence durable: verified replies and listings \
+                     are never crowded out by the anonymous crowd."
                 }
                 match has_identity {
                     Some(true) => rsx! {
@@ -1554,7 +1561,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use freebird_core::feed::AttestationSlot;
-    use freebird_core::inbox::{AuthorizedReplyPointer, InboxStateV1, ReplyPointer};
     use freebird_core::types::{
         AuthorizedFollows, AuthorizedProfile, FollowsV1, PostId, ProfileV1,
     };
@@ -1576,20 +1582,19 @@ mod tests {
         }
     }
 
-    fn announce(sk: &SigningKey, target_post: PostId, time: u64) -> AuthorizedReplyPointer {
+    fn announce(sk: &SigningKey, target_post: PostId, time: u64) -> InboxPointer {
         let vk = sk.verifying_key();
-        AuthorizedReplyPointer::new(
-            ReplyPointer {
-                replier: vk.to_bytes(),
-                fingerprint: "fp".into(),
-                target_post,
-                reply_post: PostId::compute(&vk, time, "follow", &None),
-                time,
-            },
-            sk,
-        )
+        InboxPointer {
+            replier: vk.to_bytes(),
+            target_post,
+            reply_post: PostId::compute(&vk, time, "follow", &None),
+            time,
+        }
     }
 
+    /// Anonymous announcers count exactly like verified ones (#23): the
+    /// confirmation is the announcer's own signed follow list, never the
+    /// attestation.
     #[test]
     fn follower_shown_only_when_their_follow_list_confirms() {
         let owner = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
@@ -1597,16 +1602,16 @@ mod tests {
         let liar = SigningKey::generate(&mut OsRng);
         let unfetched = SigningKey::generate(&mut OsRng);
 
-        let mut inbox = InboxStateV1::default();
+        let mut pointers: Vec<InboxPointer> = Vec::new();
         // Real follower announces twice (refollow) — must dedupe to one.
-        inbox.pointers.pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 1));
-        inbox.pointers.pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 2));
+        pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 1));
+        pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 2));
         // Liar announces but their follow list doesn't contain owner.
-        inbox.pointers.pointers.push(announce(&liar, actions::FOLLOW_ANNOUNCE_TARGET, 3));
+        pointers.push(announce(&liar, actions::FOLLOW_ANNOUNCE_TARGET, 3));
         // Announcer whose feed hasn't arrived yet.
-        inbox.pointers.pointers.push(announce(&unfetched, actions::FOLLOW_ANNOUNCE_TARGET, 4));
+        pointers.push(announce(&unfetched, actions::FOLLOW_ANNOUNCE_TARGET, 4));
         // Ordinary reply pointer must not count as a follower.
-        inbox.pointers.pointers.push(announce(&real, PostId([7u8; 16]), 5));
+        pointers.push(announce(&real, PostId([7u8; 16]), 5));
 
         let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
         feeds.insert(real.verifying_key().to_bytes(), Some(feed_following(&real, &[owner])));
@@ -1614,7 +1619,7 @@ mod tests {
         feeds.insert(unfetched.verifying_key().to_bytes(), None);
 
         assert_eq!(
-            verified_followers(&inbox, &feeds, &owner),
+            confirmed_followers(&pointers, &feeds, &owner),
             vec![real.verifying_key().to_bytes()]
         );
     }

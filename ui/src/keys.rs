@@ -1,10 +1,11 @@
 //! Key material and contract-address derivation.
 
-use directory_contract::{DirectoryParametersV1, DIRECTORY_SEED};
+use directory_contract::{DirectoryParametersV2, DIRECTORY_SEED};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::avatar::AvatarParametersV1;
 use freebird_core::feed::{FeedParametersV1, MAX_FUTURE_MS};
 use freebird_core::inbox::InboxParametersV1;
+use inbox_contract::state::InboxParametersV2;
 use freebird_core::types::{AuthorizedPost, PostId, PostV1};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use ghostkey_lib::armorable::Armorable;
@@ -15,6 +16,13 @@ pub const AVATAR_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/avatar_cont
 pub const DIRECTORY_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/directory_contract.wasm");
 pub const CELL_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/cell_contract.wasm");
 pub const FREEBIRD_DELEGATE_WASM: &[u8] = include_bytes!("../contracts/freebird_delegate.wasm");
+
+// Frozen v1 bytes, kept ONLY to derive the legacy inbox/directory addresses
+// for the dual-read migration window (issue #23). Reads use the instance id;
+// these wasm modules are never instantiated by this build.
+pub const INBOX_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract_v1.wasm");
+pub const DIRECTORY_V1_CONTRACT_WASM: &[u8] =
+    include_bytes!("../contracts/directory_contract_v1.wasm");
 
 /// This bundle's build number (git commit count; 0 in git-less dev builds).
 pub fn own_build() -> u64 {
@@ -35,7 +43,15 @@ pub fn feed_params(author: &VerifyingKey) -> FeedParametersV1 {
     }
 }
 
-pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV1 {
+pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV2 {
+    InboxParametersV2 {
+        owner: *owner,
+        ghostkey_master: master_key(),
+    }
+}
+
+/// Params of the author's LEGACY (v1) inbox — dual-read window only.
+pub fn inbox_params_v1(owner: &VerifyingKey) -> InboxParametersV1 {
     InboxParametersV1 {
         owner: *owner,
         ghostkey_master: master_key(),
@@ -48,9 +64,17 @@ pub fn avatar_params(author: &VerifyingKey) -> AvatarParametersV1 {
 
 /// The public directory (issue #11): no author key in the params, so every
 /// client derives the SAME address — one instance for the whole network.
-pub fn directory_params() -> DirectoryParametersV1 {
-    DirectoryParametersV1 {
+pub fn directory_params() -> DirectoryParametersV2 {
+    DirectoryParametersV2 {
         seed: DIRECTORY_SEED.into(),
+        ghostkey_master: master_key(),
+    }
+}
+
+/// Params of the LEGACY (v1) directory — dual-read window only.
+pub fn directory_params_v1() -> directory_contract::legacy::LegacyDirectoryParameters {
+    directory_contract::legacy::LegacyDirectoryParameters {
+        seed: directory_contract::legacy::DIRECTORY_SEED_V1.into(),
         ghostkey_master: master_key(),
     }
 }
@@ -72,6 +96,11 @@ pub fn inbox_key(owner: &VerifyingKey) -> ContractKey {
     contract_key(INBOX_CONTRACT_WASM, params)
 }
 
+pub fn inbox_key_v1(owner: &VerifyingKey) -> ContractKey {
+    let params = freebird_core::to_cbor(&inbox_params_v1(owner)).expect("params serialize");
+    contract_key(INBOX_V1_CONTRACT_WASM, params)
+}
+
 pub fn avatar_key(author: &VerifyingKey) -> ContractKey {
     let params = freebird_core::to_cbor(&avatar_params(author)).expect("params serialize");
     contract_key(AVATAR_CONTRACT_WASM, params)
@@ -85,6 +114,10 @@ pub fn inbox_instance_id(owner: &VerifyingKey) -> ContractInstanceId {
     *inbox_key(owner).id()
 }
 
+pub fn inbox_instance_id_v1(owner: &VerifyingKey) -> ContractInstanceId {
+    *inbox_key_v1(owner).id()
+}
+
 pub fn avatar_instance_id(author: &VerifyingKey) -> ContractInstanceId {
     *avatar_key(author).id()
 }
@@ -96,6 +129,30 @@ pub fn directory_key() -> ContractKey {
 
 pub fn directory_instance_id() -> ContractInstanceId {
     *directory_key().id()
+}
+
+pub fn directory_key_v1() -> ContractKey {
+    let params = freebird_core::to_cbor(&directory_params_v1()).expect("params serialize");
+    contract_key(DIRECTORY_V1_CONTRACT_WASM, params)
+}
+
+pub fn directory_instance_id_v1() -> ContractInstanceId {
+    *directory_key_v1().id()
+}
+
+/// An author's anchor cell (issue #23): frozen cell wasm + posting key +
+/// purpose "anchor" — the one per-author address that can never rotate.
+pub fn anchor_params(owner: &VerifyingKey) -> cell_contract::CellParametersV1 {
+    freebird_anchor::anchor_params(owner)
+}
+
+pub fn anchor_key(owner: &VerifyingKey) -> ContractKey {
+    let params = cell_contract::to_cbor(&anchor_params(owner)).expect("params serialize");
+    contract_key(CELL_CONTRACT_WASM, params)
+}
+
+pub fn anchor_instance_id(owner: &VerifyingKey) -> ContractInstanceId {
+    *anchor_key(owner).id()
 }
 
 /// The publisher's control cell (build number + feature flags): like the

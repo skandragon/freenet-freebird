@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 use freebird_core::feed::FeedStateV1;
 use freebird_core::inbox::InboxStateV1;
 use freenet_stdlib::client_api::WebApi;
+use inbox_contract::state::InboxStateV2;
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub enum SyncStatus {
@@ -26,8 +27,19 @@ pub static ACCOUNT: GlobalSignal<Option<SigningKey>> = Signal::global(|| None);
 pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
     Signal::global(BTreeMap::new);
 
-/// Inbox states by owner key.
-pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV1>> =
+/// Inbox (v2) states by owner key.
+pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV2>> =
+    Signal::global(BTreeMap::new);
+
+/// LEGACY (v1) inbox states by owner key — dual-read migration window
+/// (issue #23): old attested pointers stay visible until the publisher
+/// closes the window via the `read_v1_inbox` control flag.
+pub static LEGACY_INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV1>> =
+    Signal::global(BTreeMap::new);
+
+/// Per-author anchor cells (issue #23): role → current contract version and
+/// address. `None` value = requested, not yet arrived (or absent).
+pub static ANCHORS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_anchor::AnchorV1>>> =
     Signal::global(BTreeMap::new);
 
 /// Avatars by author key. `None` value = fetched (or fetching) but absent —
@@ -36,8 +48,12 @@ pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV1>> =
 pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>> =
     Signal::global(BTreeMap::new);
 
-/// The public author directory (issue #11). None = not fetched yet.
-pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV1>> =
+/// The public author directory, v2 (issue #11). None = not fetched yet.
+pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV2>> =
+    Signal::global(|| None);
+
+/// The LEGACY (v1) directory — dual-read migration window (issue #23).
+pub static LEGACY_DIRECTORY: GlobalSignal<Option<directory_contract::legacy::LegacyDirectoryState>> =
     Signal::global(|| None);
 
 /// Our "list me publicly" preference, delegate-persisted like the theme:
@@ -206,6 +222,18 @@ pub static GHOSTKEY_DELEGATE: GlobalSignal<Option<freenet_stdlib::prelude::Deleg
 
 /// Author key from a ?follow= link the page was opened with.
 pub static PENDING_FOLLOW: GlobalSignal<Option<[u8; 32]>> = Signal::global(|| None);
+
+/// A control-cell feature flag, defaulting when control state is absent or
+/// the flag unset. The v1 dual-read window is gated on `read_v1_inbox` /
+/// `read_v1_directory` (default ON) so the publisher can close it network-
+/// wide once the migration completes.
+pub fn flag_bool(name: &str, default: bool) -> bool {
+    CONTROL
+        .read()
+        .as_ref()
+        .map(|c| c.flag_bool(name, default))
+        .unwrap_or(default)
+}
 
 pub fn own_author() -> Option<[u8; 32]> {
     ACCOUNT

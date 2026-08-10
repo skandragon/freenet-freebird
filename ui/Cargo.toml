@@ -11,8 +11,10 @@ freebird-core = { workspace = true, features = [] }
 # Types only — default-features = false keeps the contract entry points out
 # of the browser wasm.
 directory-contract = { path = "../contracts/directory-contract", default-features = false }
+inbox-contract = { path = "../contracts/inbox-contract", default-features = false }
 cell-contract = { path = "../contracts/cell-contract", default-features = false }
 freebird-control = { path = "../control" }
+freebird-anchor = { path = "../anchor" }
 freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold.workspace = true
 ghostkey_lib.workspace = true

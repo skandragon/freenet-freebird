@@ -2,14 +2,16 @@
 //! and the api layer; every action signs locally with the posting key.
 
 use dioxus::prelude::*;
-use directory_contract::{AuthorizedListing, ListingV1};
+use directory_contract::{AuthorizedListingV2, ListingV1};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::attestation::AttestationV1;
 use freebird_core::delegate_api::FreebirdDelegateRequest;
 use freebird_core::feed::{AttestationSlot, FeedStateV1, FeedStateV1Delta, PostsV1};
-use freebird_core::inbox::{AuthorizedReplyPointer, InboxStateV1Delta, ReplierCred, ReplyPointer};
 use freebird_core::types::{
     AuthorizedFollows, AuthorizedProfile, FollowsV1, PostId, PostRef, ProfileV1,
+};
+use inbox_contract::state::{
+    AuthorizedReplyPointerV2, InboxStateV2Delta, ReplierCredV2, ReplyPointerV2,
 };
 
 use crate::api;
@@ -67,6 +69,12 @@ pub async fn create_account(name: String) -> Result<(), String> {
     };
 
     api::put_own_contracts(&vk, &state).await?;
+    // Anchor cell: role → current contract generation, so future rotations
+    // are soft for anyone reading us (issue #23). Best-effort — a missing
+    // anchor just means readers fall back to derived addresses.
+    if let Err(e) = api::publish_anchor(&sk).await {
+        api::log(&format!("anchor publish failed: {e}"));
+    }
 
     let author = vk.to_bytes();
     FEEDS.write().insert(author, Some(state));
@@ -80,9 +88,20 @@ pub async fn create_account(name: String) -> Result<(), String> {
 pub async fn resume_account(seed: Vec<u8>) -> Result<(), String> {
     let seed: [u8; 32] = seed.try_into().map_err(|_| "bad posting_key length")?;
     let sk = SigningKey::from_bytes(&seed);
-    let author = sk.verifying_key().to_bytes();
-    *ACCOUNT.write() = Some(sk);
-    api::fetch_feed(author).await
+    let vk = sk.verifying_key();
+    let author = vk.to_bytes();
+    *ACCOUNT.write() = Some(sk.clone());
+    api::fetch_feed(author).await?;
+    // Owner-republish half of the #23 migration, best-effort and idempotent:
+    // make sure our v2 inbox exists (an account created pre-rotation never
+    // PUT it) and (re)publish the anchor cell pointing at it.
+    if let Err(e) = api::ensure_own_inbox(&vk).await {
+        api::log(&format!("v2 inbox republish failed: {e}"));
+    }
+    if let Err(e) = api::publish_anchor(&sk).await {
+        api::log(&format!("anchor publish failed: {e}"));
+    }
+    Ok(())
 }
 
 fn signing_key() -> Result<SigningKey, String> {
@@ -99,8 +118,8 @@ fn own_feed() -> Option<FeedStateV1> {
 }
 
 /// Publish a post; when it's a reply, also drop a pointer in the target
-/// author's inbox (requires our attestation — anonymous replies stay
-/// follower-visible only).
+/// author's inbox. Anonymous accounts participate too (issue #23) — the
+/// attestation, when we have one, only buys the pointer durable slots.
 pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Result<(), String> {
     let sk = signing_key()?;
     let post = keys::make_post(&sk, content, in_reply_to);
@@ -112,39 +131,38 @@ pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Resu
     apply_own_posts(vec![post.clone()]);
 
     if let Some(target) = in_reply_to {
-        if let Some(att) = own_feed().and_then(|f| f.attestation.0) {
-            send_inbox_pointer(&sk, att, target.author, target.post, post.post.id, post.post.time)
-                .await?;
-        }
+        let att = own_feed().and_then(|f| f.attestation.0);
+        send_inbox_pointer(&sk, att, target.author, target.post, post.post.id, post.post.time)
+            .await?;
     }
     Ok(())
 }
 
-/// Drop an attested pointer into `target_author`'s inbox: a reply pointer, or
-/// a follow announcement when `target_post` is FOLLOW_ANNOUNCE_TARGET.
+/// Drop a pointer into `target_author`'s inbox: a reply pointer, or a follow
+/// announcement when `target_post` is FOLLOW_ANNOUNCE_TARGET. `attestation`
+/// picks the slot tier (attested = uncrowdable, None = anonymous share).
 async fn send_inbox_pointer(
     sk: &SigningKey,
-    attestation: AttestationV1,
+    attestation: Option<AttestationV1>,
     target_author: [u8; 32],
     target_post: PostId,
     reply_post: PostId,
     time: u64,
 ) -> Result<(), String> {
-    let fingerprint = attestation.fingerprint();
     let replier = sk.verifying_key().to_bytes();
-    let cred = ReplierCred {
+    let cred = ReplierCredV2 {
         posting_key: sk.verifying_key(),
         attestation,
     };
-    let ptr = ReplyPointer {
+    let ptr = ReplyPointerV2 {
         replier,
-        fingerprint,
+        fingerprint: cred.fingerprint(),
         target_post,
         reply_post,
         time,
     };
-    let authorized = AuthorizedReplyPointer::new(ptr, sk);
-    let delta = InboxStateV1Delta {
+    let authorized = AuthorizedReplyPointerV2::new(ptr, sk);
+    let delta = InboxStateV2Delta {
         creds: Some([(replier, cred)].into_iter().collect()),
         pointers: Some(vec![authorized]),
     };
@@ -228,36 +246,33 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
         api::fetch_feed(target).await.ok();
         // Announce the follow into the target's inbox (#12). Best-effort
         // hint: their UI re-verifies against our signed follow list before
-        // showing us. Anonymous accounts (no attestation) follow invisibly.
-        if let Some(att) = current.attestation.0.clone() {
-            let time = keys::now_ms();
-            let announce_id = PostId::compute(&sk.verifying_key(), time, "follow", &None);
-            if let Err(e) =
-                send_inbox_pointer(&sk, att, target, FOLLOW_ANNOUNCE_TARGET, announce_id, time)
-                    .await
-            {
-                api::log(&format!("follow announcement failed: {e}"));
-            }
+        // showing us. Anonymous accounts announce too (issue #23).
+        let att = current.attestation.0.clone();
+        let time = keys::now_ms();
+        let announce_id = PostId::compute(&sk.verifying_key(), time, "follow", &None);
+        if let Err(e) =
+            send_inbox_pointer(&sk, att, target, FOLLOW_ANNOUNCE_TARGET, announce_id, time).await
+        {
+            api::log(&format!("follow announcement failed: {e}"));
         }
     }
     Ok(())
 }
 
-/// Toggle the public-directory listing (issue #11). Listing requires the
-/// Ghost Key attestation (the directory's write gate). Delisting only stops
-/// the refreshes — Freenet has no remove — so the entry ages out of the
-/// capped set once others' activity evicts it.
+/// Toggle the public-directory listing (issue #11). Open to everyone
+/// (issue #23): an attestation, when present, makes the listing uncrowdable;
+/// anonymous listings share the bounded remainder. Delisting only stops the
+/// refreshes — Freenet has no remove — so the entry ages out of the capped
+/// set once others' activity evicts it.
 pub async fn set_public_listing(on: bool) -> Result<(), String> {
     if on {
         let sk = signing_key()?;
-        let att = own_feed()
-            .and_then(|f| f.attestation.0)
-            .ok_or("public listing requires a verified account (Ghost Key)")?;
+        let att = own_feed().and_then(|f| f.attestation.0);
         let listing = ListingV1 {
             author: sk.verifying_key().to_bytes(),
             last_active: keys::now_ms(),
         };
-        let authorized = AuthorizedListing::new(listing, &sk, att);
+        let authorized = AuthorizedListingV2::new(listing, &sk, att);
         api::put_directory_listing(&authorized).await?;
         // Optimistic local apply so Discover shows us immediately.
         if let Some(dir) = DIRECTORY.write().as_mut() {
@@ -317,6 +332,13 @@ pub async fn complete_verification(
     api::update_own_feed(delta).await?;
     if let Some(Some(state)) = FEEDS.write().get_mut(&own_author().unwrap()) {
         state.attestation = AttestationSlot(Some(attestation));
+    }
+    // A listed account that just verified upgrades its directory listing to
+    // the attested (uncrowdable) tier. Best-effort.
+    if *PUBLIC_LISTING.read() == Some(true) {
+        if let Err(e) = set_public_listing(true).await {
+            api::log(&format!("listing tier upgrade failed: {e}"));
+        }
     }
     Ok(tier)
 }
