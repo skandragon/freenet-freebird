@@ -1,0 +1,14 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "instrument serif",
+        "createdAt": "2026-08-10T04:39:13.152Z",
+        "reason": "User requested cardinalhq.io fonts; Instrument Serif is the pinned display face"
+      }
+    ]
+  }
+}
