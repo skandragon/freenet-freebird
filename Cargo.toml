@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "anchor",
     "common",
     "contracts/avatar-contract",
     "contracts/cell-contract",
