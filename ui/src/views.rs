@@ -389,13 +389,15 @@ pub fn App() -> Element {
         div { class: "app",
             header {
                 h1 {
-                    svg {
-                        view_box: "0 0 24 24",
-                        fill: "currentColor",
-                        "aria-hidden": "true",
-                        path { d: "M3 13 C7 6 14 4 22 4 C19 7 17 8 14 9 C16 9 18 9 20 9 C17 12 13 13 10 13 C7 13 5 14 4 16 C3.5 15 3 14 3 13 Z" }
+                    a { href: "{View::Home.to_hash()}",
+                        svg {
+                            view_box: "0 0 24 24",
+                            fill: "currentColor",
+                            "aria-hidden": "true",
+                            path { d: "M3 13 C7 6 14 4 22 4 C19 7 17 8 14 9 C16 9 18 9 20 9 C17 12 13 13 10 13 C7 13 5 14 4 16 C3.5 15 3 14 3 13 Z" }
+                        }
+                        "Freebird"
                     }
-                    "Freebird"
                 }
                 button { class: "link theme-toggle",
                     title: "Theme",
