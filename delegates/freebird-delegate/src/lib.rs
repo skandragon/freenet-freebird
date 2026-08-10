@@ -1,3 +1,4 @@
+#![allow(unexpected_cfgs)]
 //! Freebird KV delegate: per-origin encrypted key-value storage on the
 //! user's node. Pattern-copied from River's chat-delegate, minus everything
 //! Freebird doesn't need (CAS, subscriptions, signing — posts are signed in

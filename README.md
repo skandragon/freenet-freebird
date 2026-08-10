@@ -6,18 +6,46 @@ UI is a web app served from the network itself. Signup is anonymous (a locally
 generated key); a [Ghost Key](https://freenet.org/ghostkey) buys a verified
 check mark and the ability to reply into other people's threads.
 
+**The trust rule:** your own feed is free; other people's attention costs a
+Ghost Key.
+
 Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpowers/specs/2026-08-09-freebird-design.md)
+
+## Vocabulary
+
+| Freebird | Meaning |
+|---|---|
+| **Peep** | A post (≤ 2 KB, signed, lives in your feed contract) |
+| **Repeep** | A repost (not yet implemented) |
+| **Reply** | A peep referencing another peep; discoverable via the target's inbox if you're verified |
+| **Feed** | Your per-author contract: profile, follows, peeps, optional attestation |
+| **Follower / Following** | Public follow list in your feed state |
+| **Check mark** | Ghost Key attestation, verified by the contract itself |
 
 ## Layout
 
 - `common/` — `freebird-core`: wire types, CRDT merge logic, ghostkey
   attestation verification, property tests
-- `contracts/feed-contract/` — per-author feed (profile, follows, posts,
+- `contracts/feed-contract/` — per-author feed (profile, follows, peeps,
   optional attestation)
 - `contracts/inbox-contract/` — per-author reply inbox (ghostkey-gated writes)
 - `delegates/freebird-delegate/` — per-app encrypted KV storage on the user's
   node (posting key, drafts)
-- `ui/` — Dioxus web UI
+- `ui/` — Dioxus web UI (`ui/contracts/` holds the compiled wasm the UI embeds
+  for address derivation — refresh with `make contracts delegate`)
+
+## Build
+
+```sh
+make test        # workspace tests (CRDT proptests, attestation, delegate)
+make contracts   # contract wasm + forbidden-import check (river#241 gate)
+make delegate    # delegate wasm + import check
+make ui          # dx release build (implies contracts+delegate)
+make publish     # publish the UI to Freenet via fdev (needs node tunnel)
+```
+
+Requires: rustup stable + `wasm32-unknown-unknown`, `dx` (Dioxus CLI 0.7),
+`fdev`, `wasm-tools`.
 
 ## License
 
