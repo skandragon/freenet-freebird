@@ -44,6 +44,14 @@ pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV1>>
 /// None = delegate not answered yet.
 pub static PUBLIC_LISTING: GlobalSignal<Option<bool>> = Signal::global(|| None);
 
+/// The publisher's control record (latest deployed build + feature flags).
+/// None = not arrived / not decodable — behave as if no control exists.
+pub static CONTROL: GlobalSignal<Option<freebird_control::ControlV1>> = Signal::global(|| None);
+
+/// Highest build the user dismissed the update banner for. None until the
+/// delegate answers (the banner waits, so it never flashes pre-dismissal).
+pub static DISMISSED_BUILD: GlobalSignal<Option<u64>> = Signal::global(|| None);
+
 /// Result of asking the freebird delegate for `posting_key`:
 /// None = not answered yet; Some(None) = no account stored (onboard);
 /// Some(Some(seed)) = existing account.

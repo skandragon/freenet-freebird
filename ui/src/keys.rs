@@ -13,7 +13,13 @@ pub const FEED_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/feed_contract
 pub const INBOX_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract.wasm");
 pub const AVATAR_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/avatar_contract.wasm");
 pub const DIRECTORY_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/directory_contract.wasm");
+pub const CELL_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/cell_contract.wasm");
 pub const FREEBIRD_DELEGATE_WASM: &[u8] = include_bytes!("../contracts/freebird_delegate.wasm");
+
+/// This bundle's build number (git commit count; 0 in git-less dev builds).
+pub fn own_build() -> u64 {
+    env!("BUILD_NUMBER").parse().unwrap_or(0)
+}
 
 /// The Freenet Ghost Key master verifying key — the compiled-in trust anchor
 /// every canonical Freebird client derives addresses with.
@@ -90,6 +96,18 @@ pub fn directory_key() -> ContractKey {
 
 pub fn directory_instance_id() -> ContractInstanceId {
     *directory_key().id()
+}
+
+/// The publisher's control cell (build number + feature flags): like the
+/// directory, params contain no per-user key, so every client derives the
+/// same address.
+pub fn control_cell_key() -> ContractKey {
+    let params = cell_contract::to_cbor(&freebird_control::control_params()).expect("params serialize");
+    contract_key(CELL_CONTRACT_WASM, params)
+}
+
+pub fn control_cell_instance_id() -> ContractInstanceId {
+    *control_cell_key().id()
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -64,6 +64,19 @@ header h1 svg { width: 1.6rem; height: 1.6rem; flex: none; }
   letter-spacing: 0.14em;
 }
 .tabs { display: flex; gap: 1rem; margin-bottom: 0.75rem; }
+.update-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  background: var(--card);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 0.5rem 0.9rem;
+  margin-bottom: 0.8rem;
+}
+.update-banner-actions { display: flex; gap: 0.8rem; }
 .columns { display: grid; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); gap: 1rem; }
 @media (max-width: 720px) { .columns { grid-template-columns: 1fr; } }
 .card {

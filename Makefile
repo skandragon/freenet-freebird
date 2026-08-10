@@ -5,7 +5,9 @@
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin
 CARGO := $(RUSTUP_BIN)/cargo
 DX := $(HOME)/.cargo/bin/dx
-WASM_TOOLS := $(HOME)/.cargo/bin/wasm-tools
+# wasm-tools may come from cargo or homebrew; a missing binary must FAIL the
+# import check, not silently pass it (grep of no output looks "clean").
+WASM_TOOLS := $(shell command -v wasm-tools || command -v $(HOME)/.cargo/bin/wasm-tools || echo /opt/homebrew/bin/wasm-tools)
 # dx shells out to cargo/rustc — give it the right toolchain first.
 export PATH := $(RUSTUP_BIN):$(HOME)/.cargo/bin:$(PATH)
 
@@ -21,11 +23,15 @@ contracts:
 	# directory-contract builds in its own invocation: joint feature
 	# unification with the pinned contracts could alter their bytes.
 	$(CARGO) build -p directory-contract --target $(WASM_TARGET) --release
+	# cell-contract likewise — and it is the FROZEN kernel: its vendored wasm
+	# must never change bytes again (see contracts/cell-contract/src/lib.rs).
+	$(CARGO) build -p cell-contract --target $(WASM_TARGET) --release
 	$(MAKE) check-imports W=$(WASM_DIR)/feed_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/inbox_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/avatar_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/directory_contract.wasm
-	cp $(WASM_DIR)/feed_contract.wasm $(WASM_DIR)/inbox_contract.wasm $(WASM_DIR)/avatar_contract.wasm $(WASM_DIR)/directory_contract.wasm ui/contracts/
+	$(MAKE) check-imports W=$(WASM_DIR)/cell_contract.wasm
+	cp $(WASM_DIR)/feed_contract.wasm $(WASM_DIR)/inbox_contract.wasm $(WASM_DIR)/avatar_contract.wasm $(WASM_DIR)/directory_contract.wasm $(WASM_DIR)/cell_contract.wasm ui/contracts/
 	$(MAKE) check-addresses
 
 delegate:
@@ -61,16 +67,25 @@ check-imports:
 	if [ -n "$$bad" ]; then echo "FORBIDDEN IMPORTS in $(W):"; echo "$$bad"; exit 1; fi
 	@echo "$(W): imports clean"
 
-# Contracts/delegate must be current first: the UI embeds their wasm
-# (include_bytes) and derives contract addresses from those exact bytes.
-ui: contracts delegate
+# The UI embeds the VENDORED wasm in ui/contracts/ (include_bytes) — the
+# committed bytes are the source of truth, because compiled bytes are not
+# reproducible across toolchains and any byte change rotates every derived
+# address. `make contracts`/`make delegate` are the deliberate acts that
+# refresh them (guarded by check-addresses); the ui build never does.
+ui:
+	$(MAKE) check-addresses
 	cd ui && $(DX) build --release
 
 test:
 	$(CARGO) test --workspace
 
+# Site first, then the control cell: the advertised build must never get
+# ahead of the bundle users can actually load.
 publish:
 	scripts/publish-ui.sh
+	$(CARGO) run -p freebird-ctl --release -- publish-control \
+	  --build $$(git rev-list --count HEAD) \
+	  --label $$(git rev-parse --short HEAD)
 
 clean:
 	$(CARGO) clean

@@ -1,0 +1,31 @@
+[package]
+name = "cell-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freebird signed-cell contract: frozen kernel for owner-signed opaque state"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+freenet-stdlib.workspace = true
+# NO freebird-core: this kernel is frozen after first pin — a shared-crate
+# dependency would give routine edits a path into these wasm bytes.
+# ed25519-dalek verification calls no RNG, but its rand_core dep needs the
+# stub backend to compile for wasm32 under wasmtime (freenet/river#241).
+getrandom = { workspace = true, features = ["custom"] }
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

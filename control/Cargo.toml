@@ -1,0 +1,20 @@
+[package]
+name = "freebird-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freebird control-channel schema (build number + feature flags) over the cell contract"
+
+[dependencies]
+# Types only — default-features = false keeps the contract entry points out
+# of consumers (same pattern as the UI's directory-contract dependency).
+cell-contract = { path = "../contracts/cell-contract", default-features = false }
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek.workspace = true
+data-encoding.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

@@ -10,7 +10,11 @@ fn cmd(program: &str, args: &[&str]) -> Option<String> {
 fn main() {
     let hash = cmd("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let date = cmd("date", &["-u", "+%Y-%m-%d"]).unwrap_or_default();
+    // Monotonic build number for the update banner; 0 = no git = dev build
+    // (the banner disables itself, see freebird_control::update_available).
+    let number = cmd("git", &["rev-list", "--count", "HEAD"]).unwrap_or_else(|| "0".into());
     println!("cargo:rustc-env=BUILD_HASH={hash}");
     println!("cargo:rustc-env=BUILD_DATE={date}");
+    println!("cargo:rustc-env=BUILD_NUMBER={number}");
     println!("cargo:rerun-if-changed=../.git/HEAD");
 }

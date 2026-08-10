@@ -2,10 +2,13 @@
 members = [
     "common",
     "contracts/avatar-contract",
+    "contracts/cell-contract",
     "contracts/directory-contract",
     "contracts/feed-contract",
     "contracts/inbox-contract",
+    "control",
     "delegates/freebird-delegate",
+    "tools/freebird-ctl",
     "ui",
 ]
 resolver = "2"

@@ -29,6 +29,11 @@ Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpower
 - `contracts/feed-contract/` — per-author feed (profile, follows, peeps,
   optional attestation)
 - `contracts/inbox-contract/` — per-author reply inbox (ghostkey-gated writes)
+- `contracts/cell-contract/` — FROZEN signed-cell kernel (owner-signed opaque
+  state; never rebuild — see its crate docs)
+- `control/` — `freebird-control`: control-channel schema (deployed build
+  number + feature flags) carried in a cell body
+- `tools/freebird-ctl/` — publisher CLI (`keygen`, `publish-control`, `show`)
 - `delegates/freebird-delegate/` — per-app encrypted KV storage on the user's
   node (posting key, drafts)
 - `ui/` — Dioxus web UI (`ui/contracts/` holds the compiled wasm the UI embeds
@@ -40,8 +45,9 @@ Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpower
 make test        # workspace tests (CRDT proptests, attestation, delegate)
 make contracts   # contract wasm + forbidden-import check (river#241 gate)
 make delegate    # delegate wasm + import check
-make ui          # dx release build (implies contracts+delegate)
-make publish     # publish the UI to Freenet via fdev (needs node tunnel)
+make ui          # dx release build (embeds the VENDORED wasm in ui/contracts/)
+make publish     # site via fdev, then the control cell via freebird-ctl
+                 # (needs node tunnel + ~/.freebird/publisher.key)
 ```
 
 Requires: rustup stable + `wasm32-unknown-unknown`, `dx` (Dioxus CLI 0.7),
