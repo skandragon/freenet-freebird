@@ -849,6 +849,15 @@ fn AuthorPage(author: [u8; 32]) -> Element {
         .map(|f| {
             let mut v = f.posts.posts.clone();
             v.sort_by(|a, b| (b.post.time, b.post.id).cmp(&(a.post.time, a.post.id)));
+            // Same rule as the home timeline: a reply whose parent is in the
+            // list is reachable via the parent's thread — hide it top-level.
+            let ids: std::collections::BTreeSet<freebird_core::types::PostId> =
+                v.iter().map(|p| p.post.id).collect();
+            v.retain(|p| {
+                p.post
+                    .in_reply_to
+                    .is_none_or(|r| r.author != author || !ids.contains(&r.post))
+            });
             v
         })
         .unwrap_or_default();
