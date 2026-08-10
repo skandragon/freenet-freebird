@@ -294,6 +294,42 @@ fn dedup_generations(v2: Vec<InboxPointer>, v1: Vec<InboxPointer>) -> Vec<InboxP
     out
 }
 
+/// Ancestors of a post, walked up `in_reply_to` through loaded feeds and
+/// returned root-first. The second value is the first parent the walk could
+/// not resolve (feed or post not loaded yet) — the caller fetches that feed
+/// and re-renders. A reference cycle terminates the walk instead of looping.
+fn ancestor_chain(
+    feeds: &std::collections::BTreeMap<[u8; 32], Option<FeedStateV1>>,
+    start: Option<PostRef>,
+) -> (Vec<([u8; 32], AuthorizedPost)>, Option<PostRef>) {
+    let mut chain: Vec<([u8; 32], AuthorizedPost)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
+        Default::default();
+    let mut cursor = start;
+    let mut unresolved = None;
+    while let Some(r) = cursor {
+        if !seen.insert((r.author, r.post)) {
+            break;
+        }
+        let found = feeds
+            .get(&r.author)
+            .and_then(|f| f.as_ref())
+            .and_then(|f| f.posts.posts.iter().find(|p| p.post.id == r.post).cloned());
+        match found {
+            Some(post) => {
+                cursor = post.post.in_reply_to;
+                chain.push((r.author, post));
+            }
+            None => {
+                unresolved = Some(r);
+                break;
+            }
+        }
+    }
+    chain.reverse();
+    (chain, unresolved)
+}
+
 fn ago(time: u64) -> String {
     let now = keys::now_ms();
     let delta_s = now.saturating_sub(time) / 1000;
@@ -827,7 +863,11 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thr
                 a { class: "muted", href: "{thread_href}", title: "thread", "{ago(post.post.time)}" }
             }
             if let Some(parent) = post.post.in_reply_to {
-                p { class: "muted replying-to", "replying to @{short_key(&parent.author)}" }
+                p { class: "muted replying-to",
+                    a { class: "muted", href: "{View::Thread(parent).to_hash()}",
+                        "replying to @{short_key(&parent.author)}"
+                    }
+                }
             }
             p { class: "content", "{post.post.content}" }
             div { class: "post-actions",
@@ -942,10 +982,48 @@ fn ThreadPage(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
         .and_then(|f| f.as_ref())
         .and_then(|f| f.posts.posts.iter().find(|p| p.post.id == post_id).cloned());
 
+    // Conversation context above the focused post: walk `in_reply_to` up
+    // through loaded feeds, root-first. An ancestor whose feed hasn't
+    // arrived yet is fetched and the chain re-renders when it lands.
+    let (ancestors, unresolved) = ancestor_chain(
+        &FEEDS.read(),
+        post.as_ref().and_then(|p| p.post.in_reply_to),
+    );
+    use_effect(move || {
+        let parent = ancestor_chain(
+            &FEEDS.read(),
+            FEEDS
+                .read()
+                .get(&author)
+                .and_then(|f| f.as_ref())
+                .and_then(|f| f.posts.posts.iter().find(|p| p.post.id == post_id))
+                .and_then(|p| p.post.in_reply_to),
+        )
+        .1;
+        if let Some(r) = parent {
+            if !FEEDS.read().contains_key(&r.author) {
+                spawn(async move {
+                    let _ = api::fetch_feed(r.author).await;
+                });
+            }
+        }
+    });
+
     rsx! {
         div { class: "thread-page",
             button { class: "link", onclick: move |_| *VIEW.write() = View::Home,
                 "← back to feed"
+            }
+            if let Some(r) = unresolved {
+                if FEEDS.read().get(&r.author).is_none_or(|f| f.is_none()) {
+                    p { class: "muted", "loading earlier peeps from @{short_key(&r.author)}…" }
+                } else {
+                    // Feed arrived but the post is gone (beyond retention).
+                    p { class: "muted", "an earlier peep by @{short_key(&r.author)} is no longer available" }
+                }
+            }
+            for (ancestor, apost) in ancestors {
+                PostCard { key: "{post_key(&ancestor, &apost.post.id)}", author: ancestor, post: apost }
             }
             match post {
                 Some(post) => rsx! { PostCard { author, post, expand_thread: true } },
@@ -1667,6 +1745,89 @@ mod tests {
             reply_post: PostId::compute(&vk, time, "follow", &None),
             time,
         }
+    }
+
+    fn feed_with_posts(sk: &SigningKey, posts: Vec<AuthorizedPost>) -> FeedStateV1 {
+        let mut feed = feed_following(sk, &[]);
+        feed.posts.posts = posts;
+        feed
+    }
+
+    /// Walking up from a reply yields every loaded ancestor root-first and
+    /// reports nothing left to fetch.
+    #[test]
+    fn ancestor_chain_walks_to_root() {
+        let a = SigningKey::generate(&mut OsRng);
+        let b = SigningKey::generate(&mut OsRng);
+        let root = keys::make_post(&a, "root".into(), None);
+        let mid = keys::make_post(
+            &b,
+            "mid".into(),
+            Some(PostRef { author: a.verifying_key().to_bytes(), post: root.post.id }),
+        );
+        let start = Some(PostRef { author: b.verifying_key().to_bytes(), post: mid.post.id });
+
+        let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
+        feeds.insert(a.verifying_key().to_bytes(), Some(feed_with_posts(&a, vec![root.clone()])));
+        feeds.insert(b.verifying_key().to_bytes(), Some(feed_with_posts(&b, vec![mid.clone()])));
+
+        let (chain, unresolved) = ancestor_chain(&feeds, start);
+        assert_eq!(unresolved, None);
+        assert_eq!(
+            chain.iter().map(|(k, p)| (*k, p.post.id)).collect::<Vec<_>>(),
+            vec![
+                (a.verifying_key().to_bytes(), root.post.id),
+                (b.verifying_key().to_bytes(), mid.post.id),
+            ]
+        );
+    }
+
+    /// A parent whose feed isn't loaded stops the walk and is reported as
+    /// unresolved so the caller can fetch it; loaded ancestors below it are
+    /// still returned.
+    #[test]
+    fn ancestor_chain_reports_unloaded_parent() {
+        let a = SigningKey::generate(&mut OsRng);
+        let b = SigningKey::generate(&mut OsRng);
+        let far = PostRef { author: a.verifying_key().to_bytes(), post: PostId([9u8; 16]) };
+        let mid = keys::make_post(&b, "mid".into(), Some(far));
+        let start = Some(PostRef { author: b.verifying_key().to_bytes(), post: mid.post.id });
+
+        let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
+        feeds.insert(b.verifying_key().to_bytes(), Some(feed_with_posts(&b, vec![mid.clone()])));
+
+        let (chain, unresolved) = ancestor_chain(&feeds, start);
+        assert_eq!(unresolved, Some(far));
+        assert_eq!(
+            chain.iter().map(|(k, p)| (*k, p.post.id)).collect::<Vec<_>>(),
+            vec![(b.verifying_key().to_bytes(), mid.post.id)]
+        );
+    }
+
+    /// A malicious `in_reply_to` cycle must terminate instead of hanging the
+    /// renderer.
+    #[test]
+    fn ancestor_chain_survives_cycles() {
+        let a = SigningKey::generate(&mut OsRng);
+        let key = a.verifying_key().to_bytes();
+        // Two posts pointing at each other (ids forged for the test — the
+        // walk never verifies signatures, it only follows references).
+        let mut p1 = keys::make_post(&a, "one".into(), None);
+        let mut p2 = keys::make_post(&a, "two".into(), None);
+        p1.post.id = PostId([1u8; 16]);
+        p2.post.id = PostId([2u8; 16]);
+        p1.post.in_reply_to = Some(PostRef { author: key, post: p2.post.id });
+        p2.post.in_reply_to = Some(PostRef { author: key, post: p1.post.id });
+
+        let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
+        feeds.insert(key, Some(feed_with_posts(&a, vec![p1.clone(), p2])));
+
+        let (chain, unresolved) = ancestor_chain(
+            &feeds,
+            Some(PostRef { author: key, post: p1.post.id }),
+        );
+        assert_eq!(unresolved, None);
+        assert_eq!(chain.len(), 2);
     }
 
     /// Anonymous announcers count exactly like verified ones (#23): the
