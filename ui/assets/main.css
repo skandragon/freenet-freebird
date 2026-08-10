@@ -139,3 +139,4 @@ button.danger { background: var(--danger); }
 button.danger-link { color: var(--danger); background: none; }
 hr { border: none; border-top: 1px solid var(--border); margin: 0.8rem 0; }
 a { color: var(--accent-text); }
+.app-footer { text-align: center; margin-top: 2rem; }
