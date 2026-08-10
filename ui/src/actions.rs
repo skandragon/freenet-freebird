@@ -118,19 +118,21 @@ async fn send_reply_pointer(
     reply: &freebird_core::types::AuthorizedPost,
 ) -> Result<(), String> {
     let fingerprint = attestation.fingerprint();
+    let replier = sk.verifying_key().to_bytes();
     let cred = ReplierCred {
         posting_key: sk.verifying_key(),
         attestation,
     };
     let ptr = ReplyPointer {
-        fingerprint: fingerprint.clone(),
+        replier,
+        fingerprint,
         target_post: target.post,
         reply_post: reply.post.id,
         time: reply.post.time,
     };
     let authorized = AuthorizedReplyPointer::new(ptr, sk);
     let delta = InboxStateV1Delta {
-        creds: Some([(fingerprint, cred)].into_iter().collect()),
+        creds: Some([(replier, cred)].into_iter().collect()),
         pointers: Some(vec![authorized]),
     };
     api::update_inbox(target.author, delta).await

@@ -9,11 +9,23 @@ use std::collections::BTreeSet;
 pub struct PostId(pub [u8; 16]);
 
 impl PostId {
-    pub fn compute(author: &VerifyingKey, time: u64, content: &str) -> Self {
+    /// Binds EVERY content-bearing field — two posts differing only in
+    /// `in_reply_to` must not collide, or arrival order forks peers silently
+    /// (dedupe is by id).
+    pub fn compute(
+        author: &VerifyingKey,
+        time: u64,
+        content: &str,
+        in_reply_to: &Option<PostRef>,
+    ) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(author.as_bytes());
         hasher.update(&time.to_be_bytes());
         hasher.update(content.as_bytes());
+        if let Some(r) = in_reply_to {
+            hasher.update(&r.author);
+            hasher.update(&r.post.0);
+        }
         let hash = hasher.finalize();
         let mut id = [0u8; 16];
         id.copy_from_slice(&hash.as_bytes()[..16]);

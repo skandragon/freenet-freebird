@@ -130,9 +130,19 @@ impl ContractInterface for Contract {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
+        if state.as_ref().is_empty() {
+            return Ok(StateDelta::from(vec![]));
+        }
         let parameters: InboxParametersV1 = deser(parameters.as_ref(), "parameters")?;
         let inbox: InboxStateV1 = deser(state.as_ref(), "state")?;
-        let summary: InboxStateV1Summary = deser(summary.as_ref(), "summary")?;
+        // Zero-byte summary = "peer has nothing" (summarize of empty state
+        // emits it); parsing it as CBOR would abort the sync instead.
+        let summary: InboxStateV1Summary = if summary.as_ref().is_empty() {
+            let empty = InboxStateV1::default();
+            empty.summarize(&empty, &parameters)
+        } else {
+            deser(summary.as_ref(), "summary")?
+        };
         match inbox.delta(&inbox, &parameters, &summary) {
             Some(d) => Ok(StateDelta::from(ser(&d)?)),
             None => Ok(StateDelta::from(vec![])),

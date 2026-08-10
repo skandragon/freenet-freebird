@@ -80,7 +80,7 @@ pub fn make_post(
     let vk = sk.verifying_key();
     let time = now_ms().min(u64::MAX - MAX_FUTURE_MS);
     let post = PostV1 {
-        id: PostId::compute(&vk, time, &content),
+        id: PostId::compute(&vk, time, &content, &in_reply_to),
         time,
         content,
         in_reply_to,

@@ -77,9 +77,19 @@ mod components {
 
     // ---- profile: single-writer LWW by version ----
 
+    /// LWW identity for a signed record: `(version, content-hash)`, ordered
+    /// lexicographically. The hash rides in the summary so two peers holding
+    /// DIFFERENT equal-version records still see each other as stale and
+    /// exchange deltas — a version-only summary leaves that conflict
+    /// permanently unreconciled.
+    pub fn lww_key<T: serde::Serialize>(version: u32, value: &T) -> (u32, [u8; 32]) {
+        let bytes = crate::to_cbor(value).expect("lww value serializes");
+        (version, *blake3::hash(&bytes).as_bytes())
+    }
+
     impl ComposableState for AuthorizedProfile {
         type ParentState = FeedStateV1;
-        type Summary = u32;
+        type Summary = (u32, [u8; 32]);
         type Delta = AuthorizedProfile;
         type Parameters = FeedParametersV1;
 
@@ -96,16 +106,16 @@ mod components {
             _parent: &Self::ParentState,
             _parameters: &Self::Parameters,
         ) -> Self::Summary {
-            self.profile.version
+            lww_key(self.profile.version, self)
         }
 
         fn delta(
             &self,
             _parent: &Self::ParentState,
             _parameters: &Self::Parameters,
-            old_version: &Self::Summary,
+            old_summary: &Self::Summary,
         ) -> Option<Self::Delta> {
-            (self.profile.version > *old_version).then(|| self.clone())
+            (lww_key(self.profile.version, self) > *old_summary).then(|| self.clone())
         }
 
         fn apply_delta(
@@ -116,13 +126,8 @@ mod components {
         ) -> Result<(), String> {
             let Some(delta) = delta else { return Ok(()) };
             check_profile(delta, &parameters.author)?;
-            // Stale/equal versions are a no-op (commutativity), except an
-            // equal-version conflict, which resolves by canonical bytes so
-            // every peer picks the same winner.
-            if delta.profile.version > self.profile.version
-                || (delta.profile.version == self.profile.version
-                    && crate::to_cbor(delta)? > crate::to_cbor(self)?)
-            {
+            // Winner = max (version, content-hash); stale deltas no-op.
+            if lww_key(delta.profile.version, delta) > lww_key(self.profile.version, self) {
                 *self = delta.clone();
             }
             Ok(())
@@ -143,7 +148,7 @@ mod components {
 
     impl ComposableState for AuthorizedFollows {
         type ParentState = FeedStateV1;
-        type Summary = u32;
+        type Summary = (u32, [u8; 32]);
         type Delta = AuthorizedFollows;
         type Parameters = FeedParametersV1;
 
@@ -160,16 +165,16 @@ mod components {
             _parent: &Self::ParentState,
             _parameters: &Self::Parameters,
         ) -> Self::Summary {
-            self.follows.version
+            lww_key(self.follows.version, self)
         }
 
         fn delta(
             &self,
             _parent: &Self::ParentState,
             _parameters: &Self::Parameters,
-            old_version: &Self::Summary,
+            old_summary: &Self::Summary,
         ) -> Option<Self::Delta> {
-            (self.follows.version > *old_version).then(|| self.clone())
+            (lww_key(self.follows.version, self) > *old_summary).then(|| self.clone())
         }
 
         fn apply_delta(
@@ -180,10 +185,7 @@ mod components {
         ) -> Result<(), String> {
             let Some(delta) = delta else { return Ok(()) };
             check_follows(delta, &parameters.author)?;
-            if delta.follows.version > self.follows.version
-                || (delta.follows.version == self.follows.version
-                    && crate::to_cbor(delta)? > crate::to_cbor(self)?)
-            {
+            if lww_key(delta.follows.version, delta) > lww_key(self.follows.version, self) {
                 *self = delta.clone();
             }
             Ok(())
@@ -302,7 +304,7 @@ mod components {
         if p.post.content.len() > MAX_POST_BYTES {
             return Err(format!("post over {MAX_POST_BYTES} bytes"));
         }
-        if p.post.id != PostId::compute(author, p.post.time, &p.post.content) {
+        if p.post.id != PostId::compute(author, p.post.time, &p.post.content, &p.post.in_reply_to) {
             return Err("post id does not match content".into());
         }
         p.verify_signature(author)
@@ -435,7 +437,7 @@ mod tests {
     fn make_post(sk: &SigningKey, time: u64, content: &str) -> AuthorizedPost {
         let vk = sk.verifying_key();
         let post = PostV1 {
-            id: PostId::compute(&vk, time, content),
+            id: PostId::compute(&vk, time, content, &None),
             time,
             content: content.to_string(),
             in_reply_to: None,
@@ -580,6 +582,40 @@ mod tests {
             .unwrap();
         }
         assert_eq!(s.profile.profile.name, "v3");
+    }
+
+    /// Regression (review finding #3): two peers holding DIFFERENT
+    /// equal-version profiles must reconcile via merge — a version-only
+    /// summary hid the conflict forever.
+    #[test]
+    fn equal_version_profile_conflict_reconciles_over_the_wire() {
+        let (sk, vk) = author();
+        let (_, master) = author();
+        let p = params(vk, master);
+        let mut a = base_state(&sk);
+        let mut b = base_state(&sk);
+        let pa = AuthorizedProfile::new(
+            ProfileV1 { name: "X".into(), bio: String::new(), version: 2 },
+            &sk,
+        );
+        let pb = AuthorizedProfile::new(
+            ProfileV1 { name: "Y".into(), bio: String::new(), version: 2 },
+            &sk,
+        );
+        a.profile = pa;
+        b.profile = pb;
+
+        // Full merge in both directions, as the sync protocol would.
+        let a_clone = a.clone();
+        a.merge(&a_clone, &p, &b).unwrap();
+        let b_clone = b.clone();
+        b.merge(&b_clone, &p, &a).unwrap();
+
+        assert_eq!(
+            crate::to_cbor(&a.profile).unwrap(),
+            crate::to_cbor(&b.profile).unwrap(),
+            "equal-version conflict must converge"
+        );
     }
 
     #[test]

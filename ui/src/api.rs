@@ -139,6 +139,9 @@ pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Res
 /// GET + subscribe someone's feed and inbox by author key.
 pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
+    // Pending placeholder so effects don't re-spawn the fetch every render
+    // until the response lands.
+    FEEDS.write().entry(author).or_insert(None);
     track(keys::feed_key(&vk), TrackedKind::Feed(author));
     track(keys::inbox_key(&vk), TrackedKind::Inbox(author));
     send(ClientRequest::ContractOp(ContractRequest::Get {

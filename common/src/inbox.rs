@@ -1,9 +1,15 @@
 //! Per-author reply inbox: an open-write contract where Ghost Key–attested
 //! repliers leave pointers to replies that live in their own feeds.
 //!
-//! Because certs are ~1 KB (RSA notary layer), each replier's credential is
-//! stored once in a fingerprint-keyed map; pointers reference it. The
-//! per-fingerprint cap bounds what one Ghost Key purchase can occupy.
+//! Credentials are keyed by the replier's POSTING key — the true authority a
+//! pointer's signature verifies against. Keying by ghost-key fingerprint is
+//! wrong: one Ghost Key may attest many posting keys (re-verification after a
+//! reinstall does exactly this), and a cred swap under a shared key would
+//! orphan every stored pointer and brick the inbox network-wide.
+//!
+//! The ghost-key fingerprint still rides in each pointer for the fairness
+//! cap: one purchase gets at most MAX_PER_FINGERPRINT slots regardless of
+//! how many posting keys it attests.
 
 use freenet_scaffold_macro::composable;
 
@@ -28,13 +34,13 @@ impl InboxStateV1 {
         _parameters: &InboxParametersV1,
     ) -> Result<(), String> {
         self.pointers.canonicalize();
-        let referenced: std::collections::BTreeSet<String> = self
+        let referenced: std::collections::BTreeSet<[u8; 32]> = self
             .pointers
             .pointers
             .iter()
-            .map(|p| p.ptr.fingerprint.clone())
+            .map(|p| p.ptr.replier)
             .collect();
-        self.creds.creds.retain(|fp, _| referenced.contains(fp));
+        self.creds.creds.retain(|k, _| referenced.contains(k));
         Ok(())
     }
 
@@ -74,28 +80,34 @@ mod inbox_components {
     }
 
     impl ReplierCred {
-        fn check(&self, fingerprint: &str, master: &VerifyingKey) -> Result<(), String> {
+        fn check(&self, map_key: &[u8; 32], master: &VerifyingKey) -> Result<(), String> {
+            if self.posting_key.as_bytes() != map_key {
+                return Err("credential stored under wrong posting key".into());
+            }
             self.attestation
                 .verify(&self.posting_key, Some(master))
                 .map_err(|e| format!("replier credential invalid: {e}"))?;
-            if self.attestation.fingerprint() != fingerprint {
-                return Err("credential stored under wrong fingerprint".into());
-            }
             Ok(())
+        }
+
+        pub fn fingerprint(&self) -> String {
+            self.attestation.fingerprint()
         }
     }
 
-    // ---- creds: grow-only map (cleanup prunes unreferenced entries) ----
+    // ---- creds: map keyed by posting key; LWW per entry by content hash ----
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
     pub struct CredsV1 {
-        pub creds: BTreeMap<String, ReplierCred>,
+        pub creds: BTreeMap<[u8; 32], ReplierCred>,
     }
 
     impl ComposableState for CredsV1 {
         type ParentState = InboxStateV1;
-        type Summary = BTreeSet<String>;
-        type Delta = BTreeMap<String, ReplierCred>;
+        /// posting key → attestation content hash: peers holding DIFFERENT
+        /// creds for one key must look different, or they never reconcile.
+        type Summary = BTreeMap<[u8; 32], [u8; 32]>;
+        type Delta = BTreeMap<[u8; 32], ReplierCred>;
         type Parameters = InboxParametersV1;
 
         fn verify(
@@ -103,8 +115,11 @@ mod inbox_components {
             _parent: &Self::ParentState,
             parameters: &Self::Parameters,
         ) -> Result<(), String> {
-            for (fp, cred) in &self.creds {
-                cred.check(fp, &parameters.ghostkey_master)?;
+            if self.creds.len() > MAX_POINTERS {
+                return Err("more credentials than pointers can reference".into());
+            }
+            for (key, cred) in &self.creds {
+                cred.check(key, &parameters.ghostkey_master)?;
             }
             Ok(())
         }
@@ -114,7 +129,10 @@ mod inbox_components {
             _parent: &Self::ParentState,
             _parameters: &Self::Parameters,
         ) -> Self::Summary {
-            self.creds.keys().cloned().collect()
+            self.creds
+                .iter()
+                .map(|(k, c)| (*k, c.attestation.content_hash()))
+                .collect()
         }
 
         fn delta(
@@ -123,11 +141,17 @@ mod inbox_components {
             _parameters: &Self::Parameters,
             old_summary: &Self::Summary,
         ) -> Option<Self::Delta> {
-            let delta: BTreeMap<String, ReplierCred> = self
+            let delta: BTreeMap<[u8; 32], ReplierCred> = self
                 .creds
                 .iter()
-                .filter(|(fp, _)| !old_summary.contains(*fp))
-                .map(|(fp, c)| (fp.clone(), c.clone()))
+                .filter(|(k, c)| {
+                    match old_summary.get(*k) {
+                        None => true,
+                        // Deterministic winner: max content hash.
+                        Some(theirs) => c.attestation.content_hash() > *theirs,
+                    }
+                })
+                .map(|(k, c)| (*k, c.clone()))
                 .collect();
             (!delta.is_empty()).then_some(delta)
         }
@@ -139,18 +163,19 @@ mod inbox_components {
             delta: &Option<Self::Delta>,
         ) -> Result<(), String> {
             let Some(delta) = delta else { return Ok(()) };
-            for (fp, cred) in delta {
-                cred.check(fp, &parameters.ghostkey_master)?;
-                // A fingerprint is derived from the ghost key, and the
-                // attestation binds the posting key, so two valid creds under
-                // one fingerprint differ only in attestation bytes.
-                // Deterministic winner: max canonical bytes.
-                match self.creds.get(fp) {
+            // Bound the work one delta can demand: each cred costs an RSA
+            // chain verification inside wasm.
+            if delta.len() > MAX_POINTERS {
+                return Err("credential delta too large".into());
+            }
+            for (key, cred) in delta {
+                cred.check(key, &parameters.ghostkey_master)?;
+                match self.creds.get(key) {
                     Some(existing)
                         if existing.attestation.content_hash()
                             >= cred.attestation.content_hash() => {}
                     _ => {
-                        self.creds.insert(fp.clone(), cred.clone());
+                        self.creds.insert(*key, cred.clone());
                     }
                 }
             }
@@ -162,7 +187,10 @@ mod inbox_components {
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
     pub struct ReplyPointer {
-        /// Ghost key fingerprint of the replier; must resolve in `creds`.
+        /// The replier's posting key; must resolve in `creds`.
+        pub replier: [u8; 32],
+        /// Ghost key fingerprint of the replier's credential — the fairness-
+        /// cap group. Must equal `creds[replier].fingerprint()`.
         pub fingerprint: String,
         /// The post in the inbox owner's feed being replied to.
         pub target_post: PostId,
@@ -203,11 +231,31 @@ mod inbox_components {
         (p.ptr.time, p.ptr.reply_post)
     }
 
+    /// Check a pointer against the credential map of the (in-progress) state.
+    fn check_pointer(
+        p: &AuthorizedReplyPointer,
+        creds: &BTreeMap<[u8; 32], super::ReplierCred>,
+    ) -> Result<bool, String> {
+        let Some(cred) = creds.get(&p.ptr.replier) else {
+            return Ok(false); // no credential: dropped, not fatal
+        };
+        p.verify_signature(&cred.posting_key)?;
+        if p.ptr.fingerprint != cred.fingerprint() {
+            return Err("pointer fingerprint does not match credential".into());
+        }
+        Ok(true)
+    }
+
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     pub struct PointersSummary {
-        /// (fingerprint-agnostic) identity of a pointer is the reply post id.
         pub ids: BTreeSet<PostId>,
         pub horizon: RetentionHorizon,
+        /// Per-fingerprint retention: for every fingerprint AT its cap, the
+        /// oldest key retained for it. Without this, a peer that dropped a
+        /// flooder's excess pointers advertises appetite it doesn't have and
+        /// senders re-offer the same entries every round — the same livelock
+        /// class the global horizon prevents, triggered exactly during spam.
+        pub fp_horizons: BTreeMap<String, PointerOrderKey>,
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -223,9 +271,6 @@ mod inbox_components {
             self.pointers.sort_by_key(order_key);
             self.pointers.dedup_by_key(|p| p.ptr.reply_post);
 
-            // Per-fingerprint cap: walk newest→oldest keeping the first
-            // MAX_PER_FINGERPRINT per fingerprint, so one purchase can't
-            // occupy the whole inbox.
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             let mut keep: Vec<bool> = vec![false; self.pointers.len()];
             for (i, p) in self.pointers.iter().enumerate().rev() {
@@ -251,6 +296,24 @@ mod inbox_components {
                 RetentionHorizon::OldestRetained(order_key(&self.pointers[0]))
             }
         }
+
+        fn fp_horizons(&self) -> BTreeMap<String, PointerOrderKey> {
+            let mut groups: BTreeMap<String, Vec<PointerOrderKey>> = BTreeMap::new();
+            for p in &self.pointers {
+                groups
+                    .entry(p.ptr.fingerprint.clone())
+                    .or_default()
+                    .push(order_key(p));
+            }
+            groups
+                .into_iter()
+                .filter(|(_, keys)| keys.len() >= MAX_PER_FINGERPRINT)
+                .map(|(fp, keys)| {
+                    let oldest = keys.iter().min().cloned().expect("non-empty group");
+                    (fp, oldest)
+                })
+                .collect()
+        }
     }
 
     impl ComposableState for PointersV1 {
@@ -274,12 +337,9 @@ mod inbox_components {
             }
             let mut seen = BTreeSet::new();
             for p in &self.pointers {
-                let cred = parent
-                    .creds
-                    .creds
-                    .get(&p.ptr.fingerprint)
-                    .ok_or_else(|| "pointer without credential".to_string())?;
-                p.verify_signature(&cred.posting_key)?;
+                if !check_pointer(p, &parent.creds.creds)? {
+                    return Err("pointer without credential".into());
+                }
                 if !seen.insert(p.ptr.reply_post) {
                     return Err("duplicate reply pointer".into());
                 }
@@ -295,6 +355,7 @@ mod inbox_components {
             PointersSummary {
                 ids: self.pointers.iter().map(|p| p.ptr.reply_post).collect(),
                 horizon: self.retention_horizon(),
+                fp_horizons: self.fp_horizons(),
             }
         }
 
@@ -304,9 +365,16 @@ mod inbox_components {
             _parameters: &Self::Parameters,
             old_summary: &Self::Summary,
         ) -> Option<Self::Delta> {
-            let retained = |p: &AuthorizedReplyPointer| match &old_summary.horizon {
-                RetentionHorizon::Open => true,
-                RetentionHorizon::OldestRetained(oldest) => order_key(p) > *oldest,
+            let retained = |p: &AuthorizedReplyPointer| {
+                let above_global = match &old_summary.horizon {
+                    RetentionHorizon::Open => true,
+                    RetentionHorizon::OldestRetained(oldest) => order_key(p) > *oldest,
+                };
+                let above_fp = match old_summary.fp_horizons.get(&p.ptr.fingerprint) {
+                    None => true,
+                    Some(oldest) => order_key(p) > *oldest,
+                };
+                above_global && above_fp
             };
             let delta: Vec<AuthorizedReplyPointer> = self
                 .pointers
@@ -332,8 +400,7 @@ mod inbox_components {
             // another peer's otherwise-valid delta.
             let mut accepted: Vec<AuthorizedReplyPointer> = Vec::new();
             for p in delta {
-                if let Some(cred) = parent.creds.creds.get(&p.ptr.fingerprint) {
-                    p.verify_signature(&cred.posting_key)?;
+                if check_pointer(p, &parent.creds.creds)? {
                     accepted.push(p.clone());
                 }
             }
@@ -357,21 +424,20 @@ mod tests {
     struct Replier {
         sk: SigningKey,
         cred: ReplierCred,
-        fingerprint: String,
+        key: [u8; 32],
     }
 
     fn replier(authority: &TestAuthority) -> Replier {
         let sk = SigningKey::generate(&mut OsRng);
         let vk = sk.verifying_key();
         let attestation = authority.attest(&vk);
-        let fingerprint = attestation.fingerprint();
         Replier {
-            sk,
+            key: vk.to_bytes(),
             cred: ReplierCred {
                 posting_key: vk,
                 attestation,
             },
-            fingerprint,
+            sk,
         }
     }
 
@@ -388,21 +454,22 @@ mod tests {
 
     fn pointer(r: &Replier, time: u64, tag: u64) -> AuthorizedReplyPointer {
         let ptr = ReplyPointer {
-            fingerprint: r.fingerprint.clone(),
+            replier: r.key,
+            fingerprint: r.cred.fingerprint(),
             target_post: PostId([1u8; 16]),
-            reply_post: PostId::compute(&r.sk.verifying_key(), time, &format!("r{tag}")),
+            reply_post: PostId::compute(&r.sk.verifying_key(), time, &format!("r{tag}"), &None),
             time,
         };
         AuthorizedReplyPointer::new(ptr, &r.sk)
     }
 
     fn delta_of(
-        creds: Vec<(&Replier, ())>,
+        creds: Vec<&Replier>,
         pointers: Vec<AuthorizedReplyPointer>,
     ) -> Option<InboxStateV1Delta> {
-        let creds_map: std::collections::BTreeMap<String, ReplierCred> = creds
+        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCred> = creds
             .into_iter()
-            .map(|(r, ())| (r.fingerprint.clone(), r.cred.clone()))
+            .map(|r| (r.key, r.cred.clone()))
             .collect();
         Some(InboxStateV1Delta {
             creds: (!creds_map.is_empty()).then_some(creds_map),
@@ -421,7 +488,7 @@ mod tests {
         let p = params(&authority);
         let r = replier(&authority);
         let mut s = InboxStateV1::default();
-        apply(&mut s, &p, delta_of(vec![(&r, ())], vec![pointer(&r, 5, 0)]));
+        apply(&mut s, &p, delta_of(vec![&r], vec![pointer(&r, 5, 0)]));
         assert_eq!(s.pointers.pointers.len(), 1);
         s.verify(&s.clone(), &p).expect("verifies");
     }
@@ -445,7 +512,7 @@ mod tests {
         let mut s = InboxStateV1::default();
         let clone = s.clone();
         assert!(s
-            .apply_delta(&clone, &p, &delta_of(vec![(&r, ())], vec![pointer(&r, 5, 0)]))
+            .apply_delta(&clone, &p, &delta_of(vec![&r], vec![pointer(&r, 5, 0)]))
             .is_err());
     }
 
@@ -456,14 +523,40 @@ mod tests {
         let r = replier(&authority);
         let other = replier(&authority);
         let mut s = InboxStateV1::default();
-        // Pointer claims r's fingerprint but is signed by other's key.
+        // Pointer claims r's identity but is signed by other's key.
         let mut fake = pointer(&other, 5, 0);
-        fake.ptr.fingerprint = r.fingerprint.clone();
+        fake.ptr.replier = r.key;
+        fake.ptr.fingerprint = r.cred.fingerprint();
         let fake = AuthorizedReplyPointer::new(fake.ptr, &other.sk);
+        let mut delta = delta_of(vec![&r], vec![fake]);
         let clone = s.clone();
-        assert!(s
-            .apply_delta(&clone, &p, &delta_of(vec![(&r, ())], vec![fake]))
-            .is_err());
+        assert!(s.apply_delta(&clone, &p, &mut delta).is_err());
+    }
+
+    /// Regression (review finding #1): one Ghost Key attesting a SECOND
+    /// posting key must not orphan pointers from the first — both creds
+    /// coexist under their own posting keys and the state stays valid.
+    #[test]
+    fn same_ghostkey_second_posting_key_does_not_brick_inbox() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+
+        // Two posting keys attested by chains from the same authority.
+        let r1 = replier(&authority);
+        let r2 = replier(&authority);
+
+        let mut s = InboxStateV1::default();
+        apply(&mut s, &p, delta_of(vec![&r1], vec![pointer(&r1, 5, 0)]));
+        s.verify(&s.clone(), &p).expect("valid after first reply");
+
+        // Second identity replies later — including a cred-only delta first
+        // (the shape that used to swap the shared-fingerprint cred).
+        apply(&mut s, &p, delta_of(vec![&r2], vec![]));
+        apply(&mut s, &p, delta_of(vec![&r2], vec![pointer(&r2, 6, 1)]));
+
+        s.verify(&s.clone(), &p)
+            .expect("old pointers must still verify after another cred arrives");
+        assert_eq!(s.pointers.pointers.len(), 2);
     }
 
     #[test]
@@ -474,28 +567,60 @@ mod tests {
         let honest = replier(&authority);
 
         let mut s = InboxStateV1::default();
-        apply(
-            &mut s,
-            &p,
-            delta_of(vec![(&honest, ())], vec![pointer(&honest, 1, 0)]),
-        );
-        // Spammer floods with newer pointers.
+        apply(&mut s, &p, delta_of(vec![&honest], vec![pointer(&honest, 1, 0)]));
         let flood: Vec<_> = (0..50).map(|i| pointer(&spammer, 100 + i, i)).collect();
-        apply(&mut s, &p, delta_of(vec![(&spammer, ())], flood));
+        apply(&mut s, &p, delta_of(vec![&spammer], flood));
 
         let spam_count = s
             .pointers
             .pointers
             .iter()
-            .filter(|x| x.ptr.fingerprint == spammer.fingerprint)
+            .filter(|x| x.ptr.fingerprint == spammer.cred.fingerprint())
             .count();
         assert_eq!(spam_count, MAX_PER_FINGERPRINT);
         assert!(
             s.pointers
                 .pointers
                 .iter()
-                .any(|x| x.ptr.fingerprint == honest.fingerprint),
+                .any(|x| x.ptr.fingerprint == honest.cred.fingerprint()),
             "honest pointer must survive the flood"
+        );
+    }
+
+    /// Regression (review finding #4): a peer that pruned a flooder's excess
+    /// pointers must not be re-offered them forever. After one exchange the
+    /// sender has nothing left to offer.
+    #[test]
+    fn fp_horizon_prevents_flood_reoffer_livelock() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let spammer = replier(&authority);
+
+        // Sender holds a flood (as separate states so nothing was pruned).
+        let mut sender = InboxStateV1::default();
+        apply(
+            &mut sender,
+            &p,
+            delta_of(
+                vec![&spammer],
+                (0..MAX_PER_FINGERPRINT as u64 + 5)
+                    .map(|i| pointer(&spammer, 100 + i, i))
+                    .collect(),
+            ),
+        );
+        // sender itself caps at MAX_PER_FINGERPRINT — build receiver from it.
+        let mut receiver = InboxStateV1::default();
+        let clone = receiver.clone();
+        receiver
+            .merge(&clone, &p, &sender)
+            .expect("first merge ok");
+
+        // Steady state: sender must now produce NO pointer delta.
+        let summary = receiver.summarize(&receiver.clone(), &p);
+        let delta = sender.delta(&sender.clone(), &p, &summary);
+        assert!(
+            delta.is_none() || delta.as_ref().unwrap().pointers.is_none(),
+            "sender must not re-offer capped-out pointers: {delta:?}"
         );
     }
 
@@ -505,9 +630,35 @@ mod tests {
         let p = params(&authority);
         let r = replier(&authority);
         let mut s = InboxStateV1::default();
-        // Cred delta with no surviving pointer.
-        apply(&mut s, &p, delta_of(vec![(&r, ())], vec![]));
+        apply(&mut s, &p, delta_of(vec![&r], vec![]));
         assert!(s.creds.creds.is_empty());
+    }
+
+    #[test]
+    fn oversized_cred_delta_rejected() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = replier(&authority);
+        // Fabricate a delta with more creds than can ever be referenced.
+        let mut creds_map = std::collections::BTreeMap::new();
+        for i in 0..(MAX_POINTERS + 1) {
+            let mut key = r.key;
+            key[0] = (i % 256) as u8;
+            key[1] = (i / 256) as u8;
+            creds_map.insert(key, r.cred.clone());
+        }
+        let mut s = InboxStateV1::default();
+        let clone = s.clone();
+        assert!(s
+            .apply_delta(
+                &clone,
+                &p,
+                &Some(InboxStateV1Delta {
+                    creds: Some(creds_map),
+                    pointers: None,
+                }),
+            )
+            .is_err());
     }
 
     proptest! {
@@ -533,7 +684,7 @@ mod tests {
             }
 
             let mut s1 = InboxStateV1::default();
-            apply(&mut s1, &p, delta_of(vec![(&r1, ()), (&r2, ())], vec![]));
+            apply(&mut s1, &p, delta_of(vec![&r1, &r2], vec![]));
             let mut s2 = s1.clone();
 
             for chunk in pointers.chunks(3) {
@@ -542,7 +693,6 @@ mod tests {
             for chunk in order2.chunks(4) {
                 apply(&mut s2, &p, delta_of(vec![], chunk.to_vec()));
             }
-            // Cleanup prunes creds identically on both sides.
             prop_assert_eq!(crate::to_cbor(&s1).unwrap(), crate::to_cbor(&s2).unwrap());
         }
 
@@ -554,7 +704,7 @@ mod tests {
             let r = replier(&authority);
             let mut s = InboxStateV1::default();
             let pointers: Vec<_> = times.iter().enumerate().map(|(i, t)| pointer(&r, *t, i as u64)).collect();
-            apply(&mut s, &p, delta_of(vec![(&r, ())], pointers));
+            apply(&mut s, &p, delta_of(vec![&r], pointers));
             let once = crate::to_cbor(&s).unwrap();
             s.post_apply_cleanup(&p).unwrap();
             prop_assert_eq!(once, crate::to_cbor(&s).unwrap());

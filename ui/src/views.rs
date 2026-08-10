@@ -221,11 +221,21 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
 
 #[component]
 fn Timeline() -> Element {
-    // Merge own + followed posts, newest first.
+    // Merge own + followed posts, newest first. FEEDS holds more than the
+    // timeline (thread expansion caches repliers' feeds) — filter to the
+    // feeds actually followed.
     let posts: Vec<([u8; 32], AuthorizedPost)> = {
         let feeds = FEEDS.read();
+        let mut wanted: std::collections::BTreeSet<[u8; 32]> = Default::default();
+        if let Some(own) = own_author() {
+            wanted.insert(own);
+            if let Some(Some(own_feed)) = feeds.get(&own) {
+                wanted.extend(own_feed.follows.follows.follows.iter().copied());
+            }
+        }
         let mut all: Vec<([u8; 32], AuthorizedPost)> = feeds
             .iter()
+            .filter(|(author, _)| wanted.contains(*author))
             .filter_map(|(author, state)| state.as_ref().map(|s| (author, s)))
             .flat_map(|(author, s)| {
                 s.posts.posts.iter().map(move |p| (*author, p.clone()))
@@ -316,13 +326,24 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
                     .iter()
                     .filter(|p| p.ptr.target_post == post_id)
                     .filter_map(|p| {
-                        let cred = inbox.creds.creds.get(&p.ptr.fingerprint)?;
-                        let replier = cred.posting_key.to_bytes();
+                        inbox.creds.creds.get(&p.ptr.replier)?;
+                        let replier = p.ptr.replier;
                         let found = feeds.get(&replier).and_then(|f| f.as_ref()).and_then(|f| {
                             f.posts
                                 .posts
                                 .iter()
                                 .find(|x| x.post.id == p.ptr.reply_post)
+                                // The reply must actually claim THIS post as
+                                // its parent — a pointer alone must not let
+                                // anyone graft an arbitrary peep into a
+                                // stranger's thread.
+                                .filter(|x| {
+                                    x.post.in_reply_to
+                                        == Some(PostRef {
+                                            author,
+                                            post: post_id,
+                                        })
+                                })
                                 .cloned()
                         });
                         Some((replier, found))
@@ -344,8 +365,7 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
                         .pointers
                         .pointers
                         .iter()
-                        .filter_map(|p| inbox.creds.creds.get(&p.ptr.fingerprint))
-                        .map(|c| c.posting_key.to_bytes())
+                        .map(|p| p.ptr.replier)
                         .filter(|k| !feeds.contains_key(k))
                         .collect()
                 })
