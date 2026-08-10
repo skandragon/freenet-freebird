@@ -39,24 +39,30 @@
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Figtree", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
 }
+code, .keyline, .status { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace; }
 .app { max-width: 960px; margin: 0 auto; padding: 0 1rem 4rem; }
 header { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 0; }
 header h1 {
   margin: 0;
-  font-size: 1.5rem;
-  font-weight: 800;
-  letter-spacing: -0.02em;
+  font-family: "Instrument Serif", ui-serif, Georgia, serif;
+  font-size: 1.8rem;
+  font-weight: 400;
   color: var(--accent-text);
   display: flex;
   align-items: center;
   gap: 0.45rem;
 }
 header h1 svg { width: 1.6rem; height: 1.6rem; flex: none; }
-.status { font-size: 0.8rem; color: var(--muted); }
+.status {
+  font-size: 0.7rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
 .columns { display: grid; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); gap: 1rem; }
 @media (max-width: 720px) { .columns { grid-template-columns: 1fr; } }
 .card {
