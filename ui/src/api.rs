@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
+use directory_contract::{AuthorizedListing, DirectoryStateV1};
 use ed25519_dalek::VerifyingKey;
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::{FeedParametersV1, FeedStateV1, FeedStateV1Delta};
@@ -148,6 +149,14 @@ fn inbox_container(owner: &VerifyingKey) -> ContractContainer {
     )))
 }
 
+fn directory_container() -> ContractContainer {
+    let params = freebird_core::to_cbor(&keys::directory_params()).expect("params");
+    ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(keys::DIRECTORY_CONTRACT_WASM.to_vec())),
+        Parameters::from(params),
+    )))
+}
+
 /// PUT our own feed + inbox (first run), subscribing to both.
 pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Result<(), String> {
     let feed_state = freebird_core::to_cbor(feed)?;
@@ -245,6 +254,36 @@ pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV1Delta) -> 
     send(ClientRequest::ContractOp(ContractRequest::Update {
         key: keys::inbox_key(&vk),
         data: UpdateData::Delta(StateDelta::from(bytes)),
+    }))
+    .await
+}
+
+/// GET + subscribe the well-known public directory (issue #11).
+pub async fn fetch_directory() -> Result<(), String> {
+    track(keys::directory_key(), TrackedKind::Directory);
+    send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: keys::directory_instance_id(),
+        return_contract_code: false,
+        subscribe: true,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
+/// PUT our directory listing. Put creates the directory on the very first
+/// listing network-wide and the contract's per-author LWW merge handles
+/// every later one (same pattern as avatars).
+pub async fn put_directory_listing(listing: &AuthorizedListing) -> Result<(), String> {
+    let mut state = DirectoryStateV1::default();
+    state.listings.insert(listing.listing.author, listing.clone());
+    let bytes = freebird_core::to_cbor(&state)?;
+    track(keys::directory_key(), TrackedKind::Directory);
+    send(ClientRequest::ContractOp(ContractRequest::Put {
+        contract: directory_container(),
+        state: WrappedState::new(bytes),
+        related_contracts: RelatedContracts::default(),
+        subscribe: false,
+        blocking_subscribe: false,
     }))
     .await
 }
@@ -442,6 +481,30 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                 Err(e) => log(&format!("bad avatar state: {e}")),
             }
         }
+        TrackedKind::Directory => {
+            let params = keys::directory_params();
+            let mut dir = DIRECTORY.write();
+            let entry = dir.get_or_insert_with(DirectoryStateV1::default);
+            if is_full_state {
+                match freebird_core::from_cbor::<DirectoryStateV1>(bytes) {
+                    Ok(incoming) => {
+                        if let Err(e) = entry.merge(&params, &incoming) {
+                            log(&format!("directory merge rejected: {e}"));
+                        }
+                    }
+                    Err(e) => log(&format!("bad directory state: {e}")),
+                }
+            } else {
+                match freebird_core::from_cbor::<directory_contract::DirectoryDeltaV1>(bytes) {
+                    Ok(delta) => {
+                        if let Err(e) = entry.apply_delta(&params, &delta) {
+                            log(&format!("directory delta rejected: {e}"));
+                        }
+                    }
+                    Err(e) => log(&format!("bad directory delta: {e}")),
+                }
+            }
+        }
         TrackedKind::Inbox(author) => {
             let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
             let params = keys::inbox_params(&vk);
@@ -505,6 +568,8 @@ fn dispatch_kv(payload: &[u8]) {
                 if let Some(label) = value.as_deref().and_then(|v| std::str::from_utf8(v).ok()) {
                     crate::state::apply_theme(crate::state::Theme::from_label(label));
                 }
+            } else if key == "public_listing" {
+                *PUBLIC_LISTING.write() = Some(value.as_deref() == Some(b"on".as_ref()));
             }
         }
         Ok(FreebirdDelegateResponse::Stored { .. })
@@ -554,6 +619,7 @@ pub enum TrackedKind {
     Feed([u8; 32]),
     Inbox([u8; 32]),
     Avatar([u8; 32]),
+    Directory,
 }
 
 pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> =

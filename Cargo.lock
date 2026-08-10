@@ -1283,6 +1283,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "directory-contract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ciborium",
+ "ed25519-dalek",
+ "freebird-core",
+ "freenet-stdlib",
+ "getrandom 0.2.17",
+ "rand 0.8.7",
+ "serde",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1485,6 +1499,7 @@ dependencies = [
  "bs58",
  "ciborium",
  "dioxus",
+ "directory-contract",
  "ed25519-dalek",
  "freebird-core",
  "freenet-scaffold",

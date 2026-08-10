@@ -63,6 +63,7 @@ header h1 svg { width: 1.6rem; height: 1.6rem; flex: none; }
   text-transform: uppercase;
   letter-spacing: 0.14em;
 }
+.tabs { display: flex; gap: 1rem; margin-bottom: 0.75rem; }
 .columns { display: grid; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); gap: 1rem; }
 @media (max-width: 720px) { .columns { grid-template-columns: 1fr; } }
 .card {

@@ -1,5 +1,6 @@
 //! Key material and contract-address derivation.
 
+use directory_contract::{DirectoryParametersV1, DIRECTORY_SEED};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::avatar::AvatarParametersV1;
 use freebird_core::feed::{FeedParametersV1, MAX_FUTURE_MS};
@@ -11,6 +12,7 @@ use ghostkey_lib::armorable::Armorable;
 pub const FEED_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/feed_contract.wasm");
 pub const INBOX_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract.wasm");
 pub const AVATAR_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/avatar_contract.wasm");
+pub const DIRECTORY_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/directory_contract.wasm");
 pub const FREEBIRD_DELEGATE_WASM: &[u8] = include_bytes!("../contracts/freebird_delegate.wasm");
 
 /// The Freenet Ghost Key master verifying key — the compiled-in trust anchor
@@ -36,6 +38,15 @@ pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV1 {
 
 pub fn avatar_params(author: &VerifyingKey) -> AvatarParametersV1 {
     AvatarParametersV1 { author: *author }
+}
+
+/// The public directory (issue #11): no author key in the params, so every
+/// client derives the SAME address — one instance for the whole network.
+pub fn directory_params() -> DirectoryParametersV1 {
+    DirectoryParametersV1 {
+        seed: DIRECTORY_SEED.into(),
+        ghostkey_master: master_key(),
+    }
 }
 
 fn contract_key(wasm: &[u8], params_cbor: Vec<u8>) -> ContractKey {
@@ -70,6 +81,15 @@ pub fn inbox_instance_id(owner: &VerifyingKey) -> ContractInstanceId {
 
 pub fn avatar_instance_id(author: &VerifyingKey) -> ContractInstanceId {
     *avatar_key(author).id()
+}
+
+pub fn directory_key() -> ContractKey {
+    let params = freebird_core::to_cbor(&directory_params()).expect("params serialize");
+    contract_key(DIRECTORY_CONTRACT_WASM, params)
+}
+
+pub fn directory_instance_id() -> ContractInstanceId {
+    *directory_key().id()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -121,5 +141,10 @@ mod tests {
         assert_eq!(feed_key(&a), feed_key(&a));
         assert_ne!(feed_key(&a), feed_key(&b));
         assert_ne!(feed_key(&a), inbox_key(&a), "feed and inbox differ per wasm");
+    }
+
+    #[test]
+    fn directory_address_fixed() {
+        assert_eq!(directory_key(), directory_key());
     }
 }
