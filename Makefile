@@ -19,10 +19,12 @@ WASM_DIR := target/$(WASM_TARGET)/release
 all: test contracts delegate ui
 
 contracts:
-	$(CARGO) build -p feed-contract -p inbox-contract -p avatar-contract --target $(WASM_TARGET) --release
-	# directory-contract builds in its own invocation: joint feature
-	# unification with the pinned contracts could alter their bytes.
+	$(CARGO) build -p feed-contract -p avatar-contract --target $(WASM_TARGET) --release
+	# directory-contract and inbox-contract build in their own invocations:
+	# joint feature unification with the pinned contracts could alter their
+	# bytes (inbox v2 pulls deps feed/avatar must never unify with).
 	$(CARGO) build -p directory-contract --target $(WASM_TARGET) --release
+	$(CARGO) build -p inbox-contract --target $(WASM_TARGET) --release
 	# cell-contract likewise — and it is the FROZEN kernel: its vendored wasm
 	# must never change bytes again (see contracts/cell-contract/src/lib.rs).
 	$(CARGO) build -p cell-contract --target $(WASM_TARGET) --release
