@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod types;
 
 use serde::{de::DeserializeOwned, Serialize};

@@ -18,11 +18,13 @@ freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
 freenet-scaffold-macro.workspace = true
 
+rand = { workspace = true, optional = true }
+
 [features]
 default = []
 # Mint full master→notary→ghostkey chains for tests. Pulls rand via
 # ghostkey_lib's keygen paths — native-only; never enable in a wasm build.
-test-fixtures = []
+test-fixtures = ["dep:rand"]
 
 [dev-dependencies]
 proptest.workspace = true

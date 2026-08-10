@@ -45,6 +45,21 @@ freebird-core = { path = "common" }
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
 rand = "0.8.5"
 
+# Test-only RSA blind-signature chain minting is unusably slow unoptimized
+# (ghostkeys measured ~40s → ~1.5s). Dev-profile only; release wasm unaffected.
+[profile.dev.package.blind-rsa-signatures]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3
+
 [profile.release]
 opt-level = 'z'
 lto = true
