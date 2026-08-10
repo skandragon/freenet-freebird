@@ -13,6 +13,7 @@ freenet-scaffold.workspace = true
 ghostkey_lib.workspace = true
 ciborium.workspace = true
 serde.workspace = true
+serde_json = "1"
 bs58.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand.workspace = true
@@ -32,5 +33,6 @@ web-sys = { version = "0.3", features = [
     "UrlSearchParams",
     "WebSocket",
     "MessageEvent",
+    "Response",
     "console",
 ] }

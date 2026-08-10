@@ -72,6 +72,14 @@ pub fn App() -> Element {
                     Ok(()) => api::log("sent posting_key Get"),
                     Err(e) => api::log(&format!("posting_key get failed: {e}")),
                 }
+                // Auto-discover the Identity Vault's current delegate.
+                match crate::ghostkey::discover_vault_delegate().await {
+                    Ok(key) => {
+                        api::log(&format!("vault delegate discovered: {key}"));
+                        *GHOSTKEY_DELEGATE.write() = Some(key);
+                    }
+                    Err(e) => api::log(&format!("vault delegate discovery failed: {e}")),
+                }
             }
         });
     });
@@ -483,7 +491,7 @@ fn FollowBox() -> Element {
                 }
             }
             input {
-                placeholder: "Author address (base58)",
+                placeholder: "Author address",
                 value: "{input}",
                 oninput: move |e| input.set(e.value()),
             }
@@ -501,7 +509,7 @@ fn FollowBox() -> Element {
                                 }
                             });
                         }
-                        None => error.set("not a valid 32-byte base58 key".into()),
+                        None => error.set("not a valid author address".into()),
                     }
                 },
                 "Follow"
@@ -516,12 +524,11 @@ fn VerifyBox() -> Element {
     let mut busy = use_signal(|| false);
     let mut message = use_signal(String::new);
     let verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
-    let vault_configured = !SETTINGS.read().ghostkey_delegate.is_empty();
+    let vault_found = GHOSTKEY_DELEGATE.read().is_some();
 
     // Auto-detect a Ghost Key: HasIdentity never prompts the user.
     use_effect(move || {
-        let configured = !SETTINGS.read().ghostkey_delegate.is_empty();
-        if configured && GHOSTKEY_HAS_IDENTITY.read().is_none() {
+        if GHOSTKEY_DELEGATE.read().is_some() && GHOSTKEY_HAS_IDENTITY.read().is_none() {
             spawn(async {
                 let _ = api::ghostkey_request(crate::ghostkey::GhostkeyRequest::HasIdentity).await;
             });
@@ -575,9 +582,9 @@ fn VerifyBox() -> Element {
                         }
                     },
                     None => rsx! {
-                        if !vault_configured {
+                        if !vault_found {
                             p { class: "muted",
-                                "Set the ghostkey delegate hash in Settings to enable detection."
+                                "Looking for the Identity Vault on this node…"
                             }
                         }
                     },
@@ -604,27 +611,11 @@ fn VerifyBox() -> Element {
 
 #[component]
 fn SettingsBox() -> Element {
-    let mut value = use_signal(|| SETTINGS.read().ghostkey_delegate.clone());
-    let mut saved = use_signal(|| false);
     let mut arming = use_signal(|| false);
 
     rsx! {
         section { class: "card",
-            h3 { "Settings" }
-            label { class: "muted", "Ghostkey delegate code hash (base58)" }
-            input {
-                value: "{value}",
-                oninput: move |e| { value.set(e.value()); saved.set(false); },
-            }
-            button {
-                onclick: move |_| {
-                    save_settings(&Settings { ghostkey_delegate: value.read().trim().to_string() });
-                    saved.set(true);
-                },
-                "Save"
-            }
-            if *saved.read() { span { class: "muted", " saved" } }
-            hr {}
+            h3 { "Account" }
             if *arming.read() {
                 p { class: "error",
                     "This destroys your posting key. Your feed can never be \

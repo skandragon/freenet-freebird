@@ -41,41 +41,12 @@ pub static GHOSTKEY_SIGN_RESULT: GlobalSignal<Option<Result<(Vec<u8>, Vec<u8>, S
     Signal::global(|| None);
 pub static GHOSTKEY_HAS_IDENTITY: GlobalSignal<Option<bool>> = Signal::global(|| None);
 
-#[derive(Clone, PartialEq, Debug, Default)]
-pub struct Settings {
-    /// bs58 code hash of the ghostkey delegate (Identity Vault). Config, not
-    /// a compile-time constant: re-keying the vault must not require a
-    /// Freebird rebuild (freenet/ghostkeys#21).
-    pub ghostkey_delegate: String,
-}
-
-pub static SETTINGS: GlobalSignal<Settings> = Signal::global(load_settings);
-
-const SETTINGS_KEY: &str = "freebird_settings_v1";
-
-fn load_settings() -> Settings {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-            if let Ok(Some(v)) = storage.get_item(SETTINGS_KEY) {
-                return Settings {
-                    ghostkey_delegate: v,
-                };
-            }
-        }
-    }
-    Settings::default()
-}
-
-pub fn save_settings(settings: &Settings) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-            let _ = storage.set_item(SETTINGS_KEY, &settings.ghostkey_delegate);
-        }
-    }
-    *SETTINGS.write() = settings.clone();
-}
+/// The Identity Vault's current delegate key, auto-discovered at startup
+/// from the vault webapp's published `delegate-key.json` (never hardcoded —
+/// freenet/ghostkeys#21). None until discovery completes; stays None if the
+/// vault app isn't reachable on this node.
+pub static GHOSTKEY_DELEGATE: GlobalSignal<Option<freenet_stdlib::prelude::DelegateKey>> =
+    Signal::global(|| None);
 
 pub fn own_author() -> Option<[u8; 32]> {
     ACCOUNT

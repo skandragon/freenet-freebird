@@ -1,0 +1,44 @@
+- iframe [active] [ref=f6e2]:
+  - generic [ref=f7e3]:
+    - banner [ref=f7e4]:
+      - heading "Freebird" [level=1] [ref=f7e5]
+      - generic [ref=f7e6]: connected
+    - generic [ref=f7e7]:
+      - main [ref=f7e8]:
+        - generic [ref=f7e9]:
+          - textbox "What's peeping?" [ref=f7e10]
+          - generic [ref=f7e11]:
+            - generic [ref=f7e12]: 0/2048
+            - button "Peep" [disabled] [ref=f7e13]
+        - article [ref=f7e15]:
+          - generic [ref=f7e16]:
+            - strong [ref=f7e17]: Freebird Test
+            - generic [ref=f7e18]: "@C4YkJwLQ · 2m"
+          - paragraph [ref=f7e19]: First peep from Freebird — a microblog living entirely on Freenet. 🐦
+          - generic [ref=f7e20]:
+            - button "reply" [ref=f7e21] [cursor=pointer]
+            - button "replies" [ref=f7e22] [cursor=pointer]
+      - complementary [ref=f7e23]:
+        - generic [ref=f7e24]:
+          - heading "Freebird Test" [level=3] [ref=f7e25]
+          - paragraph [ref=f7e26]: "Your address (share to be followed):"
+          - code [ref=f7e27]: C4YkJwLQuSTxTjB8gHjLBMSeTaxsNb5foRb6XLEup4jp
+          - button "edit profile" [ref=f7e28] [cursor=pointer]
+        - generic [ref=f7e29]:
+          - heading "Following (0)" [level=3] [ref=f7e30]
+          - textbox "Author address (base58)" [ref=f7e31]
+          - button "Follow" [disabled] [ref=f7e32]
+        - generic [ref=f7e33]:
+          - heading "Verification" [level=3] [ref=f7e34]
+          - paragraph [ref=f7e35]: Anonymous accounts peep freely to their own feed, but replies are only visible to followers. A Ghost Key adds a check mark and puts your replies in the thread.
+          - paragraph [ref=f7e36]: Set the ghostkey delegate hash in Settings to enable detection.
+          - button "Get check mark" [ref=f7e37] [cursor=pointer]
+        - generic [ref=f7e38]:
+          - heading "Settings" [level=3] [ref=f7e39]
+          - text: Ghostkey delegate code hash (base58)
+          - textbox [ref=f7e40]
+          - button "Save" [ref=f7e41] [cursor=pointer]
+          - separator [ref=f7e42]
+          - paragraph [ref=f7e44]: This destroys your posting key. Your feed can never be updated again and will age out of the network. There is no undo.
+          - button "Yes, delete forever" [ref=f7e45] [cursor=pointer]
+          - button "cancel" [ref=f7e46] [cursor=pointer]

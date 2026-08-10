@@ -1,0 +1,10 @@
+- iframe [ref=f8e2]:
+  - generic [ref=f9e3]:
+    - banner [ref=f9e4]:
+      - heading "Freebird" [level=1] [ref=f9e5]
+      - generic [ref=f9e6]: connected
+    - generic [ref=f9e7]:
+      - heading "Welcome" [level=2] [ref=f9e8]
+      - paragraph [ref=f9e9]: Pick a display name. Your account is a locally generated key — no signup, no server.
+      - textbox "Display name" [ref=f9e10]
+      - button "Create account" [disabled] [ref=f9e11]

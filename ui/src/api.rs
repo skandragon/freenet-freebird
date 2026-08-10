@@ -81,8 +81,16 @@ pub async fn connect() -> Result<(), String> {
                         if let Some(win) = web_sys::window() {
                             let _ = win.location().reload();
                         }
+                        *SYNC_STATUS.write() = SyncStatus::Error(e);
+                    } else if e.starts_with("connection error")
+                        || *SYNC_STATUS.read() != SyncStatus::Connected
+                    {
+                        *SYNC_STATUS.write() = SyncStatus::Error(e);
+                    } else {
+                        // Request-level error (e.g. probing a delegate that
+                        // isn't installed) — the connection is fine.
+                        log(&format!("request error: {e}"));
                     }
-                    *SYNC_STATUS.write() = SyncStatus::Error(e);
                 }
             }
         }
@@ -249,16 +257,13 @@ pub async fn kv_request(request: FreebirdDelegateRequest) -> Result<(), String> 
     .await
 }
 
-/// Ask the ghostkey delegate (key from Settings) to sign our attestation
-/// payload with the user's default ghost key. Response arrives via dispatch.
+/// Ask the ghostkey delegate (auto-discovered from the vault) to sign our
+/// attestation payload. Response arrives via dispatch.
 pub async fn ghostkey_request(request: GhostkeyRequest) -> Result<(), String> {
-    let code_hash = SETTINGS.read().ghostkey_delegate.clone();
-    if code_hash.is_empty() {
-        return Err("ghostkey delegate key not configured (Settings)".into());
-    }
-    let params = Parameters::from(Vec::<u8>::new());
-    let key = DelegateKey::from_params(code_hash, &params)
-        .map_err(|e| format!("bad ghostkey delegate key: {e}"))?;
+    let key = GHOSTKEY_DELEGATE
+        .read()
+        .clone()
+        .ok_or("Identity Vault not discovered on this node yet")?;
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&request, &mut payload).map_err(|e| e.to_string())?;
     send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
