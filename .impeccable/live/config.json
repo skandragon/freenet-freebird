@@ -1,0 +1,6 @@
+{
+  "files": ["target/dx/freebird-ui/*/web/public/index.html"],
+  "insertBefore": "</body>",
+  "commentSyntax": "html",
+  "cspChecked": true
+}

@@ -281,32 +281,54 @@ fn Home() -> Element {
 fn Compose(in_reply_to: Option<PostRef>) -> Element {
     let mut text = use_signal(String::new);
     let mut error = use_signal(String::new);
+    let mut notice = use_signal(String::new);
     let limit = freebird_core::feed::MAX_POST_BYTES;
+    let is_reply = in_reply_to.is_some();
+    let own_verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
+    let over = text.read().len() > limit;
 
     rsx! {
         div { class: "card compose",
             textarea {
-                placeholder: if in_reply_to.is_some() { "Write a reply…" } else { "What's peeping?" },
+                placeholder: if is_reply { "Write a reply…" } else { "What's peeping?" },
                 value: "{text}",
                 oninput: move |e| text.set(e.value()),
             }
+            if is_reply && !own_verified {
+                p { class: "muted",
+                    "This reply will post to your own feed, where your followers see it. \
+                     It won't appear in this thread — that takes a verified account."
+                }
+            }
             div { class: "compose-row",
-                span { class: "muted", "{text.read().len()}/{limit}" }
+                span { class: if over { "error" } else { "muted" }, "{text.read().len()}/{limit} bytes" }
                 button {
-                    disabled: text.read().trim().is_empty() || text.read().len() > limit,
+                    disabled: text.read().trim().is_empty() || over,
                     onclick: move |_| {
                         let content = text.read().trim().to_string();
+                        let verified_now = own_author().map(|a| is_verified(&a)).unwrap_or(false);
                         error.set(String::new());
+                        notice.set(String::new());
                         spawn(async move {
                             match actions::publish_post(content, in_reply_to).await {
-                                Ok(()) => text.set(String::new()),
+                                Ok(()) => {
+                                    text.set(String::new());
+                                    if is_reply {
+                                        notice.set(if verified_now {
+                                            "Reply posted to the thread.".into()
+                                        } else {
+                                            "Reply posted to your feed.".into()
+                                        });
+                                    }
+                                }
                                 Err(e) => error.set(e),
                             }
                         });
                     },
-                    if in_reply_to.is_some() { "Reply" } else { "Peep" }
+                    if is_reply { "Reply" } else { "Peep" }
                 }
             }
+            if !notice.read().is_empty() { p { class: "muted", "{notice}" } }
             if !error.read().is_empty() { p { class: "error", "{error}" } }
         }
     }
@@ -342,7 +364,7 @@ fn Timeline() -> Element {
     rsx! {
         div { class: "timeline",
             if posts.is_empty() {
-                p { class: "muted", "Nothing here yet. Peep something, or follow an author from the sidebar." }
+                p { class: "muted", "Nothing here yet. Peep something above, or add an author's address in the Following box." }
             }
             for (author, post) in posts {
                 PostCard { author, post: post.clone() }
@@ -471,10 +493,16 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
         }
     });
 
+    let inbox_loaded = INBOXES.read().contains_key(&author);
+
     rsx! {
         div { class: "thread",
             if replies.is_empty() {
-                p { class: "muted", "No verified replies yet." }
+                if inbox_loaded {
+                    p { class: "muted", "No verified replies yet." }
+                } else {
+                    p { class: "muted", "Checking for replies…" }
+                }
             }
             for (replier, reply) in replies {
                 match reply {
