@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
 //! Node connection + request plumbing + response dispatch.
 //!
 //! Slimmed from River's freenet_api layer: one WebSocket via
