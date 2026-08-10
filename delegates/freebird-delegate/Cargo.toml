@@ -1,0 +1,25 @@
+[package]
+name = "freebird-delegate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freebird per-app KV storage delegate"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+bs58.workspace = true
+freenet-stdlib.workspace = true
+freebird-core.workspace = true
+# freebird-core pulls ghostkey_lib → rand → getrandom; same stub-backend
+# treatment as the contracts (freenet/river#241). No RNG is ever called —
+# key GENERATION happens in the browser UI; this delegate only stores.
+getrandom = { workspace = true, features = ["custom"] }

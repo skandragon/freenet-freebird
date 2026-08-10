@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod delegate_api;
 pub mod feed;
 pub mod inbox;
 pub mod types;
