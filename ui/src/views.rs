@@ -1082,6 +1082,67 @@ fn PublicListingToggle(author: [u8; 32]) -> Element {
     }
 }
 
+/// Current Discover rows from the two directory signals. Reads the signals,
+/// so callers (render or effects) subscribe to directory updates.
+fn current_listings() -> Vec<([u8; 32], u64)> {
+    let legacy: Vec<([u8; 32], u64)> = LEGACY_DIRECTORY
+        .read()
+        .as_ref()
+        .map(|d| {
+            d.listings
+                .values()
+                .map(|l| (l.listing.author, l.listing.last_active))
+                .collect()
+        })
+        .unwrap_or_default();
+    let v2: Vec<([u8; 32], u64)> = DIRECTORY
+        .read()
+        .as_ref()
+        .map(|d| {
+            d.listings
+                .values()
+                .map(|l| (l.listing.author, l.listing.last_active))
+                .collect()
+        })
+        .unwrap_or_default();
+    merged_listings(&legacy, &v2)
+}
+
+/// Newest-first union of the legacy and v2 directory listings as
+/// (author, last_active) pairs — one entry per author, v2 winning
+/// unconditionally (dual-read window, #23).
+fn merged_listings(
+    legacy: &[([u8; 32], u64)],
+    v2: &[([u8; 32], u64)],
+) -> Vec<([u8; 32], u64)> {
+    let mut by_author: std::collections::BTreeMap<[u8; 32], u64> = Default::default();
+    for &(a, t) in legacy.iter().chain(v2) {
+        by_author.insert(a, t);
+    }
+    let mut v: Vec<([u8; 32], u64)> = by_author.into_iter().collect();
+    v.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
+    v
+}
+
+/// Which of the top `sample` listed authors still need a feed fetch: feed
+/// not resolved (absent OR the pending/failed `None` placeholder) and not
+/// already attempted during this Discover visit. Treating the placeholder
+/// as fetchable is deliberate — a GET that failed must not black-hole the
+/// author's name for the whole session.
+fn feeds_to_fetch(
+    listings: &[([u8; 32], u64)],
+    feeds: &std::collections::BTreeMap<[u8; 32], Option<FeedStateV1>>,
+    attempted: &std::collections::BTreeSet<[u8; 32]>,
+    sample: usize,
+) -> Vec<[u8; 32]> {
+    listings
+        .iter()
+        .take(sample)
+        .map(|&(a, _)| a)
+        .filter(|a| feeds.get(a).is_none_or(|f| f.is_none()) && !attempted.contains(a))
+        .collect()
+}
+
 /// Discover tab (issue #11): the well-known public directory — authors who
 /// opted in, newest activity first, with a sampled preview of their feeds.
 #[component]
@@ -1101,45 +1162,30 @@ fn Discover() -> Element {
     });
 
     let loaded = DIRECTORY.read().is_some() || LEGACY_DIRECTORY.read().is_some();
-    // v2 merged with the legacy v1 directory (dual-read window, #23): v2
-    // wins per author; newest-active first.
-    let listings: Vec<([u8; 32], u64)> = {
-        let mut by_author: std::collections::BTreeMap<[u8; 32], u64> = Default::default();
-        if let Some(d) = LEGACY_DIRECTORY.read().as_ref() {
-            for l in d.listings.values() {
-                by_author.insert(l.listing.author, l.listing.last_active);
-            }
-        }
-        if let Some(d) = DIRECTORY.read().as_ref() {
-            for l in d.listings.values() {
-                by_author.insert(l.listing.author, l.listing.last_active);
-            }
-        }
-        let mut v: Vec<([u8; 32], u64)> = by_author.into_iter().collect();
-        v.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
-        v
-    };
+    let listings = current_listings();
 
-    // Fetch a sample of listed authors' feeds (names, avatars, latest peeps)
-    // through the existing fetch_feed plumbing.
-    {
-        let sample: Vec<[u8; 32]> = {
-            let feeds = FEEDS.read();
-            listings
-                .iter()
-                .take(SAMPLE)
-                .map(|(a, _)| *a)
-                .filter(|a| !feeds.contains_key(a))
-                .collect()
-        };
-        use_effect(move || {
-            for a in sample.clone() {
-                spawn(async move {
-                    let _ = api::fetch_feed(a).await;
-                });
-            }
-        });
-    }
+    // Fetch a sample of listed authors' feeds (names, latest peeps) through
+    // the existing fetch_feed plumbing. Every read happens INSIDE the effect
+    // so it re-fires as the directory and feeds stream in — computing the
+    // sample at render time left the effect with the empty first-render
+    // snapshot, and no names ever loaded. `attempted` (peeked, so its own
+    // write can't re-trigger us) caps each author at one fetch per visit;
+    // remount resets it, so a feed that failed to resolve is retried on the
+    // next visit instead of being black-holed for the session.
+    let mut attempted = use_signal(std::collections::BTreeSet::<[u8; 32]>::new);
+    use_effect(move || {
+        let listings = current_listings();
+        let sample = feeds_to_fetch(&listings, &FEEDS.read(), &attempted.peek(), SAMPLE);
+        if sample.is_empty() {
+            return;
+        }
+        attempted.write().extend(sample.iter().copied());
+        for a in sample {
+            spawn(async move {
+                let _ = api::fetch_feed(a).await;
+            });
+        }
+    });
 
     let own = own_author();
     let own_follows: std::collections::BTreeSet<[u8; 32]> = own
@@ -1670,5 +1716,46 @@ mod tests {
         );
         assert_eq!(merged.len(), 3);
         assert_eq!(merged.iter().filter(|p| **p == shared).count(), 1);
+    }
+
+    /// Dual-read merge for Discover: one row per author, v2 wins even when
+    /// its last_active is older, rows sorted newest-active first.
+    #[test]
+    fn discover_listings_merge_v2_wins_newest_first() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        let legacy = [(a, 50), (b, 90)];
+        let v2 = [(b, 10), (c, 70)];
+        assert_eq!(merged_listings(&legacy, &v2), vec![(c, 70), (a, 50), (b, 10)]);
+    }
+
+    /// The fetch sample must include authors whose feed is absent AND
+    /// authors stuck on the pending/failed `None` placeholder (the session
+    /// black-hole), skip resolved feeds and ones already attempted this
+    /// visit, and honor the sample cap.
+    #[test]
+    fn discover_fetches_unresolved_feeds_once_per_visit() {
+        let missing = [1u8; 32];
+        let pending = [2u8; 32];
+        let loaded = [3u8; 32];
+        let tried = [4u8; 32];
+        let beyond = [5u8; 32];
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
+        feeds.insert(pending, None);
+        feeds.insert(loaded, Some(feed_following(&sk, &[])));
+        feeds.insert(tried, None);
+
+        let attempted: std::collections::BTreeSet<[u8; 32]> =
+            [tried].into_iter().collect();
+        let listings =
+            vec![(missing, 50), (pending, 40), (loaded, 30), (tried, 20), (beyond, 10)];
+
+        assert_eq!(
+            feeds_to_fetch(&listings, &feeds, &attempted, 4),
+            vec![missing, pending]
+        );
     }
 }
