@@ -242,6 +242,19 @@ pub fn App() -> Element {
         #[cfg(target_arch = "wasm32")]
         {
             *PENDING_FOLLOW.write() = parse_follow_param();
+            // Hash routing (issue #2): adopt the load-time hash, then track
+            // back/forward via hashchange.
+            if let Some(w) = web_sys::window() {
+                *VIEW.write() = View::from_hash(&w.location().hash().unwrap_or_default());
+                use wasm_bindgen::JsCast;
+                let on_hash = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(|| {
+                    if let Some(w) = web_sys::window() {
+                        *VIEW.write() = View::from_hash(&w.location().hash().unwrap_or_default());
+                    }
+                });
+                w.set_onhashchange(Some(on_hash.as_ref().unchecked_ref()));
+                on_hash.forget();
+            }
         }
         spawn(async {
             #[cfg(target_arch = "wasm32")]
@@ -289,6 +302,22 @@ pub fn App() -> Element {
                 }
             }
         });
+    });
+
+    // VIEW -> location.hash. Skip when the hash already means this view:
+    // breaks the hashchange feedback loop and leaves foreign hashes
+    // (#follow=) alone.
+    use_effect(move || {
+        let view = *VIEW.read();
+        #[cfg(target_arch = "wasm32")]
+        if let Some(w) = web_sys::window() {
+            let loc = w.location();
+            if View::from_hash(&loc.hash().unwrap_or_default()) != view {
+                let _ = loc.set_hash(&view.to_hash());
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = view;
     });
 
     // When the stored posting key answer arrives, resume or leave onboarding.
@@ -374,6 +403,7 @@ pub fn App() -> Element {
                 match *VIEW.read() {
                     View::Home => rsx! { Home {} },
                     View::Profile => rsx! { ProfilePage {} },
+                    View::Thread(r) => rsx! { ThreadPage { author: r.author, post_id_bytes: r.post.0.to_vec() } },
                 }
             } else if awaiting_key && matches!(status, SyncStatus::Connected | SyncStatus::Connecting) {
                 p { class: "muted", "Loading account…" }
@@ -591,15 +621,16 @@ fn Timeline() -> Element {
 }
 
 #[component]
-fn PostCard(author: [u8; 32], post: AuthorizedPost) -> Element {
+fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thread: bool) -> Element {
     let mut show_reply = use_signal(|| false);
-    let mut show_thread = use_signal(|| false);
+    let mut show_thread = use_signal(move || expand_thread);
     let name = author_name(&author);
     let verified = is_verified(&author);
     let post_ref = PostRef {
         author,
         post: post.post.id,
     };
+    let thread_href = View::Thread(post_ref).to_hash();
     let reply_count = INBOXES
         .read()
         .get(&author)
@@ -618,7 +649,9 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost) -> Element {
                 Avatar { author }
                 strong { "{name}" }
                 if verified { span { class: "check", title: "Ghost Key verified", "✔" } }
-                span { class: "muted", "@{short_key(&author)} · {ago(post.post.time)}" }
+                span { class: "muted", "@{short_key(&author)} · " }
+                // Timestamp = thread permalink (deep link, issue #2).
+                a { class: "muted", href: "{thread_href}", title: "thread", "{ago(post.post.time)}" }
             }
             if let Some(parent) = post.post.in_reply_to {
                 p { class: "muted replying-to", "replying to @{short_key(&parent.author)}" }
@@ -729,6 +762,37 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
                         None => rsx! { p { class: "muted", "loading reply from @{short_key(&replier)}…" } },
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Deep-linked single post (`#/thread/<author>/<post>`): the post with its
+/// reply thread expanded.
+#[component]
+fn ThreadPage(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
+    let post_id = freebird_core::types::PostId(post_id_bytes.clone().try_into().unwrap_or([0; 16]));
+    use_effect(move || {
+        if !FEEDS.read().contains_key(&author) {
+            spawn(async move {
+                let _ = api::fetch_feed(author).await;
+            });
+        }
+    });
+    let post = FEEDS
+        .read()
+        .get(&author)
+        .and_then(|f| f.as_ref())
+        .and_then(|f| f.posts.posts.iter().find(|p| p.post.id == post_id).cloned());
+
+    rsx! {
+        div { class: "thread-page",
+            button { class: "link", onclick: move |_| *VIEW.write() = View::Home,
+                "← back to feed"
+            }
+            match post {
+                Some(post) => rsx! { PostCard { author, post, expand_thread: true } },
+                None => rsx! { p { class: "muted", "Loading post…" } },
             }
         }
     }
