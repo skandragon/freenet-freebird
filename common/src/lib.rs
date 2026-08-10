@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod feed;
 pub mod types;
 
 use serde::{de::DeserializeOwned, Serialize};

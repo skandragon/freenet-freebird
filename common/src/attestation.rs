@@ -29,6 +29,7 @@ struct ScopedPayloadWire {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+// Manual Debug/PartialEq below: GhostkeyCertificateV1 derives neither.
 pub struct AttestationV1 {
     /// CBOR-serialized ScopedPayload, exactly as returned by the ghostkey
     /// delegate's SignResult.
@@ -83,44 +84,97 @@ impl AttestationV1 {
     }
 }
 
+impl std::fmt::Debug for AttestationV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttestationV1")
+            .field("fingerprint", &self.fingerprint())
+            .field("scoped_payload_len", &self.scoped_payload.len())
+            .finish()
+    }
+}
+
+impl PartialEq for AttestationV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_bytes() == other.canonical_bytes()
+    }
+}
+
+impl AttestationV1 {
+    /// Canonical CBOR bytes; used for equality and deterministic tie-breaks.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::to_cbor(self).expect("attestation serializes")
+    }
+
+    /// blake3 of the canonical bytes — a stable identity for summaries.
+    pub fn content_hash(&self) -> [u8; 32] {
+        *blake3::hash(&self.canonical_bytes()).as_bytes()
+    }
+}
+
 /// Test fixtures: mint a full master→notary→ghostkey chain. Native-only —
 /// RSA keygen needs a real RNG; never compile into wasm.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixtures {
     use super::*;
-    use ed25519_dalek::Signer;
+    use ed25519_dalek::{Signer, SigningKey};
     use ghostkey_lib::notary_certificate::NotaryCertificateV1;
     use rand::rngs::OsRng;
 
-    /// Mint a chain and an attestation over `posting_key`.
-    /// Returns (attestation, master verifying key).
-    pub fn test_chain(posting_key: &VerifyingKey) -> (AttestationV1, VerifyingKey) {
-        test_chain_with_payload(&AttestationV1::payload_for(posting_key))
+    /// A test-only master key that can mint multiple attestations under the
+    /// same trust root.
+    pub struct TestAuthority {
+        master_sk: SigningKey,
+        pub master_vk: VerifyingKey,
     }
 
-    /// Same, but with an arbitrary inner payload (for negative tests).
-    pub fn test_chain_with_payload(payload: &[u8]) -> (AttestationV1, VerifyingKey) {
-        let (master_sk, master_vk) =
-            ghostkey_lib::util::create_keypair(&mut OsRng).expect("keypair");
-        let (notary_cert, notary_sk) =
-            NotaryCertificateV1::new(&master_sk, &"test-tier".to_string()).expect("notary");
-        let (ghost_cert, ghost_sk) = GhostkeyCertificateV1::new(&notary_cert, &notary_sk);
+    impl TestAuthority {
+        #[allow(clippy::new_without_default)]
+        pub fn new() -> Self {
+            let (master_sk, master_vk) =
+                ghostkey_lib::util::create_keypair(&mut OsRng).expect("keypair");
+            Self {
+                master_sk,
+                master_vk,
+            }
+        }
 
-        let scoped = ScopedPayloadWire {
-            requestor: ciborium::Value::Text("test".into()),
-            payload: payload.to_vec(),
-        };
-        let scoped_bytes = crate::to_cbor(&scoped).expect("scoped payload serializes");
-        let signature = ghost_sk.sign(&scoped_bytes);
+        /// Mint a fresh notary + ghost key and sign `payload` with it.
+        pub fn mint(&self, payload: &[u8]) -> AttestationV1 {
+            let (notary_cert, notary_sk) =
+                NotaryCertificateV1::new(&self.master_sk, &"test-tier".to_string())
+                    .expect("notary");
+            let (ghost_cert, ghost_sk) = GhostkeyCertificateV1::new(&notary_cert, &notary_sk);
 
-        (
+            let scoped = ScopedPayloadWire {
+                requestor: ciborium::Value::Text("test".into()),
+                payload: payload.to_vec(),
+            };
+            let scoped_bytes = crate::to_cbor(&scoped).expect("scoped payload serializes");
+            let signature = ghost_sk.sign(&scoped_bytes);
+
             AttestationV1 {
                 scoped_payload: scoped_bytes,
                 signature,
                 certificate: ghost_cert,
-            },
-            master_vk,
-        )
+            }
+        }
+
+        pub fn attest(&self, posting_key: &VerifyingKey) -> AttestationV1 {
+            self.mint(&AttestationV1::payload_for(posting_key))
+        }
+    }
+
+    /// Mint a chain and an attestation over `posting_key`.
+    /// Returns (attestation, master verifying key).
+    pub fn test_chain(posting_key: &VerifyingKey) -> (AttestationV1, VerifyingKey) {
+        let authority = TestAuthority::new();
+        (authority.attest(posting_key), authority.master_vk)
+    }
+
+    /// Same, but with an arbitrary inner payload (for negative tests).
+    pub fn test_chain_with_payload(payload: &[u8]) -> (AttestationV1, VerifyingKey) {
+        let authority = TestAuthority::new();
+        (authority.mint(payload), authority.master_vk)
     }
 }
 

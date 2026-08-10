@@ -53,7 +53,7 @@ impl AuthorizedPost {
         Self { post, signature }
     }
 
-    pub fn verify(&self, author: &VerifyingKey) -> Result<(), String> {
+    pub fn verify_signature(&self, author: &VerifyingKey) -> Result<(), String> {
         let bytes = crate::to_cbor(&self.post)?;
         author
             .verify_strict(&bytes, &self.signature)
@@ -83,7 +83,7 @@ impl AuthorizedProfile {
         Self { profile, signature }
     }
 
-    pub fn verify(&self, author: &VerifyingKey) -> Result<(), String> {
+    pub fn verify_signature(&self, author: &VerifyingKey) -> Result<(), String> {
         let bytes = crate::to_cbor(&self.profile)?;
         author
             .verify_strict(&bytes, &self.signature)
@@ -113,7 +113,7 @@ impl AuthorizedFollows {
         Self { follows, signature }
     }
 
-    pub fn verify(&self, author: &VerifyingKey) -> Result<(), String> {
+    pub fn verify_signature(&self, author: &VerifyingKey) -> Result<(), String> {
         let bytes = crate::to_cbor(&self.follows)?;
         author
             .verify_strict(&bytes, &self.signature)
