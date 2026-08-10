@@ -215,7 +215,7 @@ pub fn App() -> Element {
                     },
                     "theme: {THEME.read().label()}"
                 }
-                span { class: "status",
+                span { class: "status", aria_live: "polite",
                     match &status {
                         SyncStatus::Connecting => "connecting…".to_string(),
                         SyncStatus::Connected => "connected".to_string(),
@@ -249,6 +249,7 @@ fn Onboarding() -> Element {
             p { "Pick a display name. Your account is a locally generated key — no signup, no server." }
             input {
                 placeholder: "Display name",
+                aria_label: "Display name",
                 value: "{name}",
                 oninput: move |e| name.set(e.value()),
             }
@@ -326,12 +327,44 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
     let own_verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
     let over = text.read().len() > limit;
 
+    let mut submit = move || {
+        let content = text.peek().trim().to_string();
+        if content.is_empty() || text.peek().len() > limit {
+            return;
+        }
+        let verified_now = own_author().map(|a| is_verified(&a)).unwrap_or(false);
+        error.set(String::new());
+        notice.set(String::new());
+        spawn(async move {
+            match actions::publish_post(content, in_reply_to).await {
+                Ok(()) => {
+                    text.set(String::new());
+                    if is_reply {
+                        notice.set(if verified_now {
+                            "Reply posted to the thread.".into()
+                        } else {
+                            "Reply posted to your feed.".into()
+                        });
+                    }
+                }
+                Err(e) => error.set(e),
+            }
+        });
+    };
+
     rsx! {
         div { class: "card compose",
             textarea {
                 placeholder: if is_reply { "Write a reply…" } else { "What's peeping?" },
+                aria_label: if is_reply { "Reply text" } else { "New peep" },
                 value: "{text}",
                 oninput: move |e| text.set(e.value()),
+                onkeydown: move |e| {
+                    let m = e.modifiers();
+                    if e.key() == Key::Enter && (m.meta() || m.ctrl()) {
+                        submit();
+                    }
+                },
             }
             if is_reply && !own_verified {
                 p { class: "muted",
@@ -343,27 +376,7 @@ fn Compose(in_reply_to: Option<PostRef>) -> Element {
                 span { class: if over { "error" } else { "muted" }, "{text.read().len()}/{limit} bytes" }
                 button {
                     disabled: text.read().trim().is_empty() || over,
-                    onclick: move |_| {
-                        let content = text.read().trim().to_string();
-                        let verified_now = own_author().map(|a| is_verified(&a)).unwrap_or(false);
-                        error.set(String::new());
-                        notice.set(String::new());
-                        spawn(async move {
-                            match actions::publish_post(content, in_reply_to).await {
-                                Ok(()) => {
-                                    text.set(String::new());
-                                    if is_reply {
-                                        notice.set(if verified_now {
-                                            "Reply posted to the thread.".into()
-                                        } else {
-                                            "Reply posted to your feed.".into()
-                                        });
-                                    }
-                                }
-                                Err(e) => error.set(e),
-                            }
-                        });
-                    },
+                    onclick: move |_| submit(),
                     if is_reply { "Reply" } else { "Peep" }
                 }
             }
@@ -566,7 +579,7 @@ fn MyAccount() -> Element {
             h3 {
                 span { class: "avatar", style: identicon_style(&author) }
                 " {author_name(&author)}"
-                if is_verified(&author) { span { class: "check", "✔" } }
+                if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
             }
             p { class: "muted keyline", "Your address (share to be followed):" }
             code { class: "keyline", "{full_key}" }
@@ -594,7 +607,7 @@ fn FollowBox() -> Element {
                     span {
                         span { class: "avatar", style: identicon_style(&f) }
                         " {author_name(&f)}"
-                        if is_verified(&f) { span { class: "check", "✔" } }
+                        if is_verified(&f) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                     }
                     button { class: "link",
                         onclick: move |_| {
@@ -606,6 +619,7 @@ fn FollowBox() -> Element {
             }
             input {
                 placeholder: "Author address",
+                aria_label: "Author address",
                 value: "{input}",
                 oninput: move |e| input.set(e.value()),
             }
@@ -693,7 +707,7 @@ fn VerifyBox() -> Element {
                     Some(false) => rsx! {
                         p { class: "muted",
                             "No Ghost Key in your node's vault yet — "
-                            a { href: "https://freenet.org/ghostkey", target: "_blank", "get one here" }
+                            a { href: "https://freenet.org/ghostkey", target: "_blank", rel: "noopener noreferrer", "get one here" }
                             ", import it in the Identity Vault, then come back."
                         }
                     },
@@ -765,6 +779,7 @@ fn ProfilePage() -> Element {
     let mut editing = use_signal(|| false);
     let mut name = use_signal(String::new);
     let mut bio = use_signal(String::new);
+    let mut edit_error = use_signal(String::new);
 
     let Some(author) = own_author() else {
         return rsx! {};
@@ -781,7 +796,7 @@ fn ProfilePage() -> Element {
                 h2 {
                     span { class: "avatar lg", style: identicon_style(&author) }
                     " {author_name(&author)}"
-                    if is_verified(&author) { span { class: "check", "✔" } }
+                    if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                 }
                 if let Some(f) = &feed {
                     if !f.profile.profile.bio.is_empty() {
@@ -793,19 +808,29 @@ fn ProfilePage() -> Element {
                 p { class: "muted keyline", "Share this link — anyone opening it can follow you in one click:" }
                 code { class: "keyline", "{follow_link(&author)}" }
                 if *editing.read() {
-                    input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name" }
-                    input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio" }
+                    input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name", aria_label: "Name" }
+                    input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio", aria_label: "Bio" }
                     button {
                         onclick: move |_| {
                             let (n, b) = (name.read().clone(), bio.read().clone());
+                            edit_error.set(String::new());
                             spawn(async move {
-                                if actions::publish_profile(n, b).await.is_ok() {
-                                    editing.set(false);
+                                match actions::publish_profile(n, b).await {
+                                    Ok(()) => editing.set(false),
+                                    Err(e) => edit_error.set(e),
                                 }
                             });
                         },
                         "Save"
                     }
+                    button { class: "link",
+                        onclick: move |_| {
+                            edit_error.set(String::new());
+                            editing.set(false);
+                        },
+                        "cancel"
+                    }
+                    if !edit_error.read().is_empty() { p { class: "error", "{edit_error}" } }
                 } else {
                     button { class: "link",
                         onclick: move |_| {
@@ -813,6 +838,7 @@ fn ProfilePage() -> Element {
                                 name.set(f.profile.profile.name.clone());
                                 bio.set(f.profile.profile.bio.clone());
                             }
+                            edit_error.set(String::new());
                             editing.set(true);
                         },
                         "edit profile"
