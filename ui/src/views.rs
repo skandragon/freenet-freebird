@@ -182,7 +182,9 @@ pub fn App() -> Element {
 
     rsx! {
         // Inlined: the app is served under /v1/contract/web/<key>/, where
-        // dx's absolute /assets/ URLs 404.
+        // dx's absolute /assets/ URLs 404. Fonts are data:-embedded — the
+        // sandbox CSP allows no external hosts.
+        style { dangerous_inner_html: include_str!("../assets/fonts.css") }
         style { dangerous_inner_html: include_str!("../assets/main.css") }
         div { class: "app",
             header {
