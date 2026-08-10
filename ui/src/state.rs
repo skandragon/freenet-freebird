@@ -126,6 +126,9 @@ pub static VIEW: GlobalSignal<View> = Signal::global(View::default);
 pub static GHOSTKEY_DELEGATE: GlobalSignal<Option<freenet_stdlib::prelude::DelegateKey>> =
     Signal::global(|| None);
 
+/// Author key from a ?follow= link the page was opened with.
+pub static PENDING_FOLLOW: GlobalSignal<Option<[u8; 32]>> = Signal::global(|| None);
+
 pub fn own_author() -> Option<[u8; 32]> {
     ACCOUNT
         .read()

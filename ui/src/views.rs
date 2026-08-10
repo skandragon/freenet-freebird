@@ -9,6 +9,44 @@ use crate::api;
 use crate::keys;
 use crate::state::*;
 
+/// The app's own base URL (path through the contract id, no query/hash).
+#[cfg(target_arch = "wasm32")]
+fn app_base_url() -> String {
+    web_sys::window()
+        .map(|w| {
+            let l = w.location();
+            format!(
+                "{}{}",
+                l.origin().unwrap_or_default(),
+                l.pathname().unwrap_or_default()
+            )
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn app_base_url() -> String {
+    String::new()
+}
+
+/// Shareable "this is me, follow me" link.
+pub fn follow_link(author: &[u8; 32]) -> String {
+    format!("{}?follow={}", app_base_url(), bs58::encode(author).into_string())
+}
+
+/// Parse ?follow=<addr> (also accepted in the fragment) from the page URL.
+#[cfg(target_arch = "wasm32")]
+fn parse_follow_param() -> Option<[u8; 32]> {
+    let l = web_sys::window()?.location();
+    let mut haystack = l.search().unwrap_or_default();
+    haystack.push('&');
+    haystack.push_str(&l.hash().unwrap_or_default());
+    let start = haystack.find("follow=")? + "follow=".len();
+    let rest = &haystack[start..];
+    let end = rest.find(['&', '#']).unwrap_or(rest.len());
+    bs58::decode(&rest[..end]).into_vec().ok()?.try_into().ok()
+}
+
 pub fn short_key(author: &[u8; 32]) -> String {
     let full = bs58::encode(author).into_string();
     full.chars().take(8).collect()
@@ -47,7 +85,12 @@ fn ago(time: u64) -> String {
 #[component]
 pub fn App() -> Element {
     use_effect(|| {
-        apply_theme(*THEME.read());
+        let theme = THEME.peek().clone();
+        apply_theme(theme);
+        #[cfg(target_arch = "wasm32")]
+        {
+            *PENDING_FOLLOW.write() = parse_follow_param();
+        }
         spawn(async {
             #[cfg(target_arch = "wasm32")]
             {
@@ -128,7 +171,10 @@ pub fn App() -> Element {
                 h1 { "Freebird" }
                 button { class: "link theme-toggle",
                     title: "Theme",
-                    onclick: move |_| apply_theme(THEME.read().next()),
+                    onclick: move |_| {
+                        let next = THEME.peek().next();
+                        apply_theme(next);
+                    },
                     "theme: {THEME.read().label()}"
                 }
                 span { class: "status",
@@ -192,9 +238,34 @@ fn Onboarding() -> Element {
 
 #[component]
 fn Home() -> Element {
+    let pending = *PENDING_FOLLOW.read();
     rsx! {
         div { class: "columns",
             main {
+                if let Some(target) = pending {
+                    if Some(target) != own_author() {
+                        div { class: "card follow-banner",
+                            span {
+                                "Follow "
+                                strong { "{author_name(&target)}" }
+                                " (@{short_key(&target)})?"
+                            }
+                            button {
+                                onclick: move |_| {
+                                    spawn(async move {
+                                        let _ = actions::set_follow(target, true).await;
+                                        *PENDING_FOLLOW.write() = None;
+                                    });
+                                },
+                                "Follow"
+                            }
+                            button { class: "link",
+                                onclick: move |_| *PENDING_FOLLOW.write() = None,
+                                "dismiss"
+                            }
+                        }
+                    }
+                }
                 Compose { in_reply_to: None }
                 Timeline {}
             }
@@ -646,8 +717,10 @@ fn ProfilePage() -> Element {
                         p { "{f.profile.profile.bio}" }
                     }
                 }
-                p { class: "muted keyline", "Your address (share to be followed):" }
+                p { class: "muted keyline", "Your address:" }
                 code { class: "keyline", "{full_key}" }
+                p { class: "muted keyline", "Share this link — anyone opening it can follow you in one click:" }
+                code { class: "keyline", "{follow_link(&author)}" }
                 if *editing.read() {
                     input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name" }
                     input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio" }

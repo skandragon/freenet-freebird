@@ -1,0 +1,7 @@
+- iframe [ref=f16e2]:
+  - generic [ref=f17e3]:
+    - banner [ref=f17e4]:
+      - heading "Freebird" [level=1] [ref=f17e5]
+      - 'button "theme: auto" [ref=f17e6] [cursor=pointer]'
+      - generic [ref=f17e7]: connecting…
+    - paragraph [ref=f17e8]: Loading account…

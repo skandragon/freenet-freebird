@@ -76,15 +76,15 @@ pub async fn connect() -> Result<(), String> {
             match msg {
                 Ok(response) => dispatch(response),
                 Err(e) => {
-                    if e.contains("AUTH_TOKEN_INVALID") {
-                        // Stale token after node restart — reload to get a new one.
-                        if let Some(win) = web_sys::window() {
-                            let _ = win.location().reload();
-                        }
-                        *SYNC_STATUS.write() = SyncStatus::Error(e);
-                    } else if e.starts_with("connection error")
-                        || *SYNC_STATUS.read() != SyncStatus::Connected
-                    {
+                    let connection_dead = e.contains("AUTH_TOKEN_INVALID")
+                        || e.contains("WebSocket is not open")
+                        || e.starts_with("connection error");
+                    if connection_dead {
+                        log(&format!("connection lost: {e}"));
+                        *SYNC_STATUS.write() =
+                            SyncStatus::Error("connection lost — reconnecting…".into());
+                        schedule_reload();
+                    } else if *SYNC_STATUS.read() != SyncStatus::Connected {
                         *SYNC_STATUS.write() = SyncStatus::Error(e);
                     } else {
                         // Request-level error (e.g. probing a delegate that
@@ -96,6 +96,24 @@ pub async fn connect() -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+/// Reload the page once, after a short delay — the simplest reliable
+/// reconnect (fresh socket, fresh auth token, full resync). Guarded so a
+/// burst of errors schedules only one.
+#[cfg(target_arch = "wasm32")]
+fn schedule_reload() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SCHEDULED: AtomicBool = AtomicBool::new(false);
+    if SCHEDULED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async {
+        crate::sleep_ms(5000).await;
+        if let Some(win) = web_sys::window() {
+            let _ = win.location().reload();
+        }
+    });
 }
 
 pub async fn send(request: ClientRequest<'static>) -> Result<(), String> {

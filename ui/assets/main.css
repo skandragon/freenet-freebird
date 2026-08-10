@@ -93,6 +93,7 @@ input {
   color: var(--text);
 }
 aside h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+.follow-banner { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
 .onboarding { max-width: 420px; margin: 3rem auto; }
 button.danger { background: var(--danger); }
 .danger-zone { border-color: var(--danger); }
