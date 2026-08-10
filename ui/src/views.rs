@@ -134,7 +134,10 @@ pub fn App() -> Element {
                 }
             }
             if onboarded {
-                Home {}
+                match *VIEW.read() {
+                    View::Home => rsx! { Home {} },
+                    View::Profile => rsx! { ProfilePage {} },
+                }
             } else if awaiting_key && matches!(status, SyncStatus::Connected | SyncStatus::Connecting) {
                 p { class: "muted", "Loading account…" }
             } else {
@@ -192,8 +195,6 @@ fn Home() -> Element {
             aside {
                 MyAccount {}
                 FollowBox {}
-                VerifyBox {}
-                SettingsBox {}
             }
         }
     }
@@ -410,15 +411,9 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
 
 #[component]
 fn MyAccount() -> Element {
-    let author = own_author();
-    let mut editing = use_signal(|| false);
-    let mut name = use_signal(String::new);
-    let mut bio = use_signal(String::new);
-
-    let Some(author) = author else {
+    let Some(author) = own_author() else {
         return rsx! {};
     };
-    let feed: Option<FeedStateV1> = FEEDS.read().get(&author).cloned().flatten();
     let full_key = bs58::encode(&author).into_string();
 
     rsx! {
@@ -427,38 +422,10 @@ fn MyAccount() -> Element {
                 "{author_name(&author)}"
                 if is_verified(&author) { span { class: "check", "✔" } }
             }
-            if let Some(f) = &feed {
-                if !f.profile.profile.bio.is_empty() {
-                    p { "{f.profile.profile.bio}" }
-                }
-            }
             p { class: "muted keyline", "Your address (share to be followed):" }
             code { class: "keyline", "{full_key}" }
-            if *editing.read() {
-                input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name" }
-                input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio" }
-                button {
-                    onclick: move |_| {
-                        let (n, b) = (name.read().clone(), bio.read().clone());
-                        spawn(async move {
-                            if actions::publish_profile(n, b).await.is_ok() {
-                                editing.set(false);
-                            }
-                        });
-                    },
-                    "Save"
-                }
-            } else {
-                button { class: "link",
-                    onclick: move |_| {
-                        if let Some(f) = FEEDS.read().get(&author).cloned().flatten() {
-                            name.set(f.profile.profile.name.clone());
-                            bio.set(f.profile.profile.bio.clone());
-                        }
-                        editing.set(true);
-                    },
-                    "edit profile"
-                }
+            button { class: "link", onclick: move |_| *VIEW.write() = View::Profile,
+                "view profile"
             }
         }
     }
@@ -545,7 +512,9 @@ fn VerifyBox() -> Element {
                 Ok((scoped, sig, cert)) => {
                     spawn(async move {
                         match actions::complete_verification(scoped, sig, cert).await {
-                            Ok(tier) => message.set(format!("Verified ({tier})")),
+                            Ok(_tier) => message.set(
+                                "Congratulations! You have earned the Prized Checkmark! ✔".into(),
+                            ),
                             Err(e) => message.set(format!("Verification failed: {e}")),
                         }
                         busy.set(false);
@@ -563,7 +532,7 @@ fn VerifyBox() -> Element {
         section { class: "card",
             h3 { "Verification" }
             if verified {
-                p { span { class: "check", "✔" } " This account is Ghost Key verified. Your replies land in other people's threads." }
+                p { span { class: "check", "✔" } " This account has earned the Prized Checkmark. Your replies land in other people's threads." }
             } else {
                 p { class: "muted",
                     "Anonymous accounts peep freely to their own feed, but replies are only \
@@ -610,12 +579,12 @@ fn VerifyBox() -> Element {
 }
 
 #[component]
-fn SettingsBox() -> Element {
+fn DangerZone() -> Element {
     let mut arming = use_signal(|| false);
 
     rsx! {
-        section { class: "card",
-            h3 { "Account" }
+        section { class: "card danger-zone",
+            h3 { "Danger zone" }
             if *arming.read() {
                 p { class: "error",
                     "This destroys your posting key. Your feed can never be \
@@ -628,6 +597,7 @@ fn SettingsBox() -> Element {
                             if let Err(e) = actions::nuke_account().await {
                                 api::log(&format!("nuke failed: {e}"));
                             }
+                            *VIEW.write() = View::Home;
                         });
                     },
                     "Yes, delete forever"
@@ -638,6 +608,69 @@ fn SettingsBox() -> Element {
                     "Delete account"
                 }
             }
+        }
+    }
+}
+
+/// Your own profile: identity, editing, verification, and the danger zone.
+#[component]
+fn ProfilePage() -> Element {
+    let mut editing = use_signal(|| false);
+    let mut name = use_signal(String::new);
+    let mut bio = use_signal(String::new);
+
+    let Some(author) = own_author() else {
+        return rsx! {};
+    };
+    let feed: Option<FeedStateV1> = FEEDS.read().get(&author).cloned().flatten();
+    let full_key = bs58::encode(&author).into_string();
+
+    rsx! {
+        div { class: "profile-page",
+            button { class: "link", onclick: move |_| *VIEW.write() = View::Home,
+                "← back to feed"
+            }
+            section { class: "card",
+                h2 {
+                    "{author_name(&author)}"
+                    if is_verified(&author) { span { class: "check", "✔" } }
+                }
+                if let Some(f) = &feed {
+                    if !f.profile.profile.bio.is_empty() {
+                        p { "{f.profile.profile.bio}" }
+                    }
+                }
+                p { class: "muted keyline", "Your address (share to be followed):" }
+                code { class: "keyline", "{full_key}" }
+                if *editing.read() {
+                    input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name" }
+                    input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio" }
+                    button {
+                        onclick: move |_| {
+                            let (n, b) = (name.read().clone(), bio.read().clone());
+                            spawn(async move {
+                                if actions::publish_profile(n, b).await.is_ok() {
+                                    editing.set(false);
+                                }
+                            });
+                        },
+                        "Save"
+                    }
+                } else {
+                    button { class: "link",
+                        onclick: move |_| {
+                            if let Some(f) = FEEDS.read().get(&author).cloned().flatten() {
+                                name.set(f.profile.profile.name.clone());
+                                bio.set(f.profile.profile.bio.clone());
+                            }
+                            editing.set(true);
+                        },
+                        "edit profile"
+                    }
+                }
+            }
+            VerifyBox {}
+            DangerZone {}
         }
     }
 }

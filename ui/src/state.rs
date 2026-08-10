@@ -41,6 +41,15 @@ pub static GHOSTKEY_SIGN_RESULT: GlobalSignal<Option<Result<(Vec<u8>, Vec<u8>, S
     Signal::global(|| None);
 pub static GHOSTKEY_HAS_IDENTITY: GlobalSignal<Option<bool>> = Signal::global(|| None);
 
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum View {
+    #[default]
+    Home,
+    Profile,
+}
+
+pub static VIEW: GlobalSignal<View> = Signal::global(View::default);
+
 /// The Identity Vault's current delegate key, auto-discovered at startup
 /// from the vault webapp's published `delegate-key.json` (never hardcoded —
 /// freenet/ghostkeys#21). None until discovery completes; stays None if the
