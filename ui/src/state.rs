@@ -113,9 +113,62 @@ pub enum View {
     #[default]
     Home,
     Profile,
+    Thread(freebird_core::types::PostRef),
+}
+
+impl View {
+    /// Canonical location.hash for this view (issue #2).
+    pub fn to_hash(self) -> String {
+        match self {
+            View::Home => "#/".into(),
+            View::Profile => "#/profile".into(),
+            View::Thread(r) => format!(
+                "#/thread/{}/{}",
+                bs58::encode(r.author).into_string(),
+                bs58::encode(r.post.0).into_string()
+            ),
+        }
+    }
+
+    /// Parse a location.hash; anything unrecognized is Home.
+    pub fn from_hash(hash: &str) -> View {
+        let mut parts = hash.trim_start_matches(['#', '/']).split('/');
+        match parts.next() {
+            Some("profile") => View::Profile,
+            Some("thread") => (|| {
+                let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                let post = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                Some(View::Thread(freebird_core::types::PostRef {
+                    author,
+                    post: freebird_core::types::PostId(post),
+                }))
+            })()
+            .unwrap_or(View::Home),
+            _ => View::Home,
+        }
+    }
 }
 
 pub static VIEW: GlobalSignal<View> = Signal::global(View::default);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_roundtrip() {
+        let thread = View::Thread(freebird_core::types::PostRef {
+            author: [7; 32],
+            post: freebird_core::types::PostId([9; 16]),
+        });
+        for v in [View::Home, View::Profile, thread] {
+            assert_eq!(View::from_hash(&v.to_hash()), v);
+        }
+        assert_eq!(View::from_hash(""), View::Home);
+        assert_eq!(View::from_hash("#follow=abc"), View::Home);
+        assert_eq!(View::from_hash("#/thread/junk"), View::Home);
+    }
+}
 
 /// The Identity Vault's current delegate key, auto-discovered at startup
 /// from the vault webapp's published `delegate-key.json` (never hardcoded —
