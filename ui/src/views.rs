@@ -62,6 +62,45 @@ fn author_name(author: &[u8; 32]) -> String {
         .unwrap_or_else(|| short_key(author))
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn copy_to_clipboard(text: String) -> Result<(), String> {
+    let nav = web_sys::window().ok_or("no window")?.navigator();
+    wasm_bindgen_futures::JsFuture::from(nav.clipboard().write_text(&text))
+        .await
+        .map(|_| ())
+        .map_err(|_| "clipboard write failed".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn copy_to_clipboard(_text: String) -> Result<(), String> {
+    Err("clipboard unavailable".to_string())
+}
+
+/// A link-style button that copies `text` and confirms inline.
+#[component]
+fn CopyButton(text: String, label: String) -> Element {
+    // None = idle, Some(true) = copied, Some(false) = failed.
+    let mut state = use_signal(|| None::<bool>);
+    rsx! {
+        button { class: "link",
+            onclick: move |_| {
+                let value = text.clone();
+                spawn(async move {
+                    let ok = copy_to_clipboard(value).await.is_ok();
+                    state.set(Some(ok));
+                    crate::sleep_ms(1500).await;
+                    state.set(None);
+                });
+            },
+            match *state.read() {
+                Some(true) => "copied ✓".to_string(),
+                Some(false) => "copy failed".to_string(),
+                None => label.clone(),
+            }
+        }
+    }
+}
+
 /// Deterministic per-author color chip: two hues derived from the key.
 fn identicon_style(author: &[u8; 32]) -> String {
     let h1 = (((author[0] as u16) << 8 | author[1] as u16) % 360) as u16;
@@ -574,7 +613,6 @@ fn MyAccount() -> Element {
     let Some(author) = own_author() else {
         return rsx! {};
     };
-    let full_key = bs58::encode(&author).into_string();
 
     rsx! {
         section { class: "card",
@@ -583,8 +621,8 @@ fn MyAccount() -> Element {
                 " {author_name(&author)}"
                 if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
             }
-            p { class: "muted keyline", "Your address (share to be followed):" }
-            code { class: "keyline", "{full_key}" }
+            p { class: "muted", "Anyone opening your follow link can follow you in one click." }
+            CopyButton { text: follow_link(&author), label: "copy follow link" }
             button { class: "link", onclick: move |_| *VIEW.write() = View::Profile,
                 "view profile"
             }
@@ -807,8 +845,10 @@ fn ProfilePage() -> Element {
                 }
                 p { class: "muted keyline", "Your address:" }
                 code { class: "keyline", "{full_key}" }
+                CopyButton { text: full_key.clone(), label: "copy address" }
                 p { class: "muted keyline", "Share this link — anyone opening it can follow you in one click:" }
                 code { class: "keyline", "{follow_link(&author)}" }
+                CopyButton { text: follow_link(&author), label: "copy follow link" }
                 if *editing.read() {
                     input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name", aria_label: "Name" }
                     input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio", aria_label: "Bio" }
