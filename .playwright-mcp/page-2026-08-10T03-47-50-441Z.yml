@@ -1,0 +1,23 @@
+- iframe [ref=f12e2]:
+  - generic [ref=f13e3]:
+    - banner [ref=f13e4]:
+      - heading "Freebird" [level=1] [ref=f13e5]
+      - generic [ref=f13e6]: connected
+    - generic [ref=f13e7]:
+      - main [ref=f13e8]:
+        - generic [ref=f13e9]:
+          - textbox "What's peeping?" [ref=f13e10]
+          - generic [ref=f13e11]:
+            - generic [ref=f13e12]: 0/2048
+            - button "Peep" [disabled] [ref=f13e13]
+        - paragraph [ref=f13e15]: Nothing here yet. Peep something, or follow an author from the sidebar.
+      - complementary [ref=f13e16]:
+        - generic [ref=f13e17]:
+          - heading "Skandragon✔" [level=3] [ref=f13e18]
+          - paragraph [ref=f13e19]: "Your address (share to be followed):"
+          - code [ref=f13e20]: 7LcGz5hMFMkmAiyFhSNqkFqsMXobNW5CqSA9Yi81UTks
+          - button "view profile" [ref=f13e21] [cursor=pointer]
+        - generic [ref=f13e22]:
+          - heading "Following (0)" [level=3] [ref=f13e23]
+          - textbox "Author address" [ref=f13e24]
+          - button "Follow" [disabled] [ref=f13e25]

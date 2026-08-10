@@ -47,6 +47,7 @@ fn ago(time: u64) -> String {
 #[component]
 pub fn App() -> Element {
     use_effect(|| {
+        apply_theme(*THEME.read());
         spawn(async {
             #[cfg(target_arch = "wasm32")]
             {
@@ -125,6 +126,11 @@ pub fn App() -> Element {
         div { class: "app",
             header {
                 h1 { "Freebird" }
+                button { class: "link theme-toggle",
+                    title: "Theme",
+                    onclick: move |_| apply_theme(THEME.read().next()),
+                    "theme: {THEME.read().label()}"
+                }
                 span { class: "status",
                     match &status {
                         SyncStatus::Connecting => "connecting…".to_string(),

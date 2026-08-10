@@ -1,0 +1,18 @@
+- iframe [active] [ref=f12e2]:
+  - generic [ref=f13e3]:
+    - banner [ref=f13e4]:
+      - heading "Freebird" [level=1] [ref=f13e5]
+      - generic [ref=f13e6]: connected
+    - generic [ref=f13e26]:
+      - button "← back to feed" [ref=f13e27] [cursor=pointer]
+      - generic [ref=f13e28]:
+        - heading "Skandragon✔" [level=2] [ref=f13e29]
+        - paragraph [ref=f13e30]: "Your address (share to be followed):"
+        - code [ref=f13e31]: 7LcGz5hMFMkmAiyFhSNqkFqsMXobNW5CqSA9Yi81UTks
+        - button "edit profile" [ref=f13e32] [cursor=pointer]
+      - generic [ref=f13e33]:
+        - heading "Verification" [level=3] [ref=f13e34]
+        - paragraph [ref=f13e35]: ✔ This account has earned the Prized Checkmark. Your replies land in other people's threads.
+      - generic [ref=f13e36]:
+        - heading "Danger zone" [level=3] [ref=f13e37]
+        - button "Delete account" [ref=f13e38] [cursor=pointer]

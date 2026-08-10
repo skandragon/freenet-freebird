@@ -41,6 +41,75 @@ pub static GHOSTKEY_SIGN_RESULT: GlobalSignal<Option<Result<(Vec<u8>, Vec<u8>, S
     Signal::global(|| None);
 pub static GHOSTKEY_HAS_IDENTITY: GlobalSignal<Option<bool>> = Signal::global(|| None);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Auto => "auto",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+    pub fn next(self) -> Theme {
+        match self {
+            Theme::Auto => Theme::Light,
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Auto,
+        }
+    }
+}
+
+pub static THEME: GlobalSignal<Theme> = Signal::global(load_theme);
+
+const THEME_KEY: &str = "freebird_theme";
+
+fn load_theme() -> Theme {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(s) = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(THEME_KEY).ok().flatten())
+    {
+        return match s.as_str() {
+            "light" => Theme::Light,
+            "dark" => Theme::Dark,
+            _ => Theme::Auto,
+        };
+    }
+    Theme::Auto
+}
+
+/// Set (or clear, for Auto) the data-theme attribute the CSS keys off, and
+/// persist the choice.
+pub fn apply_theme(theme: Theme) {
+    *THEME.write() = theme;
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+            let _ = storage.set_item(THEME_KEY, theme.label());
+        }
+        if let Some(root) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+        {
+            match theme {
+                Theme::Auto => {
+                    let _ = root.remove_attribute("data-theme");
+                }
+                _ => {
+                    let _ = root.set_attribute("data-theme", theme.label());
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum View {
     #[default]
