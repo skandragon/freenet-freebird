@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "common",
+    "contracts/feed-contract",
 ]
 resolver = "2"
 
