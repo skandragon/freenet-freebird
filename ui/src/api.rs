@@ -324,12 +324,30 @@ pub async fn update_own_feed(delta: FeedStateV1Delta) -> Result<(), String> {
 }
 
 /// Send a reply pointer into the TARGET author's inbox.
+///
+/// Put, not Update: during the migration window the target's v2 inbox only
+/// exists once its OWNER has resumed on a new build — an Update to a
+/// nonexistent contract fails asynchronously (console-only) and the reply
+/// would silently vanish behind a success message. Put creates the inbox on
+/// first write (same pattern as the directory and avatars), and the
+/// contract's merge turns a Put over an existing inbox into a plain apply.
 pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV2Delta) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&target_author).map_err(|e| e.to_string())?;
-    let bytes = freebird_core::to_cbor(&delta)?;
-    send(ClientRequest::ContractOp(ContractRequest::Update {
-        key: keys::inbox_key(&vk),
-        data: UpdateData::Delta(StateDelta::from(bytes)),
+    // Materialize the delta as a self-contained state (cred + pointer): the
+    // same verification the contract runs, so a bad delta fails HERE with a
+    // real message instead of as a rejected update.
+    let mut state = InboxStateV2::default();
+    let clone = state.clone();
+    state
+        .apply_delta(&clone, &keys::inbox_params(&vk), &Some(delta))
+        .map_err(|e| format!("inbox pointer rejected locally: {e}"))?;
+    let bytes = freebird_core::to_cbor(&state)?;
+    send(ClientRequest::ContractOp(ContractRequest::Put {
+        contract: inbox_container(&vk),
+        state: WrappedState::new(bytes),
+        related_contracts: RelatedContracts::default(),
+        subscribe: false,
+        blocking_subscribe: false,
     }))
     .await
 }
@@ -647,7 +665,12 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             // State and delta are both one full signed cell (same shape as
             // the control cell). Re-verify against the author's key + the
             // "anchor" purpose before decoding.
-            let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                // TRACKED is self-populated, so this "cannot happen" — but a
+                // silent return would make the broken invariant undiagnosable.
+                log("anchor dispatch: tracked author key is not a valid key");
+                return;
+            };
             match cell_contract::from_cbor::<cell_contract::SignedCellV1>(bytes) {
                 Ok(cell) => {
                     if let Err(e) = cell.check(&keys::anchor_params(&vk)) {
@@ -733,7 +756,10 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             // Read-only remnant of the v1 inbox (dual-read window): decoded
             // with the FROZEN freebird-core v1 types, merged with the same
             // v1 merge logic the deployed contract runs.
-            let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                log("legacy inbox dispatch: tracked author key is not a valid key");
+                return;
+            };
             let params = keys::inbox_params_v1(&vk);
             let mut inboxes = LEGACY_INBOXES.write();
             let entry = inboxes.entry(author).or_default();

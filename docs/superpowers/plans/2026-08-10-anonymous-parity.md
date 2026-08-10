@@ -191,6 +191,25 @@ Mirror `control/src/lib.rs` structure and its decode-tolerance doctrine (undecod
 - [ ] **Step 1:** Write `docs/superpowers/specs/2026-08-10-anonymous-parity.md` — condensed spec: tier policy tables, fingerprint namespaces, horizon semantics, anchor schema, migration/rollback story (flags `read_v1_inbox` / `read_v1_directory`, publisher flips them off once the window closes via `freebird-ctl publish-control --flag`).
 - [ ] **Step 2:** Push branch, open PR referencing #23 with the work-item checklist mapped to commits.
 
+## Post-Review Deviations (PR #24 review pass)
+
+- Fingerprint mismatch in a delta is DROPPED, not an error (test renamed
+  `wrong_tier_fingerprint_dropped`): the anon→attested cred upgrade makes
+  mismatches an honest race, and an error would poison-pill peers' deltas.
+  Fabricated full states with mismatches still fail `verify`.
+- `canonicalize` dedups `reply_post` set-based, not adjacency-based — the
+  (time, reply_post) sort separates equal reply_posts, and adjacency dedup
+  let a free key brick an inbox (apply-accepts / verify-rejects).
+- Directory `lww_key` is `(last_active, attested, hash)`: the signature
+  covers only the listing, so an attestation-stripping re-wrap must never
+  win the equal-time tie-break.
+- `update_inbox` is a Put (creates the target's v2 inbox on first write),
+  not an Update: during the migration window most targets' v2 inboxes do
+  not exist yet and an Update would fail asynchronously and invisibly.
+- `verify` also enforces the per-fingerprint caps; anchor `decode` enforces
+  the `v >= 1` floor; tier decisions (reply pointer, listing) require the
+  own feed to be loaded so a cold start can't publish at the wrong tier.
+
 ## Self-Review Notes
 
 - Spec coverage: issue work items → Task 3 (slot policy + merge tests), Task 3 (`inbox.rs` v2 equivalent — relocated to inbox-contract per frozen-core constraint, superseding the issue's `common/src/inbox.rs` pointer), Task 4 (directory), Tasks 1/2/5/6 (anchors + v2 migration + dual-read), Task 6 (three gates), Task 7 (UI + parent-present rule), Task 8 (address rotation done deliberately).

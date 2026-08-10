@@ -373,7 +373,14 @@ mod inbox_v2_components {
         ///    crowded out by anonymous.
         pub fn canonicalize(&mut self) {
             self.pointers.sort_by_key(order_key);
-            self.pointers.dedup_by_key(|p| p.ptr.reply_post);
+            // Set-based dedup, NOT dedup_by_key: the sort is by (time,
+            // reply_post), so equal reply_posts with different times are not
+            // adjacent — adjacency-only dedup would let a free anonymous key
+            // craft a state that apply accepts and verify rejects
+            // ("duplicate reply pointer"), bricking the inbox. Keeping the
+            // lowest order key is the deterministic winner.
+            let mut seen = BTreeSet::new();
+            self.pointers.retain(|p| seen.insert(p.ptr.reply_post));
 
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             let mut keep: Vec<bool> = vec![false; self.pointers.len()];
@@ -482,6 +489,18 @@ mod inbox_v2_components {
                 return Err(format!(
                     "more than {ANON_POINTER_SLOTS} anonymous pointers"
                 ));
+            }
+            // The fairness caps are load-bearing in the two-tier design: a
+            // fabricated full state must not seat one sybil across the whole
+            // anonymous share (canonicalize would only heal it on the NEXT
+            // update).
+            let mut per_fp: BTreeMap<&str, usize> = BTreeMap::new();
+            for p in &self.pointers {
+                let c = per_fp.entry(p.ptr.fingerprint.as_str()).or_insert(0);
+                *c += 1;
+                if *c > fp_cap(&p.ptr.fingerprint) {
+                    return Err("fingerprint over its fairness cap".into());
+                }
             }
             for pair in self.pointers.windows(2) {
                 if order_key(&pair[0]) > order_key(&pair[1]) {
@@ -1074,6 +1093,45 @@ mod tests {
             pointers.canonicalize();
             prop_assert_eq!(once, freebird_core::to_cbor(&pointers).unwrap());
         }
+
+        /// Convergence AT AND ABOVE the caps: ~400 mixed-tier pointers —
+        /// enough to cross the per-fp caps, the 100-slot anon share, and
+        /// the 300 global cap — arriving in two different orders and chunk
+        /// sizes, canonicalized incrementally (the lossy path). The tiered
+        /// three-pass eviction must still be history-independent. Policy
+        /// path (fake pointers): cases are cheap, so this can actually
+        /// exercise cap scale.
+        #[test]
+        fn canonicalize_incremental_convergence_at_caps(
+            times in proptest::collection::vec(0u64..2000, 300..400),
+            seed in 0u64..1000,
+        ) {
+            let pointers: Vec<_> = times.iter().enumerate().map(|(i, t)| {
+                let fp = if i % 3 == 0 { gk_fp((i % 40) as u64) } else { anon_fp((i % 60) as u64) };
+                fake(&fp, *t, i as u64)
+            }).collect();
+            let mut order2 = pointers.clone();
+            let n = order2.len();
+            for i in 0..n {
+                let j = ((seed as usize).wrapping_mul(31).wrapping_add(i * 7)) % n;
+                order2.swap(i, j);
+            }
+
+            let mut s1 = PointersV2::default();
+            for chunk in pointers.chunks(7) {
+                s1.pointers.extend(chunk.iter().cloned());
+                s1.canonicalize();
+            }
+            let mut s2 = PointersV2::default();
+            for chunk in order2.chunks(11) {
+                s2.pointers.extend(chunk.iter().cloned());
+                s2.canonicalize();
+            }
+            prop_assert_eq!(
+                freebird_core::to_cbor(&s1).unwrap(),
+                freebird_core::to_cbor(&s2).unwrap()
+            );
+        }
     }
 
     // Orphaned-cred check must hold for anon creds too: an anon cred whose
@@ -1096,5 +1154,228 @@ mod tests {
             ghostkey_master: SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
         };
         assert!(s.pointers.verify(&s, &params).is_err());
+    }
+
+    /// Regression (PR #24 review): duplicate reply_posts with DIFFERENT
+    /// times are not adjacent after the (time, reply_post) sort — an
+    /// adjacency-only dedup let a free anonymous key craft a delta that
+    /// apply accepted and verify rejected, bricking the inbox permanently.
+    #[test]
+    fn duplicate_reply_post_across_times_deduped_and_state_verifies() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = anon_replier();
+        let mk = |time: u64, reply: PostId| {
+            AuthorizedReplyPointerV2::new(
+                ReplyPointerV2 {
+                    replier: r.key,
+                    fingerprint: r.cred.fingerprint(),
+                    target_post: PostId([1u8; 16]),
+                    reply_post: reply,
+                    time,
+                },
+                &r.sk,
+            )
+        };
+        let dup = PostId([7u8; 16]);
+        let other = PostId([8u8; 16]);
+        let mut s = InboxStateV2::default();
+        // (t=50, other) sorts BETWEEN the two dup entries.
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r], vec![mk(1, dup), mk(50, other), mk(100, dup)]),
+        );
+        assert_eq!(s.pointers.pointers.len(), 2);
+        s.verify(&s.clone(), &p)
+            .expect("a state produced by apply must always verify");
+    }
+
+    /// The tier discriminator rests on attested fingerprints being bs58
+    /// (no colon): pin that a real attestation's fingerprint can never be
+    /// mistaken for the anonymous tier.
+    #[test]
+    fn attested_fingerprint_never_anon_prefixed() {
+        let authority = TestAuthority::new();
+        let r = attested_replier(&authority);
+        assert!(!is_anon_fingerprint(&r.cred.fingerprint()));
+        assert!(is_anon_fingerprint(&anon_replier().cred.fingerprint()));
+    }
+
+    /// A fabricated full state seating one key across more than its
+    /// fairness cap must be rejected by verify — canonicalize would only
+    /// heal it on the NEXT update.
+    #[test]
+    fn verify_rejects_over_per_fingerprint_cap() {
+        let params = InboxParametersV2 {
+            owner: SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
+            ghostkey_master: SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
+        };
+        let over_anon = InboxStateV2 {
+            creds: Default::default(),
+            pointers: PointersV2 {
+                pointers: (0..MAX_PER_ANON_KEY as u64 + 1)
+                    .map(|i| fake(&anon_fp(0), i, i))
+                    .collect(),
+            },
+        };
+        assert!(over_anon.pointers.verify(&over_anon, &params).is_err());
+        let over_gk = InboxStateV2 {
+            creds: Default::default(),
+            pointers: PointersV2 {
+                pointers: (0..MAX_PER_FINGERPRINT as u64 + 1)
+                    .map(|i| fake(&gk_fp(0), i, i))
+                    .collect(),
+            },
+        };
+        assert!(over_gk.pointers.verify(&over_gk, &params).is_err());
+    }
+
+    /// The MIDDLE horizon regime: attested past their reserved majority
+    /// (250) shrinks the effective anon share to 50. The anon horizon must
+    /// be OldestRetained there — an Open horizon would re-offer pruned anon
+    /// pointers forever, exactly the livelock the machinery exists to stop.
+    #[test]
+    fn shrunken_anon_horizon_is_oldest_retained() {
+        let mut v: Vec<_> = (0..250).map(|i| fake(&gk_fp(i / 8), i, i)).collect();
+        v.extend((0..50).map(|i| fake(&anon_fp(i), 1000 + i, 1000 + i)));
+        let receiver = pointers_of(v);
+        assert_eq!(receiver.pointers.len(), MAX_POINTERS);
+        let summary = summarize_pointers(&receiver);
+        assert_eq!(summary.attested_horizon, TierHorizon::Open);
+        assert!(
+            matches!(summary.anon_horizon, TierHorizon::OldestRetained(k) if k.0 == 1000),
+            "shrunken share must close below the oldest retained anon: {:?}",
+            summary.anon_horizon
+        );
+
+        // Older anon pointer: not offered. Newer: offered.
+        let older = pointers_of(vec![fake(&anon_fp(99), 500, 99)]);
+        assert!(delta_against(&older, &summary).is_none());
+        let newer = pointers_of(vec![fake(&anon_fp(98), 2000, 98)]);
+        assert!(delta_against(&newer, &summary).is_some());
+    }
+
+    /// Attested-tier fp horizon (cap 8), the v1 livelock regression kept
+    /// alive in v2: a receiver holding a fingerprint's full cap must not be
+    /// re-offered that fingerprint's older pointers.
+    #[test]
+    fn attested_fp_horizon_prevents_reoffer() {
+        let receiver = pointers_of(
+            (0..MAX_PER_FINGERPRINT as u64)
+                .map(|i| fake(&gk_fp(0), 100 + i, i))
+                .collect(),
+        );
+        let summary = summarize_pointers(&receiver);
+        assert!(summary.fp_horizons.contains_key(&gk_fp(0)));
+
+        let older = pointers_of(vec![fake(&gk_fp(0), 50, 99)]);
+        assert!(delta_against(&older, &summary).is_none());
+        let newer = pointers_of(vec![fake(&gk_fp(0), 500, 98)]);
+        assert!(delta_against(&newer, &summary).is_some());
+    }
+
+    #[test]
+    fn scrub_future_drops_far_future_keeps_boundary() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = anon_replier();
+        let now = 1_000;
+        let boundary = now + freebird_core::feed::MAX_FUTURE_MS;
+        let mut s = InboxStateV2::default();
+        apply(
+            &mut s,
+            &p,
+            delta_of(
+                vec![&r],
+                vec![pointer(&r, boundary, 0), pointer(&r, boundary + 1, 1)],
+            ),
+        );
+        assert_eq!(s.pointers.pointers.len(), 2);
+        s.scrub_future(now);
+        assert_eq!(s.pointers.pointers.len(), 1, "exactly the boundary survives");
+        assert_eq!(s.pointers.pointers[0].ptr.time, boundary);
+    }
+
+    /// Cross-replica anon→attested upgrade, realistic bundled deltas (the
+    /// client always ships cred + pointer together), applied in BOTH
+    /// orders: the stale anon pointer dies via check_pointer on one replica
+    /// and via post_apply_cleanup on the other — the two code paths must
+    /// land on byte-identical state.
+    #[test]
+    fn upgrade_order_independent_across_replicas() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let anon = anon_replier();
+        let attested = Replier {
+            cred: ReplierCredV2 {
+                posting_key: anon.sk.verifying_key(),
+                attestation: Some(authority.attest(&anon.sk.verifying_key())),
+            },
+            sk: SigningKey::from_bytes(&anon.sk.to_bytes()),
+            key: anon.key,
+        };
+        let anon_delta = delta_of(vec![&anon], vec![pointer(&anon, 5, 0)]);
+        let att_delta = delta_of(vec![&attested], vec![pointer(&attested, 6, 1)]);
+
+        let mut a = InboxStateV2::default();
+        apply(&mut a, &p, anon_delta.clone());
+        apply(&mut a, &p, att_delta.clone());
+
+        let mut b = InboxStateV2::default();
+        apply(&mut b, &p, att_delta);
+        apply(&mut b, &p, anon_delta);
+
+        assert_eq!(
+            freebird_core::to_cbor(&a).unwrap(),
+            freebird_core::to_cbor(&b).unwrap()
+        );
+        a.verify(&a.clone(), &p).expect("verifies");
+        assert_eq!(a.pointers.pointers.len(), 1, "only the attested pointer survives");
+    }
+
+    /// Healing after the upgrade: a sender still holding the pre-upgrade
+    /// anon state converges once the upgraded state flows back, and the
+    /// exchange goes quiescent (no eternal re-offer of the dead pointers).
+    #[test]
+    fn upgrade_propagation_heals_and_goes_quiescent() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let anon = anon_replier();
+        let attested = Replier {
+            cred: ReplierCredV2 {
+                posting_key: anon.sk.verifying_key(),
+                attestation: Some(authority.attest(&anon.sk.verifying_key())),
+            },
+            sk: SigningKey::from_bytes(&anon.sk.to_bytes()),
+            key: anon.key,
+        };
+
+        // Sender: pre-upgrade anon state. Receiver: post-upgrade state.
+        let mut sender = InboxStateV2::default();
+        apply(&mut sender, &p, delta_of(vec![&anon], vec![pointer(&anon, 5, 0)]));
+        let mut receiver = InboxStateV2::default();
+        apply(
+            &mut receiver,
+            &p,
+            delta_of(vec![&attested], vec![pointer(&attested, 6, 1)]),
+        );
+
+        // Full exchange both ways.
+        let clone = receiver.clone();
+        receiver.merge(&clone, &p, &sender).expect("merge ok");
+        let clone = sender.clone();
+        sender.merge(&clone, &p, &receiver).expect("merge ok");
+
+        assert_eq!(
+            freebird_core::to_cbor(&sender).unwrap(),
+            freebird_core::to_cbor(&receiver).unwrap(),
+            "sender heals to the upgraded state"
+        );
+        // Quiescence: neither side offers anything anymore.
+        let rs = receiver.summarize(&receiver.clone(), &p);
+        assert!(sender.delta(&sender.clone(), &p, &rs).is_none());
+        let ss = sender.summarize(&sender.clone(), &p);
+        assert!(receiver.delta(&receiver.clone(), &p, &ss).is_none());
     }
 }

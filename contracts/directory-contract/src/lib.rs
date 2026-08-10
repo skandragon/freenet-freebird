@@ -94,11 +94,20 @@ impl AuthorizedListingV2 {
         Ok(())
     }
 
-    /// Per-author LWW winner: max `(last_active, content hash)` — the hash
-    /// breaks equal-time ties deterministically (e.g. re-minted attestation).
-    pub fn lww_key(&self) -> (u64, [u8; 32]) {
+    /// Per-author LWW winner: max `(last_active, attested, content hash)`.
+    /// The attested bit outranks the hash tie-break: the signature covers
+    /// only `listing`, so anyone can re-wrap a victim's signed listing with
+    /// `attestation: None` — without this bit the stripped copy would win
+    /// the equal-time hash coin-flip and demote a verified author to the
+    /// evictable anonymous tier. The hash still breaks attested-vs-attested
+    /// ties deterministically (e.g. re-minted attestation).
+    pub fn lww_key(&self) -> (u64, bool, [u8; 32]) {
         let bytes = freebird_core::to_cbor(self).expect("listing serializes");
-        (self.listing.last_active, *blake3::hash(&bytes).as_bytes())
+        (
+            self.listing.last_active,
+            self.attestation.is_some(),
+            *blake3::hash(&bytes).as_bytes(),
+        )
     }
 }
 
@@ -134,7 +143,7 @@ impl TierHorizon {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct DirectorySummaryV2 {
     /// author → per-author LWW key held (BTreeMap: canonical summary bytes).
-    pub entries: BTreeMap<[u8; 32], (u64, [u8; 32])>,
+    pub entries: BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
     pub attested_horizon: TierHorizon,
     pub anon_horizon: TierHorizon,
 }
@@ -257,6 +266,13 @@ impl DirectoryStateV2 {
                 Some(held) => l.lww_key() > *held,
             })
             .filter(|l| {
+                // Horizon-gate only authors the peer does not hold: for a
+                // held author this is an in-place LWW upgrade of an existing
+                // slot, and gating it can permanently withhold an update
+                // whose order key exactly ties the tier's oldest entry.
+                if theirs.entries.contains_key(&l.listing.author) {
+                    return true;
+                }
                 let tier = if l.is_anon() {
                     &theirs.anon_horizon
                 } else {
@@ -783,6 +799,104 @@ mod tests {
         s.scrub_future(1_000);
         assert_eq!(s.listings.len(), 1);
         assert!(s.listings.contains_key(&ok_key));
+    }
+
+    /// Attestation-stripping downgrade (PR #24 review): the signature covers
+    /// only `listing`, so anyone can re-wrap a victim's attested listing
+    /// with `attestation: None`. The attested bit in lww_key must make the
+    /// real listing win at equal time — in BOTH application orders.
+    #[test]
+    fn stripped_attestation_never_beats_attested_listing() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let a = author(&authority);
+        let real = listing(&a, 5);
+        let stripped = AuthorizedListingV2 {
+            listing: real.listing.clone(),
+            signature: real.signature, // valid: covers only `listing`
+            attestation: None,
+        };
+        stripped.check(&authority.master_vk).expect("stripped copy still checks");
+
+        let mut s1 = DirectoryStateV2::default();
+        s1.apply_delta(&p, &[real.clone()]).unwrap();
+        s1.apply_delta(&p, &[stripped.clone()]).unwrap();
+        assert!(s1.listings[&a.key].attestation.is_some(), "attested wins");
+
+        let mut s2 = DirectoryStateV2::default();
+        s2.apply_delta(&p, &[stripped]).unwrap();
+        s2.apply_delta(&p, &[real]).unwrap();
+        assert!(s2.listings[&a.key].attestation.is_some(), "attested wins both orders");
+        assert_eq!(
+            freebird_core::to_cbor(&s1).unwrap(),
+            freebird_core::to_cbor(&s2).unwrap()
+        );
+    }
+
+    /// An author who verifies upgrades their own listing: attested beats
+    /// anon at equal time, and the author's NEWER publication always wins
+    /// regardless of tier (their listing, their choice).
+    #[test]
+    fn anon_listing_upgrades_to_attested() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let a = author(&authority);
+        let anon_l = |t| {
+            AuthorizedListingV2::new(
+                ListingV1 {
+                    author: a.key,
+                    last_active: t,
+                },
+                &a.sk,
+                None,
+            )
+        };
+        let mut s = DirectoryStateV2::default();
+        s.apply_delta(&p, &[anon_l(5)]).unwrap();
+        s.apply_delta(&p, &[listing(&a, 5)]).unwrap(); // equal time: attested wins
+        assert!(s.listings[&a.key].attestation.is_some());
+        s.apply_delta(&p, &[anon_l(7)]).unwrap(); // newer self-publication wins
+        assert!(s.listings[&a.key].is_anon());
+        assert_eq!(s.listings[&a.key].listing.last_active, 7);
+    }
+
+    /// Shrunken anon share (900 attested at the 1000 cap ⇒ effective anon
+    /// share 100): the anon horizon must close below the oldest retained
+    /// anon entry, and a held author's LWW upgrade must bypass the horizon.
+    #[test]
+    fn shrunken_anon_horizon_and_held_author_bypass() {
+        let authority = TestAuthority::new();
+        let a = author(&authority);
+        let mut receiver = DirectoryStateV2::default();
+        for i in 0..900u64 {
+            let key = key_of(i, 1);
+            receiver.listings.insert(key, fake_listing(Some(&a.att), key, i));
+        }
+        for i in 0..100u64 {
+            let key = key_of(i, 2);
+            receiver.listings.insert(key, fake_listing(None, key, 1000 + i));
+        }
+        receiver.canonicalize();
+        assert_eq!(receiver.listings.len(), MAX_LISTINGS);
+        let summary = receiver.summarize();
+        assert!(
+            matches!(summary.anon_horizon, TierHorizon::OldestRetained((t, _)) if t == 1000),
+            "anon horizon must close at the shrunken share: {:?}",
+            summary.anon_horizon
+        );
+
+        // NEW anon author below the horizon: not offered.
+        let mut old_sender = DirectoryStateV2::default();
+        let new_key = key_of(999, 3);
+        old_sender.listings.insert(new_key, fake_listing(None, new_key, 1));
+        assert!(old_sender.delta(&summary).is_none());
+
+        // HELD anon author, newer copy whose order key TIES the horizon
+        // exception path: offered despite the horizon (in-place LWW).
+        let held_key = key_of(0, 2);
+        let mut upgrader = DirectoryStateV2::default();
+        upgrader.listings.insert(held_key, fake_listing(None, held_key, 5000));
+        assert!(upgrader.delta(&summary).is_some());
     }
 
     /// The legacy decoder reads what the v1 contract stored: mandatory

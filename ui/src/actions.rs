@@ -91,17 +91,18 @@ pub async fn resume_account(seed: Vec<u8>) -> Result<(), String> {
     let vk = sk.verifying_key();
     let author = vk.to_bytes();
     *ACCOUNT.write() = Some(sk.clone());
-    api::fetch_feed(author).await?;
     // Owner-republish half of the #23 migration, best-effort and idempotent:
     // make sure our v2 inbox exists (an account created pre-rotation never
-    // PUT it) and (re)publish the anchor cell pointing at it.
+    // PUT it) and (re)publish the anchor cell pointing at it. This runs
+    // BEFORE the feed fetch and regardless of its outcome — reachability
+    // for replies must not depend on a read succeeding.
     if let Err(e) = api::ensure_own_inbox(&vk).await {
         api::log(&format!("v2 inbox republish failed: {e}"));
     }
     if let Err(e) = api::publish_anchor(&sk).await {
         api::log(&format!("anchor publish failed: {e}"));
     }
-    Ok(())
+    api::fetch_feed(author).await
 }
 
 fn signing_key() -> Result<SigningKey, String> {
@@ -122,6 +123,18 @@ fn own_feed() -> Option<FeedStateV1> {
 /// attestation, when we have one, only buys the pointer durable slots.
 pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Result<(), String> {
     let sk = signing_key()?;
+    // Resolve our slot tier BEFORE publishing anything: replying while the
+    // own feed is still loading would mint an anonymous-fingerprint pointer
+    // that the later-arriving attested cred orphans (the reply would
+    // silently leave the thread). Failing up front avoids the partial state.
+    let att = if in_reply_to.is_some() {
+        own_feed()
+            .ok_or("your feed is still loading — try again in a moment")?
+            .attestation
+            .0
+    } else {
+        None
+    };
     let post = keys::make_post(&sk, content, in_reply_to);
     let mut delta = empty_delta();
     delta.posts = Some(vec![post.clone()]);
@@ -131,9 +144,13 @@ pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Resu
     apply_own_posts(vec![post.clone()]);
 
     if let Some(target) = in_reply_to {
-        let att = own_feed().and_then(|f| f.attestation.0);
         send_inbox_pointer(&sk, att, target.author, target.post, post.post.id, post.post.time)
-            .await?;
+            .await
+            // The post itself is already out — say so, or the error invites
+            // a duplicate repost.
+            .map_err(|e| {
+                format!("reply posted to your feed, but delivering it to the thread failed: {e}")
+            })?;
     }
     Ok(())
 }
@@ -267,7 +284,10 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
 pub async fn set_public_listing(on: bool) -> Result<(), String> {
     if on {
         let sk = signing_key()?;
-        let att = own_feed().and_then(|f| f.attestation.0);
+        // Refuse to guess the tier while the feed is loading: publishing an
+        // anonymous listing before our attestation arrives would demote a
+        // verified author to the evictable tier until the next refresh.
+        let att = own_feed().ok_or("feed not loaded")?.attestation.0;
         let listing = ListingV1 {
             author: sk.verifying_key().to_bytes(),
             last_active: keys::now_ms(),

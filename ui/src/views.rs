@@ -234,40 +234,61 @@ struct InboxPointer {
 }
 
 /// All pointers in `owner`'s inbox(es): v2 first, then legacy v1, deduped by
-/// (replier, reply_post) — a replier present in both generations counts
-/// once. Only pointers whose credential is present are trusted (both
-/// contracts enforce this; re-checked here because full states arrive from
-/// untrusted peers).
+/// (replier, reply_post) — the same reply pointer present in both
+/// generations counts once. Signatures are verified at ingest in `api.rs`
+/// (the contract-grade merge/apply runs client-side for both generations);
+/// this helper only re-checks referential integrity — a pointer whose
+/// credential is absent is not trusted.
 fn merged_pointers(owner: &[u8; 32]) -> Vec<InboxPointer> {
+    let v2: Vec<InboxPointer> = INBOXES
+        .read()
+        .get(owner)
+        .map(|inbox| {
+            inbox
+                .pointers
+                .pointers
+                .iter()
+                .filter(|p| inbox.creds.creds.contains_key(&p.ptr.replier))
+                .map(|p| InboxPointer {
+                    replier: p.ptr.replier,
+                    target_post: p.ptr.target_post,
+                    reply_post: p.ptr.reply_post,
+                    time: p.ptr.time,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let v1: Vec<InboxPointer> = LEGACY_INBOXES
+        .read()
+        .get(owner)
+        .map(|inbox| {
+            inbox
+                .pointers
+                .pointers
+                .iter()
+                .filter(|p| inbox.creds.creds.contains_key(&p.ptr.replier))
+                .map(|p| InboxPointer {
+                    replier: p.ptr.replier,
+                    target_post: p.ptr.target_post,
+                    reply_post: p.ptr.reply_post,
+                    time: p.ptr.time,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    dedup_generations(v2, v1)
+}
+
+/// Pure half of the dual-read merge: v2 wins, and the same reply pointer
+/// present in both generations counts once. A regression here doubles every
+/// migrated user's reply counts.
+fn dedup_generations(v2: Vec<InboxPointer>, v1: Vec<InboxPointer>) -> Vec<InboxPointer> {
     let mut out: Vec<InboxPointer> = Vec::new();
     let mut seen: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
         Default::default();
-    if let Some(inbox) = INBOXES.read().get(owner) {
-        for p in &inbox.pointers.pointers {
-            if inbox.creds.creds.contains_key(&p.ptr.replier)
-                && seen.insert((p.ptr.replier, p.ptr.reply_post))
-            {
-                out.push(InboxPointer {
-                    replier: p.ptr.replier,
-                    target_post: p.ptr.target_post,
-                    reply_post: p.ptr.reply_post,
-                    time: p.ptr.time,
-                });
-            }
-        }
-    }
-    if let Some(inbox) = LEGACY_INBOXES.read().get(owner) {
-        for p in &inbox.pointers.pointers {
-            if inbox.creds.creds.contains_key(&p.ptr.replier)
-                && seen.insert((p.ptr.replier, p.ptr.reply_post))
-            {
-                out.push(InboxPointer {
-                    replier: p.ptr.replier,
-                    target_post: p.ptr.target_post,
-                    reply_post: p.ptr.reply_post,
-                    time: p.ptr.time,
-                });
-            }
+    for p in v2.into_iter().chain(v1) {
+        if seen.insert((p.replier, p.reply_post)) {
+            out.push(p);
         }
     }
     out
@@ -415,8 +436,14 @@ pub fn App() -> Element {
     let mut listing_refreshed = use_signal(|| false);
     use_effect(move || {
         let listed = *PUBLIC_LISTING.read() == Some(true);
-        let has_account = ACCOUNT.read().is_some();
-        if listed && has_account && !*listing_refreshed.peek() {
+        // Wait for the own FEED, not just the account: refreshing before the
+        // attestation arrives would republish a verified author's listing at
+        // the anonymous (evictable) tier.
+        let feed_loaded = own_author()
+            .and_then(|a| FEEDS.read().get(&a).cloned())
+            .flatten()
+            .is_some();
+        if listed && feed_loaded && !*listing_refreshed.peek() {
             listing_refreshed.set(true);
             spawn(async {
                 if let Err(e) = actions::set_public_listing(true).await {
@@ -1366,9 +1393,11 @@ fn VerifyBox() -> Element {
             } else {
                 p { class: "muted",
                     "Anonymous accounts have full run of Freebird — peep, reply into \
-                     threads, get listed in Discover. A Ghost Key adds the check mark \
-                     and makes your presence durable: verified replies and listings \
-                     are never crowded out by the anonymous crowd."
+                     threads, get listed in Discover. Anonymous replies and listings \
+                     share a bounded pool of slots, so in busy places delivery is \
+                     best-effort. A Ghost Key adds the check mark and makes your \
+                     presence durable: verified replies and listings are never \
+                     crowded out."
                 }
                 match has_identity {
                     Some(true) => rsx! {
@@ -1622,5 +1651,22 @@ mod tests {
             confirmed_followers(&pointers, &feeds, &owner),
             vec![real.verifying_key().to_bytes()]
         );
+    }
+
+    /// The same reply pointer held in both inbox generations must count
+    /// once; distinct replies from one replier must all survive.
+    #[test]
+    fn generation_dedup_counts_shared_pointer_once() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let shared = announce(&sk, PostId([1u8; 16]), 10);
+        let v2_only = announce(&sk, PostId([1u8; 16]), 20);
+        let v1_only = announce(&sk, PostId([1u8; 16]), 30);
+
+        let merged = dedup_generations(
+            vec![shared, v2_only],
+            vec![shared, v1_only],
+        );
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.iter().filter(|p| **p == shared).count(), 1);
     }
 }

@@ -46,11 +46,14 @@ impl AnchorV1 {
         Self { v: 1, roles }
     }
 
-    /// Decode a cell body. None for anything unreadable: an old client facing
-    /// a future incompatible schema must fail toward "no anchor", never
+    /// Decode a cell body. None for anything unreadable — including `v: 0`,
+    /// enforcing the documented `v >= 1` floor: an old client facing a
+    /// future incompatible schema must fail toward "no anchor", never
     /// toward an error the user sees.
     pub fn decode(body: &[u8]) -> Option<Self> {
-        cell_contract::from_cbor(body).ok()
+        cell_contract::from_cbor::<Self>(body)
+            .ok()
+            .filter(|a| a.v >= 1)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -148,6 +151,13 @@ mod tests {
     fn garbage_is_none() {
         assert_eq!(AnchorV1::decode(&[0xff, 0x00, 0x13, 0x37]), None);
         assert_eq!(AnchorV1::decode(b""), None);
+    }
+
+    #[test]
+    fn version_zero_is_none() {
+        let mut a = anchor();
+        a.v = 0;
+        assert_eq!(AnchorV1::decode(&a.encode()), None, "v >= 1 floor enforced");
     }
 
     #[test]

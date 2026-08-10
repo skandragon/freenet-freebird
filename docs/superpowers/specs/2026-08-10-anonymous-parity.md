@@ -34,14 +34,20 @@ Both open-write contracts share the same shape:
   The checkmark's functional meaning is now "durable, uncrowdable presence".
 - **Horizons**: per tier — `Open` / `OldestRetained(key)` / `Closed`
   (`Closed` = attested writers hold every slot; senders offer nothing).
-  Per-fingerprint horizons as v1, with the tier's cap. Same
+  Per-fingerprint horizons (inbox only) as v1, with the tier's cap; the
+  directory's per-key fairness is the per-author LWW map itself. Same
   re-offer-livelock rationale as v1, split by tier because tiers evict
-  independently.
+  independently. Directory deltas horizon-gate only authors the peer does
+  not already hold (in-place LWW upgrades bypass the gate).
 - **Cred upgrade**: one posting key's cred goes anon→attested in place
   (attested content-hash always beats the anon all-zero hash). Old
   anon-fingerprint pointers are dropped by cleanup, and fingerprint
   mismatches drop pointers rather than fail deltas — an honest peer's delta
   is never poison-pilled by the upgrade race.
+- **Downgrade resistance**: the directory listing signature covers only the
+  listing, so the LWW key ranks `(last_active, attested, hash)` — a
+  stripped-attestation re-wrap of a victim's listing can never beat the
+  attested original at equal time.
 
 ## Where the code lives (frozen-crate discipline)
 
