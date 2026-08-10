@@ -4,6 +4,7 @@ members = [
     "contracts/feed-contract",
     "contracts/inbox-contract",
     "delegates/freebird-delegate",
+    "ui",
 ]
 resolver = "2"
 

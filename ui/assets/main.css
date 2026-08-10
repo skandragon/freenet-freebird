@@ -1,0 +1,65 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f6f8;
+  color: #17202a;
+}
+.app { max-width: 960px; margin: 0 auto; padding: 0 1rem 4rem; }
+header { display: flex; align-items: baseline; gap: 1rem; padding: 1rem 0; }
+header h1 { margin: 0; font-size: 1.5rem; color: #1d9bf0; }
+.status { font-size: 0.8rem; color: #667; }
+.columns { display: grid; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); gap: 1rem; }
+@media (max-width: 720px) { .columns { grid-template-columns: 1fr; } }
+.card {
+  background: #fff;
+  border: 1px solid #e1e8ed;
+  border-radius: 10px;
+  padding: 0.9rem;
+  margin-bottom: 0.8rem;
+}
+.compose textarea {
+  width: 100%;
+  min-height: 4.5rem;
+  border: 1px solid #e1e8ed;
+  border-radius: 8px;
+  padding: 0.6rem;
+  font: inherit;
+  resize: vertical;
+}
+.compose-row { display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; }
+button {
+  background: #1d9bf0;
+  border: none;
+  color: #fff;
+  border-radius: 999px;
+  padding: 0.45rem 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+button.link {
+  background: none;
+  color: #1d9bf0;
+  padding: 0.15rem 0.4rem;
+  font-weight: 500;
+}
+.post-head { display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; }
+.content { white-space: pre-wrap; word-break: break-word; margin: 0.4rem 0; }
+.check { color: #1d9bf0; margin-left: 0.2rem; }
+.muted { color: #66757f; font-size: 0.85rem; }
+.error { color: #c0392b; font-size: 0.85rem; }
+.replying-to { margin: 0.1rem 0; }
+.thread { border-left: 3px solid #e1e8ed; margin-top: 0.5rem; padding-left: 0.8rem; }
+.follow-row { display: flex; justify-content: space-between; align-items: center; padding: 0.15rem 0; }
+.keyline { word-break: break-all; font-size: 0.75rem; display: block; }
+input {
+  width: 100%;
+  border: 1px solid #e1e8ed;
+  border-radius: 8px;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+  margin: 0.3rem 0;
+}
+aside h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+.onboarding { max-width: 420px; margin: 3rem auto; }
