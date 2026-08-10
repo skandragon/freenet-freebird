@@ -435,6 +435,7 @@ pub fn App() -> Element {
                     View::Profile => rsx! { ProfilePage {} },
                     View::Thread(r) => rsx! { ThreadPage { author: r.author, post_id_bytes: r.post.0.to_vec() } },
                     View::Discover => rsx! { Discover {} },
+                    View::Author(a) => rsx! { AuthorPage { author: a } },
                 }
             } else if awaiting_key && matches!(status, SyncStatus::Connected | SyncStatus::Connecting) {
                 p { class: "muted", "Loading account…" }
@@ -678,7 +679,7 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thr
         article { class: "card post",
             div { class: "post-head",
                 Avatar { author }
-                strong { "{name}" }
+                a { href: "{View::Author(author).to_hash()}", strong { "{name}" } }
                 if verified { span { class: "check", title: "Ghost Key verified", "✔" } }
                 span { class: "muted", "@{short_key(&author)} · " }
                 // Timestamp = thread permalink (deep link, issue #2).
@@ -829,6 +830,73 @@ fn ThreadPage(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
     }
 }
 
+/// An author's timeline (`#/author/<author>`): their posts, newest first.
+#[component]
+fn AuthorPage(author: [u8; 32]) -> Element {
+    use_effect(move || {
+        if !FEEDS.read().contains_key(&author) {
+            spawn(async move {
+                let _ = api::fetch_feed(author).await;
+            });
+        }
+    });
+
+    let loaded = FEEDS.read().get(&author).is_some_and(|f| f.is_some());
+    let posts: Vec<AuthorizedPost> = FEEDS
+        .read()
+        .get(&author)
+        .and_then(|f| f.as_ref())
+        .map(|f| {
+            let mut v = f.posts.posts.clone();
+            v.sort_by(|a, b| (b.post.time, b.post.id).cmp(&(a.post.time, a.post.id)));
+            v
+        })
+        .unwrap_or_default();
+
+    let own = own_author();
+    let following = own
+        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
+        .is_some_and(|f| f.follows.follows.follows.contains(&author));
+
+    rsx! {
+        div { class: "thread-page",
+            button { class: "link", onclick: move |_| *VIEW.write() = View::Home,
+                "← back to feed"
+            }
+            section { class: "card",
+                h2 {
+                    Avatar { author }
+                    " {author_name(&author)}"
+                    if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
+                }
+                p { class: "muted", "@{short_key(&author)}" }
+                if Some(author) == own {
+                    p { class: "muted", "This is you." }
+                } else if following {
+                    p { class: "muted", "following" }
+                } else {
+                    button { class: "link",
+                        onclick: move |_| {
+                            spawn(async move { let _ = actions::set_follow(author, true).await; });
+                        },
+                        "follow"
+                    }
+                }
+            }
+            div { class: "timeline",
+                if !loaded {
+                    p { class: "muted", "Loading feed…" }
+                } else if posts.is_empty() {
+                    p { class: "muted", "No peeps yet." }
+                }
+                for post in posts {
+                    PostCard { key: "{post_key(&author, &post.post.id)}", author, post }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn MyAccount() -> Element {
     let Some(author) = own_author() else {
@@ -965,7 +1033,8 @@ fn Discover() -> Element {
                     div { class: "follow-row", key: "{bs58::encode(&a).into_string()}",
                         span {
                             Avatar { author: a }
-                            " {author_name(&a)}"
+                            " "
+                            a { href: "{View::Author(a).to_hash()}", "{author_name(&a)}" }
                             if is_verified(&a) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                             span { class: "muted", " @{short_key(&a)} · active {ago(last_active)}" }
                             if let Some(latest) = FEEDS.read().get(&a).and_then(|f| f.as_ref()).and_then(|f| f.posts.posts.last()) {

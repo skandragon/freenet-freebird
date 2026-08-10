@@ -123,6 +123,7 @@ pub enum View {
     Profile,
     Discover,
     Thread(freebird_core::types::PostRef),
+    Author([u8; 32]),
 }
 
 impl View {
@@ -137,6 +138,7 @@ impl View {
                 bs58::encode(r.author).into_string(),
                 bs58::encode(r.post.0).into_string()
             ),
+            View::Author(a) => format!("#/author/{}", bs58::encode(a).into_string()),
         }
     }
 
@@ -153,6 +155,11 @@ impl View {
                     author,
                     post: freebird_core::types::PostId(post),
                 }))
+            })()
+            .unwrap_or(View::Home),
+            Some("author") => (|| {
+                let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                Some(View::Author(author))
             })()
             .unwrap_or(View::Home),
             _ => View::Home,
@@ -172,12 +179,13 @@ mod tests {
             author: [7; 32],
             post: freebird_core::types::PostId([9; 16]),
         });
-        for v in [View::Home, View::Profile, thread] {
+        for v in [View::Home, View::Profile, thread, View::Author([3; 32])] {
             assert_eq!(View::from_hash(&v.to_hash()), v);
         }
         assert_eq!(View::from_hash(""), View::Home);
         assert_eq!(View::from_hash("#follow=abc"), View::Home);
         assert_eq!(View::from_hash("#/thread/junk"), View::Home);
+        assert_eq!(View::from_hash("#/author/junk"), View::Home);
     }
 }
 
