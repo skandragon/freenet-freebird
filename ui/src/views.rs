@@ -831,11 +831,9 @@ fn ThreadPage(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
 
 #[component]
 fn MyAccount() -> Element {
-    let mut listing_error = use_signal(String::new);
     let Some(author) = own_author() else {
         return rsx! {};
     };
-    let listed = *PUBLIC_LISTING.read() == Some(true);
 
     rsx! {
         section { class: "card",
@@ -849,29 +847,39 @@ fn MyAccount() -> Element {
             button { class: "link", onclick: move |_| *VIEW.write() = View::Profile,
                 "view profile"
             }
-            // Public-directory opt-in (issue #11): attestation-gated, so
-            // anonymous accounts stay follower-only.
-            if is_verified(&author) {
-                label { class: "muted",
-                    input {
-                        r#type: "checkbox",
-                        checked: listed,
-                        onchange: move |e| {
-                            let on = e.checked();
-                            listing_error.set(String::new());
-                            spawn(async move {
-                                if let Err(err) = actions::set_public_listing(on).await {
-                                    listing_error.set(err);
-                                }
-                            });
-                        },
-                    }
-                    " list me publicly in Discover"
+        }
+    }
+}
+
+/// Public-directory opt-in (issue #11): attestation-gated, so anonymous
+/// accounts stay follower-only. Lives on the profile page.
+#[component]
+fn PublicListingToggle(author: [u8; 32]) -> Element {
+    let mut listing_error = use_signal(String::new);
+    let listed = *PUBLIC_LISTING.read() == Some(true);
+
+    rsx! {
+        p { class: "muted keyline", "Discovery:" }
+        if is_verified(&author) {
+            label { class: "toggle",
+                input {
+                    r#type: "checkbox",
+                    checked: listed,
+                    onchange: move |e| {
+                        let on = e.checked();
+                        listing_error.set(String::new());
+                        spawn(async move {
+                            if let Err(err) = actions::set_public_listing(on).await {
+                                listing_error.set(err);
+                            }
+                        });
+                    },
                 }
-                if !listing_error.read().is_empty() { p { class: "error", "{listing_error}" } }
-            } else {
-                p { class: "muted", "Get a check mark to list yourself publicly in Discover." }
+                "List me publicly in Discover"
             }
+            if !listing_error.read().is_empty() { p { class: "error", "{listing_error}" } }
+        } else {
+            p { class: "muted", "Get a check mark to list yourself publicly in Discover." }
         }
     }
 }
@@ -950,7 +958,7 @@ fn Discover() -> Element {
                 } else if listings.is_empty() {
                     p { class: "muted",
                         "Nobody is listed yet. Be the first — turn on \
-                         “list me publicly” in your account card."
+                         “List me publicly” on your profile page."
                     }
                 }
                 for (a, last_active) in listings.into_iter().take(50) {
@@ -1338,6 +1346,7 @@ fn ProfilePage() -> Element {
                 p { class: "muted keyline", "Share this link — anyone opening it can follow you in one click:" }
                 code { class: "keyline", "{follow_link(&author)}" }
                 CopyButton { text: follow_link(&author), label: "copy follow link" }
+                PublicListingToggle { author }
                 if *editing.read() {
                     input { value: "{name}", oninput: move |e| name.set(e.value()), placeholder: "Name", aria_label: "Name" }
                     input { value: "{bio}", oninput: move |e| bio.set(e.value()), placeholder: "Bio", aria_label: "Bio" }

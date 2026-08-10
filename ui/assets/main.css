@@ -141,3 +141,11 @@ button.danger-link { color: var(--danger); background: none; }
 hr { border: none; border-top: 1px solid var(--border); margin: 0.8rem 0; }
 a { color: var(--accent-text); }
 .app-footer { text-align: center; margin-top: 2rem; }
+.toggle { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; }
+.toggle input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
