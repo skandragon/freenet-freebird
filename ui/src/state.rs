@@ -66,34 +66,26 @@ impl Theme {
     }
 }
 
-pub static THEME: GlobalSignal<Theme> = Signal::global(load_theme);
-
-const THEME_KEY: &str = "freebird_theme";
-
-fn load_theme() -> Theme {
-    #[cfg(target_arch = "wasm32")]
-    if let Some(s) = web_sys::window()
-        .and_then(|w| w.local_storage().ok().flatten())
-        .and_then(|s| s.get_item(THEME_KEY).ok().flatten())
-    {
-        return match s.as_str() {
+impl Theme {
+    pub fn from_label(s: &str) -> Theme {
+        match s {
             "light" => Theme::Light,
             "dark" => Theme::Dark,
             _ => Theme::Auto,
-        };
+        }
     }
-    Theme::Auto
 }
 
-/// Set (or clear, for Auto) the data-theme attribute the CSS keys off, and
-/// persist the choice.
+// The app runs in an opaque-origin sandbox iframe: localStorage throws, so
+// the theme persists in the freebird delegate (next to posting_key).
+pub static THEME: GlobalSignal<Theme> = Signal::global(Theme::default);
+
+/// Set (or clear, for Auto) the data-theme attribute the CSS keys off.
+/// Persistence goes through the delegate; callers own that side.
 pub fn apply_theme(theme: Theme) {
     *THEME.write() = theme;
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-            let _ = storage.set_item(THEME_KEY, theme.label());
-        }
         if let Some(root) = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.document_element())

@@ -437,6 +437,10 @@ fn dispatch_kv(payload: &[u8]) {
         Ok(FreebirdDelegateResponse::Value { key, value }) => {
             if key == "posting_key" {
                 *POSTING_KEY_LOADED.write() = Some(value);
+            } else if key == "theme" {
+                if let Some(label) = value.as_deref().and_then(|v| std::str::from_utf8(v).ok()) {
+                    crate::state::apply_theme(crate::state::Theme::from_label(label));
+                }
             }
         }
         Ok(FreebirdDelegateResponse::Stored { .. })
