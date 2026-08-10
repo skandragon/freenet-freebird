@@ -804,6 +804,111 @@ fn FollowBox() -> Element {
     }
 }
 
+/// Verified followers (issue #12): follow announcements in the inbox are
+/// hints only. A follower shows once their fetched feed proves `owner` is in
+/// their signed follow list — no forged "X follows you", and unfollows age
+/// out because the claim re-verifies against the live list.
+fn verified_followers(
+    inbox: &freebird_core::inbox::InboxStateV1,
+    feeds: &std::collections::BTreeMap<[u8; 32], Option<FeedStateV1>>,
+    owner: &[u8; 32],
+) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = inbox
+        .pointers
+        .pointers
+        .iter()
+        .filter(|p| p.ptr.target_post == actions::FOLLOW_ANNOUNCE_TARGET)
+        .map(|p| p.ptr.replier)
+        .collect();
+    out.sort();
+    out.dedup();
+    out.retain(|k| {
+        feeds
+            .get(k)
+            .and_then(|f| f.as_ref())
+            .is_some_and(|f| f.follows.follows.follows.contains(owner))
+    });
+    out
+}
+
+#[component]
+fn FollowersBox() -> Element {
+    let Some(author) = own_author() else {
+        return rsx! {};
+    };
+    let followers = {
+        let inboxes = INBOXES.read();
+        let feeds = FEEDS.read();
+        inboxes
+            .get(&author)
+            .map(|i| verified_followers(i, &feeds, &author))
+            .unwrap_or_default()
+    };
+    let own_follows: std::collections::BTreeSet<[u8; 32]> = FEEDS
+        .read()
+        .get(&author)
+        .cloned()
+        .flatten()
+        .map(|f| f.follows.follows.follows.clone())
+        .unwrap_or_default();
+
+    // Fetch announcers' feeds we don't have yet, to verify their claims.
+    use_effect(move || {
+        let missing: Vec<[u8; 32]> = {
+            let inboxes = INBOXES.read();
+            let feeds = FEEDS.read();
+            inboxes
+                .get(&author)
+                .map(|i| {
+                    i.pointers
+                        .pointers
+                        .iter()
+                        .filter(|p| p.ptr.target_post == actions::FOLLOW_ANNOUNCE_TARGET)
+                        .map(|p| p.ptr.replier)
+                        .filter(|k| !feeds.contains_key(k))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for k in missing {
+            spawn(async move {
+                let _ = api::fetch_feed(k).await;
+            });
+        }
+    });
+
+    rsx! {
+        section { class: "card",
+            h3 { "Followers ({followers.len()})" }
+            if followers.is_empty() {
+                p { class: "muted",
+                    "No verified followers yet. Only followers with a check mark \
+                     announce themselves; anonymous followers stay invisible."
+                }
+            }
+            for f in followers {
+                div { class: "follow-row",
+                    span {
+                        Avatar { author: f }
+                        " {author_name(&f)}"
+                        if is_verified(&f) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
+                    }
+                    if own_follows.contains(&f) {
+                        span { class: "muted", "following" }
+                    } else {
+                        button { class: "link",
+                            onclick: move |_| {
+                                spawn(async move { let _ = actions::set_follow(f, true).await; });
+                            },
+                            "follow back"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn VerifyBox() -> Element {
     let mut busy = use_signal(|| false);
@@ -1035,8 +1140,80 @@ fn ProfilePage() -> Element {
                     }
                 }
             }
+            FollowersBox {}
             VerifyBox {}
             DangerZone {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use freebird_core::feed::AttestationSlot;
+    use freebird_core::inbox::{AuthorizedReplyPointer, InboxStateV1, ReplyPointer};
+    use freebird_core::types::{
+        AuthorizedFollows, AuthorizedProfile, FollowsV1, PostId, ProfileV1,
+    };
+    use rand::rngs::OsRng;
+    use std::collections::BTreeMap;
+
+    fn feed_following(sk: &SigningKey, follows: &[[u8; 32]]) -> FeedStateV1 {
+        FeedStateV1 {
+            profile: AuthorizedProfile::new(ProfileV1::default(), sk),
+            follows: AuthorizedFollows::new(
+                FollowsV1 {
+                    follows: follows.iter().copied().collect(),
+                    version: 1,
+                },
+                sk,
+            ),
+            attestation: AttestationSlot(None),
+            posts: Default::default(),
+        }
+    }
+
+    fn announce(sk: &SigningKey, target_post: PostId, time: u64) -> AuthorizedReplyPointer {
+        let vk = sk.verifying_key();
+        AuthorizedReplyPointer::new(
+            ReplyPointer {
+                replier: vk.to_bytes(),
+                fingerprint: "fp".into(),
+                target_post,
+                reply_post: PostId::compute(&vk, time, "follow", &None),
+                time,
+            },
+            sk,
+        )
+    }
+
+    #[test]
+    fn follower_shown_only_when_their_follow_list_confirms() {
+        let owner = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let real = SigningKey::generate(&mut OsRng);
+        let liar = SigningKey::generate(&mut OsRng);
+        let unfetched = SigningKey::generate(&mut OsRng);
+
+        let mut inbox = InboxStateV1::default();
+        // Real follower announces twice (refollow) — must dedupe to one.
+        inbox.pointers.pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 1));
+        inbox.pointers.pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 2));
+        // Liar announces but their follow list doesn't contain owner.
+        inbox.pointers.pointers.push(announce(&liar, actions::FOLLOW_ANNOUNCE_TARGET, 3));
+        // Announcer whose feed hasn't arrived yet.
+        inbox.pointers.pointers.push(announce(&unfetched, actions::FOLLOW_ANNOUNCE_TARGET, 4));
+        // Ordinary reply pointer must not count as a follower.
+        inbox.pointers.pointers.push(announce(&real, PostId([7u8; 16]), 5));
+
+        let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
+        feeds.insert(real.verifying_key().to_bytes(), Some(feed_following(&real, &[owner])));
+        feeds.insert(liar.verifying_key().to_bytes(), Some(feed_following(&liar, &[])));
+        feeds.insert(unfetched.verifying_key().to_bytes(), None);
+
+        assert_eq!(
+            verified_followers(&inbox, &feeds, &owner),
+            vec![real.verifying_key().to_bytes()]
+        );
     }
 }
