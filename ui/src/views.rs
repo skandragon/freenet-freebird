@@ -302,6 +302,20 @@ pub fn App() -> Element {
                 {
                     api::log(&format!("public_listing get failed: {e}"));
                 }
+                // Update-banner dismissal watermark.
+                if let Err(e) = api::kv_request(
+                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                        key: "dismissed_build".into(),
+                    },
+                )
+                .await
+                {
+                    api::log(&format!("dismissed_build get failed: {e}"));
+                }
+                // The publisher's control cell: newest deployed build + flags.
+                if let Err(e) = api::fetch_control().await {
+                    api::log(&format!("control fetch failed: {e}"));
+                }
                 // Auto-discover the Identity Vault's current delegate.
                 match crate::ghostkey::discover_vault_delegate().await {
                     Ok(key) => {
@@ -425,6 +439,7 @@ pub fn App() -> Element {
                     }
                 }
             }
+            UpdateBanner {}
             if onboarded {
                 nav { class: "tabs",
                     button { class: "link", onclick: move |_| *VIEW.write() = View::Home, "home" }
@@ -450,6 +465,70 @@ pub fn App() -> Element {
                     "freenet-freebird"
                 }
                 {format!(" · build {} ({})", env!("BUILD_HASH"), env!("BUILD_DATE"))}
+            }
+        }
+    }
+}
+
+/// "A new version is available" banner, driven by the publisher's control
+/// cell. Dismissing remembers the build in the delegate KV, so the banner
+/// stays gone until an even newer build ships. Dev builds (build 0) and
+/// missing/undecodable control state show nothing; the banner also waits
+/// for the delegate's dismissal answer so it never flashes.
+#[component]
+fn UpdateBanner() -> Element {
+    let control = CONTROL.read().clone();
+    let Some(dismissed) = *DISMISSED_BUILD.read() else {
+        return rsx! {};
+    };
+    let published = control.as_ref().map(|c| c.build);
+    if !freebird_control::update_available(keys::own_build(), published, dismissed) {
+        return rsx! {};
+    }
+    let build = published.unwrap_or_default();
+    let label = control
+        .as_ref()
+        .map(|c| c.build_label.clone())
+        .unwrap_or_default();
+    rsx! {
+        div { class: "update-banner", role: "status",
+            span {
+                "A new version of Freebird is available"
+                if !label.is_empty() {
+                    span { class: "muted", " (build {label})" }
+                }
+                "."
+            }
+            span { class: "update-banner-actions",
+                button {
+                    class: "link",
+                    onclick: move |_| {
+                        #[cfg(target_arch = "wasm32")]
+                        if let Some(w) = web_sys::window() {
+                            let _ = w.location().reload();
+                        }
+                    },
+                    "Reload"
+                }
+                button {
+                    class: "link muted",
+                    onclick: move |_| {
+                        *DISMISSED_BUILD.write() = Some(build);
+                        spawn(async move {
+                            if let Err(e) = api::kv_request(
+                                freebird_core::delegate_api::FreebirdDelegateRequest::Store {
+                                    key: "dismissed_build".into(),
+                                    value: build.to_string().into_bytes(),
+                                },
+                            )
+                            .await
+                            {
+                                api::log(&format!("dismissed_build save failed: {e}"));
+                            }
+                        });
+                    },
+                    "Dismiss"
+                }
             }
         }
     }

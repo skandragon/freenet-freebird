@@ -270,6 +270,18 @@ pub async fn fetch_directory() -> Result<(), String> {
     .await
 }
 
+/// GET + subscribe the publisher's control cell (update banner + flags).
+pub async fn fetch_control() -> Result<(), String> {
+    track(keys::control_cell_key(), TrackedKind::Control);
+    send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: keys::control_cell_instance_id(),
+        return_contract_code: false,
+        subscribe: true,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
 /// PUT our directory listing. Put creates the directory on the very first
 /// listing network-wide and the contract's per-author LWW merge handles
 /// every later one (same pattern as avatars).
@@ -505,6 +517,33 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                 }
             }
         }
+        TrackedKind::Control => {
+            // State and delta are both one full signed cell. Client-side
+            // re-verification is cheap and keeps a misbehaving peer from
+            // feeding us an unsigned record.
+            match cell_contract::from_cbor::<cell_contract::SignedCellV1>(bytes) {
+                Ok(cell) => {
+                    if let Err(e) = cell.check(&freebird_control::control_params()) {
+                        log(&format!("rejected invalid control cell: {e}"));
+                        return;
+                    }
+                    match freebird_control::ControlV1::decode(&cell.body) {
+                        Some(control) => {
+                            let newer = CONTROL
+                                .read()
+                                .as_ref()
+                                .is_none_or(|held| control.build > held.build);
+                            if newer {
+                                *CONTROL.write() = Some(control);
+                            }
+                        }
+                        // A future schema this build can't read: stay quiet.
+                        None => log("control cell body undecodable (newer schema?)"),
+                    }
+                }
+                Err(e) => log(&format!("bad control cell state: {e}")),
+            }
+        }
         TrackedKind::Inbox(author) => {
             let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
             let params = keys::inbox_params(&vk);
@@ -570,6 +609,14 @@ fn dispatch_kv(payload: &[u8]) {
                 }
             } else if key == "public_listing" {
                 *PUBLIC_LISTING.write() = Some(value.as_deref() == Some(b"on".as_ref()));
+            } else if key == "dismissed_build" {
+                // Decimal string; absent/garbled = never dismissed.
+                let build = value
+                    .as_deref()
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                *DISMISSED_BUILD.write() = Some(build);
             }
         }
         Ok(FreebirdDelegateResponse::Stored { .. })
@@ -620,6 +667,7 @@ pub enum TrackedKind {
     Inbox([u8; 32]),
     Avatar([u8; 32]),
     Directory,
+    Control,
 }
 
 pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> =
