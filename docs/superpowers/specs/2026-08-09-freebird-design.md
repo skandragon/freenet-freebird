@@ -70,9 +70,12 @@ Reply *content* is a post in the replier's own feed carrying `in_reply_to`
 
 - **Params**: same shape as the feed (author posting key + master key);
   different wasm ⇒ different, still-computable address.
-- **State**: capped ring of signed reply pointers (~100 bytes each: replier
-  posting key, replier's ghostkey attestation reference, target post id,
-  reply id, timestamp). Cap ~1000 (~100 KB).
+- **State**: a fingerprint-keyed credential map (posting key + attestation,
+  ~1 KB each — the RSA notary layer makes certs heavy, so each replier's
+  cred is stored once) plus a capped ring of signed reply pointers (replier
+  fingerprint, target post id, reply id, timestamp). Caps: 300 pointers
+  globally, 8 per ghost-key fingerprint (bounds what one purchase can
+  occupy); cleanup prunes creds no pointer references.
 - **Writes require a valid Ghost Key cert** chained to the master key.
   Anonymous replies still exist in the replier's feed but are only seen by
   their followers.
@@ -160,6 +163,13 @@ ui/              Dioxus web app
 6. Webapp container; publish from the explorer node.
 
 ## Decisions log
+
+- Branding: a post is a **Peep**; reposts (**Repeeps**) are post-MVP; Replies,
+  Feeds, Followers keep their usual names. Wire/type names stay `Post*`.
+- Implemented caps: 300 peeps/feed, 2 KB/peep, 300 inbox pointers, 8 per
+  fingerprint, 10-minute future-timestamp tolerance.
+- ghostkey_lib 0.2.0 is used directly in contract wasm (proven clean: only
+  freenet host imports; `getrandom` "custom" stub defuses river#241).
 
 - Signup: anonymous, local keygen in delegate. Ghost Key NOT required to post.
 - Ghost Key = check mark (optional feed attestation) + required for
