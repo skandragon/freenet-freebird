@@ -2,6 +2,7 @@
 members = [
     "common",
     "contracts/feed-contract",
+    "contracts/inbox-contract",
 ]
 resolver = "2"
 
