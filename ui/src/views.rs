@@ -62,6 +62,13 @@ fn author_name(author: &[u8; 32]) -> String {
         .unwrap_or_else(|| short_key(author))
 }
 
+/// Deterministic per-author color chip: two hues derived from the key.
+fn identicon_style(author: &[u8; 32]) -> String {
+    let h1 = (((author[0] as u16) << 8 | author[1] as u16) % 360) as u16;
+    let h2 = (h1 + 40 + (author[2] % 140) as u16) % 360;
+    format!("background: linear-gradient(135deg, hsl({h1},65%,55%), hsl({h2},65%,38%))")
+}
+
 fn is_verified(author: &[u8; 32]) -> bool {
     FEEDS
         .read()
@@ -168,7 +175,15 @@ pub fn App() -> Element {
         style { dangerous_inner_html: include_str!("../assets/main.css") }
         div { class: "app",
             header {
-                h1 { "Freebird" }
+                h1 {
+                    svg {
+                        view_box: "0 0 24 24",
+                        fill: "currentColor",
+                        "aria-hidden": "true",
+                        path { d: "M3 13 C7 6 14 4 22 4 C19 7 17 8 14 9 C16 9 18 9 20 9 C17 12 13 13 10 13 C7 13 5 14 4 16 C3.5 15 3 14 3 13 Z" }
+                    }
+                    "Freebird"
+                }
                 button { class: "link theme-toggle",
                     title: "Theme",
                     onclick: move |_| {
@@ -245,6 +260,7 @@ fn Home() -> Element {
                 if let Some(target) = pending {
                     if Some(target) != own_author() {
                         div { class: "card follow-banner",
+                            span { class: "avatar", style: identicon_style(&target) }
                             span {
                                 "Follow "
                                 strong { "{author_name(&target)}" }
@@ -398,6 +414,7 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost) -> Element {
     rsx! {
         article { class: "card post",
             div { class: "post-head",
+                span { class: "avatar", style: identicon_style(&author) }
                 strong { "{name}" }
                 if verified { span { class: "check", title: "Ghost Key verified", "✔" } }
                 span { class: "muted", "@{short_key(&author)} · {ago(post.post.time)}" }
@@ -524,7 +541,8 @@ fn MyAccount() -> Element {
     rsx! {
         section { class: "card",
             h3 {
-                "{author_name(&author)}"
+                span { class: "avatar", style: identicon_style(&author) }
+                " {author_name(&author)}"
                 if is_verified(&author) { span { class: "check", "✔" } }
             }
             p { class: "muted keyline", "Your address (share to be followed):" }
@@ -551,7 +569,8 @@ fn FollowBox() -> Element {
             for f in follows {
                 div { class: "follow-row",
                     span {
-                        "{author_name(&f)}"
+                        span { class: "avatar", style: identicon_style(&f) }
+                        " {author_name(&f)}"
                         if is_verified(&f) { span { class: "check", "✔" } }
                     }
                     button { class: "link",
@@ -737,7 +756,8 @@ fn ProfilePage() -> Element {
             }
             section { class: "card",
                 h2 {
-                    "{author_name(&author)}"
+                    span { class: "avatar lg", style: identicon_style(&author) }
+                    " {author_name(&author)}"
                     if is_verified(&author) { span { class: "check", "✔" } }
                 }
                 if let Some(f) = &feed {
