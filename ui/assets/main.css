@@ -118,7 +118,7 @@ img.avatar { object-fit: cover; }
 .muted { color: var(--muted); font-size: 0.85rem; }
 .error { color: var(--danger); font-size: 0.85rem; }
 .replying-to { margin: 0.1rem 0; }
-.thread { border-left: 3px solid var(--border); margin-top: 0.5rem; padding-left: 0.8rem; }
+.thread { margin-top: 0.5rem; padding-left: 0.8rem; }
 .follow-row { display: flex; justify-content: space-between; align-items: center; padding: 0.15rem 0; }
 .keyline { word-break: break-all; font-size: 0.75rem; display: block; }
 input {
