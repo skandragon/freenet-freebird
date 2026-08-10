@@ -2,6 +2,7 @@
 members = [
     "common",
     "contracts/avatar-contract",
+    "contracts/directory-contract",
     "contracts/feed-contract",
     "contracts/inbox-contract",
     "delegates/freebird-delegate",

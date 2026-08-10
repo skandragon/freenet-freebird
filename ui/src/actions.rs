@@ -2,6 +2,7 @@
 //! and the api layer; every action signs locally with the posting key.
 
 use dioxus::prelude::*;
+use directory_contract::{AuthorizedListing, ListingV1};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::attestation::AttestationV1;
 use freebird_core::delegate_api::FreebirdDelegateRequest;
@@ -239,6 +240,36 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+/// Toggle the public-directory listing (issue #11). Listing requires the
+/// Ghost Key attestation (the directory's write gate). Delisting only stops
+/// the refreshes — Freenet has no remove — so the entry ages out of the
+/// capped set once others' activity evicts it.
+pub async fn set_public_listing(on: bool) -> Result<(), String> {
+    if on {
+        let sk = signing_key()?;
+        let att = own_feed()
+            .and_then(|f| f.attestation.0)
+            .ok_or("public listing requires a verified account (Ghost Key)")?;
+        let listing = ListingV1 {
+            author: sk.verifying_key().to_bytes(),
+            last_active: keys::now_ms(),
+        };
+        let authorized = AuthorizedListing::new(listing, &sk, att);
+        api::put_directory_listing(&authorized).await?;
+        // Optimistic local apply so Discover shows us immediately.
+        if let Some(dir) = DIRECTORY.write().as_mut() {
+            let _ = dir.apply_delta(&keys::directory_params(), std::slice::from_ref(&authorized));
+        }
+    }
+    api::kv_request(FreebirdDelegateRequest::Store {
+        key: "public_listing".into(),
+        value: (if on { "on" } else { "off" }).as_bytes().to_vec(),
+    })
+    .await?;
+    *PUBLIC_LISTING.write() = Some(on);
     Ok(())
 }
 

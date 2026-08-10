@@ -36,6 +36,14 @@ pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV1>> =
 pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>> =
     Signal::global(BTreeMap::new);
 
+/// The public author directory (issue #11). None = not fetched yet.
+pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV1>> =
+    Signal::global(|| None);
+
+/// Our "list me publicly" preference, delegate-persisted like the theme:
+/// None = delegate not answered yet.
+pub static PUBLIC_LISTING: GlobalSignal<Option<bool>> = Signal::global(|| None);
+
 /// Result of asking the freebird delegate for `posting_key`:
 /// None = not answered yet; Some(None) = no account stored (onboard);
 /// Some(Some(seed)) = existing account.
@@ -113,6 +121,7 @@ pub enum View {
     #[default]
     Home,
     Profile,
+    Discover,
     Thread(freebird_core::types::PostRef),
 }
 
@@ -122,6 +131,7 @@ impl View {
         match self {
             View::Home => "#/".into(),
             View::Profile => "#/profile".into(),
+            View::Discover => "#/discover".into(),
             View::Thread(r) => format!(
                 "#/thread/{}/{}",
                 bs58::encode(r.author).into_string(),
@@ -135,6 +145,7 @@ impl View {
         let mut parts = hash.trim_start_matches(['#', '/']).split('/');
         match parts.next() {
             Some("profile") => View::Profile,
+            Some("discover") => View::Discover,
             Some("thread") => (|| {
                 let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
                 let post = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;

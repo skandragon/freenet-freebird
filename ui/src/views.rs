@@ -292,6 +292,16 @@ pub fn App() -> Element {
                 {
                     api::log(&format!("theme get failed: {e}"));
                 }
+                // Public-directory listing preference (issue #11).
+                if let Err(e) = api::kv_request(
+                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                        key: "public_listing".into(),
+                    },
+                )
+                .await
+                {
+                    api::log(&format!("public_listing get failed: {e}"));
+                }
                 // Auto-discover the Identity Vault's current delegate.
                 match crate::ghostkey::discover_vault_delegate().await {
                     Ok(key) => {
@@ -331,6 +341,22 @@ pub fn App() -> Element {
                     }
                 });
             }
+        }
+    });
+
+    // Refresh our directory listing's last_active once per session, so an
+    // active listed author never ages to the bottom of the eviction order.
+    let mut listing_refreshed = use_signal(|| false);
+    use_effect(move || {
+        let listed = *PUBLIC_LISTING.read() == Some(true);
+        let verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
+        if listed && verified && !*listing_refreshed.peek() {
+            listing_refreshed.set(true);
+            spawn(async {
+                if let Err(e) = actions::set_public_listing(true).await {
+                    api::log(&format!("directory listing refresh failed: {e}"));
+                }
+            });
         }
     });
 
@@ -400,10 +426,15 @@ pub fn App() -> Element {
                 }
             }
             if onboarded {
+                nav { class: "tabs",
+                    button { class: "link", onclick: move |_| *VIEW.write() = View::Home, "home" }
+                    button { class: "link", onclick: move |_| *VIEW.write() = View::Discover, "discover" }
+                }
                 match *VIEW.read() {
                     View::Home => rsx! { Home {} },
                     View::Profile => rsx! { ProfilePage {} },
                     View::Thread(r) => rsx! { ThreadPage { author: r.author, post_id_bytes: r.post.0.to_vec() } },
+                    View::Discover => rsx! { Discover {} },
                 }
             } else if awaiting_key && matches!(status, SyncStatus::Connected | SyncStatus::Connecting) {
                 p { class: "muted", "Loading account…" }
@@ -800,9 +831,11 @@ fn ThreadPage(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
 
 #[component]
 fn MyAccount() -> Element {
+    let mut listing_error = use_signal(String::new);
     let Some(author) = own_author() else {
         return rsx! {};
     };
+    let listed = *PUBLIC_LISTING.read() == Some(true);
 
     rsx! {
         section { class: "card",
@@ -815,6 +848,136 @@ fn MyAccount() -> Element {
             CopyButton { text: follow_link(&author), label: "copy follow link" }
             button { class: "link", onclick: move |_| *VIEW.write() = View::Profile,
                 "view profile"
+            }
+            // Public-directory opt-in (issue #11): attestation-gated, so
+            // anonymous accounts stay follower-only.
+            if is_verified(&author) {
+                label { class: "muted",
+                    input {
+                        r#type: "checkbox",
+                        checked: listed,
+                        onchange: move |e| {
+                            let on = e.checked();
+                            listing_error.set(String::new());
+                            spawn(async move {
+                                if let Err(err) = actions::set_public_listing(on).await {
+                                    listing_error.set(err);
+                                }
+                            });
+                        },
+                    }
+                    " list me publicly in Discover"
+                }
+                if !listing_error.read().is_empty() { p { class: "error", "{listing_error}" } }
+            } else {
+                p { class: "muted", "Get a check mark to list yourself publicly in Discover." }
+            }
+        }
+    }
+}
+
+/// Discover tab (issue #11): the well-known public directory — authors who
+/// opted in, newest activity first, with a sampled preview of their feeds.
+#[component]
+fn Discover() -> Element {
+    const SAMPLE: usize = 20;
+
+    let mut requested = use_signal(|| false);
+    use_effect(move || {
+        if !*requested.peek() {
+            requested.set(true);
+            spawn(async {
+                if let Err(e) = api::fetch_directory().await {
+                    api::log(&format!("directory fetch failed: {e}"));
+                }
+            });
+        }
+    });
+
+    let loaded = DIRECTORY.read().is_some();
+    // Newest-active first.
+    let listings: Vec<([u8; 32], u64)> = DIRECTORY
+        .read()
+        .as_ref()
+        .map(|d| {
+            let mut v: Vec<([u8; 32], u64)> = d
+                .listings
+                .values()
+                .map(|l| (l.listing.author, l.listing.last_active))
+                .collect();
+            v.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
+            v
+        })
+        .unwrap_or_default();
+
+    // Fetch a sample of listed authors' feeds (names, avatars, latest peeps)
+    // through the existing fetch_feed plumbing.
+    {
+        let sample: Vec<[u8; 32]> = {
+            let feeds = FEEDS.read();
+            listings
+                .iter()
+                .take(SAMPLE)
+                .map(|(a, _)| *a)
+                .filter(|a| !feeds.contains_key(a))
+                .collect()
+        };
+        use_effect(move || {
+            for a in sample.clone() {
+                spawn(async move {
+                    let _ = api::fetch_feed(a).await;
+                });
+            }
+        });
+    }
+
+    let own = own_author();
+    let own_follows: std::collections::BTreeSet<[u8; 32]> = own
+        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
+        .map(|f| f.follows.follows.follows.clone())
+        .unwrap_or_default();
+
+    rsx! {
+        div { class: "profile-page",
+            section { class: "card",
+                h2 { "Discover" }
+                p { class: "muted",
+                    "Authors who chose to be listed publicly. Follow someone to see \
+                     their peeps in your timeline."
+                }
+                if !loaded {
+                    p { class: "muted", "Loading directory…" }
+                } else if listings.is_empty() {
+                    p { class: "muted",
+                        "Nobody is listed yet. Be the first — turn on \
+                         “list me publicly” in your account card."
+                    }
+                }
+                for (a, last_active) in listings.into_iter().take(50) {
+                    div { class: "follow-row", key: "{bs58::encode(&a).into_string()}",
+                        span {
+                            Avatar { author: a }
+                            " {author_name(&a)}"
+                            if is_verified(&a) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
+                            span { class: "muted", " @{short_key(&a)} · active {ago(last_active)}" }
+                            if let Some(latest) = FEEDS.read().get(&a).and_then(|f| f.as_ref()).and_then(|f| f.posts.posts.last()) {
+                                p { class: "muted", "“{latest.post.content}”" }
+                            }
+                        }
+                        if Some(a) == own {
+                            span { class: "muted", "you" }
+                        } else if own_follows.contains(&a) {
+                            span { class: "muted", "following" }
+                        } else {
+                            button { class: "link",
+                                onclick: move |_| {
+                                    spawn(async move { let _ = actions::set_follow(a, true).await; });
+                                },
+                                "follow"
+                            }
+                        }
+                    }
+                }
             }
         }
     }

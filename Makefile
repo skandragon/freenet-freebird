@@ -18,10 +18,14 @@ all: test contracts delegate ui
 
 contracts:
 	$(CARGO) build -p feed-contract -p inbox-contract -p avatar-contract --target $(WASM_TARGET) --release
+	# directory-contract builds in its own invocation: joint feature
+	# unification with the pinned contracts could alter their bytes.
+	$(CARGO) build -p directory-contract --target $(WASM_TARGET) --release
 	$(MAKE) check-imports W=$(WASM_DIR)/feed_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/inbox_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/avatar_contract.wasm
-	cp $(WASM_DIR)/feed_contract.wasm $(WASM_DIR)/inbox_contract.wasm $(WASM_DIR)/avatar_contract.wasm ui/contracts/
+	$(MAKE) check-imports W=$(WASM_DIR)/directory_contract.wasm
+	cp $(WASM_DIR)/feed_contract.wasm $(WASM_DIR)/inbox_contract.wasm $(WASM_DIR)/avatar_contract.wasm $(WASM_DIR)/directory_contract.wasm ui/contracts/
 	$(MAKE) check-addresses
 
 delegate:

@@ -8,6 +8,9 @@ description = "Freebird web UI (Dioxus)"
 
 [dependencies]
 freebird-core = { workspace = true, features = [] }
+# Types only — default-features = false keeps the contract entry points out
+# of the browser wasm.
+directory-contract = { path = "../contracts/directory-contract", default-features = false }
 freenet-stdlib = { workspace = true, features = ["net"] }
 freenet-scaffold.workspace = true
 ghostkey_lib.workspace = true
