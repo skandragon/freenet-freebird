@@ -23,7 +23,8 @@ if ! nc -z localhost 7509 2>/dev/null; then
     exit 1
 fi
 
-if fdev website list 2>/dev/null | grep -q "\b${KEY_NAME}\b"; then
+# No grep -q: its early exit SIGPIPEs fdev, which pipefail turns into a miss.
+if fdev website list 2>/dev/null | grep "\b${KEY_NAME}\b" >/dev/null; then
     fdev website update --key "$KEY_NAME" "$SITE_DIR"
 else
     # Local Ed25519 keygen only; the key lives in fdev's store — back it up,
