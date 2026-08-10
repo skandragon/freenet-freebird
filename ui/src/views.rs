@@ -380,6 +380,15 @@ pub fn App() -> Element {
             } else {
                 Onboarding {}
             }
+            footer { class: "muted app-footer",
+                a {
+                    href: "https://github.com/skandragon/freenet-freebird",
+                    target: "_blank",
+                    rel: "noopener",
+                    "freenet-freebird"
+                }
+                {format!(" · build {} ({})", env!("BUILD_HASH"), env!("BUILD_DATE"))}
+            }
         }
     }
 }

@@ -1,6 +1,0 @@
-- iframe [ref=e2]:
-  - generic [ref=f1e3]:
-    - banner [ref=f1e4]:
-      - heading "Freebird" [level=1] [ref=f1e5]
-      - text: connected
-    - paragraph [ref=f1e6]: Loading account…

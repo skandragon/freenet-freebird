@@ -1,6 +1,0 @@
-[     341ms] [LOG] sent RegisterDelegate @ http://127.0.0.1:7509/v1/contract/web/8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/assets/freebird-ui-dxha05e1265825be5b4.js:0
-[     341ms] [LOG] sent posting_key Get @ http://127.0.0.1:7509/v1/contract/web/8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/assets/freebird-ui-dxha05e1265825be5b4.js:0
-[     371ms] [LOG] host response: Delegate(key=2PbsC32584LCpQnJidMvBddiA3YhyNUJYDT43qAiF8Zy, 1 values) @ http://127.0.0.1:7509/v1/contract/web/8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/assets/freebird-ui-dxha05e1265825be5b4.js:0
-[     396ms] [LOG] host response: Delegate(key=2PbsC32584LCpQnJidMvBddiA3YhyNUJYDT43qAiF8Zy, 0 values) @ http://127.0.0.1:7509/v1/contract/web/8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/assets/freebird-ui-dxha05e1265825be5b4.js:0
-[     437ms] [LOG] host response: Contract::GetResponse { key: ContractKey { instance: ContractInstanceId("GrDuSDnuW5xvS5x14b3yrGHTNXo7oKGTVZHDrMPJ7yNa"), @ http://127.0.0.1:7509/v1/contract/web/8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/assets/freebird-ui-dxha05e1265825be5b4.js:0
-[     437ms] [LOG] host response: Contract::GetResponse { key: ContractKey { instance: ContractInstanceId("Gqgpzx3AasvDrnxaLA5BGxcSojXZq8pSMWbhDmX8FbmX"), @ http://127.0.0.1:7509/v1/contract/web/8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/assets/freebird-ui-dxha05e1265825be5b4.js:0
