@@ -1,0 +1,17 @@
+[package]
+name = "freebird-anchor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freebird per-author anchor cell schema (client-side only)"
+
+[dependencies]
+serde.workspace = true
+ed25519-dalek.workspace = true
+# Types + CBOR helpers only — the anchor rides the FROZEN cell kernel.
+cell-contract = { path = "../contracts/cell-contract", default-features = false }
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }

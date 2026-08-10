@@ -17,8 +17,11 @@ freenet-main-contract = []
 serde.workspace = true
 ciborium.workspace = true
 ed25519-dalek.workspace = true
+blake3.workspace = true
+bs58.workspace = true
 freenet-stdlib.workspace = true
 freenet-scaffold.workspace = true
+freenet-scaffold-macro.workspace = true
 freebird-core.workspace = true
 # ghostkey_lib (via freebird-core) unconditionally pulls `rand`, whose
 # getrandom backend on wasm32-unknown-unknown either fails to compile or —
@@ -31,4 +34,5 @@ getrandom = { workspace = true, features = ["custom"] }
 [dev-dependencies]
 freebird-core = { workspace = true, features = ["test-fixtures"] }
 rand.workspace = true
+proptest.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }

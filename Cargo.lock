@@ -1475,6 +1475,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "freebird-anchor"
+version = "0.1.0"
+dependencies = [
+ "cell-contract",
+ "ed25519-dalek",
+ "rand 0.8.7",
+ "serde",
+]
+
+[[package]]
 name = "freebird-control"
 version = "0.1.0"
 dependencies = [
@@ -1543,6 +1553,7 @@ dependencies = [
  "dioxus",
  "directory-contract",
  "ed25519-dalek",
+ "freebird-anchor",
  "freebird-control",
  "freebird-core",
  "freenet-scaffold",
@@ -1550,6 +1561,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "ghostkey_lib",
+ "inbox-contract",
  "js-sys",
  "rand 0.8.7",
  "serde",
@@ -2153,12 +2165,16 @@ dependencies = [
 name = "inbox-contract"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bs58",
  "ciborium",
  "ed25519-dalek",
  "freebird-core",
  "freenet-scaffold",
+ "freenet-scaffold-macro",
  "freenet-stdlib",
  "getrandom 0.2.17",
+ "proptest",
  "rand 0.8.7",
  "serde",
 ]

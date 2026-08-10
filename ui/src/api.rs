@@ -9,11 +9,12 @@
 use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
-use directory_contract::{AuthorizedListing, DirectoryStateV1};
-use ed25519_dalek::VerifyingKey;
+use directory_contract::{AuthorizedListingV2, DirectoryStateV2};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::{FeedParametersV1, FeedStateV1, FeedStateV1Delta};
 use freebird_core::inbox::{InboxStateV1, InboxStateV1Delta};
+use inbox_contract::state::{InboxStateV2, InboxStateV2Delta};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse};
 #[cfg(target_arch = "wasm32")]
@@ -168,7 +169,15 @@ pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Res
         blocking_subscribe: false,
     }))
     .await?;
-    let inbox_state = freebird_core::to_cbor(&InboxStateV1::default())?;
+    ensure_own_inbox(author).await
+}
+
+/// PUT our v2 inbox with an empty state: creates it on first use, and the
+/// contract's merge makes a re-Put over an existing inbox a no-op — safe to
+/// call on every resume (the owner-republish half of the #23 migration).
+pub async fn ensure_own_inbox(author: &VerifyingKey) -> Result<(), String> {
+    let inbox_state = freebird_core::to_cbor(&InboxStateV2::default())?;
+    track(keys::inbox_key(author), TrackedKind::Inbox(author.to_bytes()));
     send(ClientRequest::ContractOp(ContractRequest::Put {
         contract: inbox_container(author),
         state: WrappedState::new(inbox_state),
@@ -179,7 +188,54 @@ pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Res
     .await
 }
 
-/// GET + subscribe someone's feed and inbox by author key.
+/// Publish (or refresh) our anchor cell: role → current contract version +
+/// address. Rides the FROZEN cell kernel, so this address never rotates —
+/// future readers learn where our current-generation contracts live even
+/// after their derived addresses change again.
+pub async fn publish_anchor(sk: &SigningKey) -> Result<(), String> {
+    let vk = sk.verifying_key();
+    let anchor = freebird_anchor::AnchorV1::new(
+        [(
+            freebird_anchor::ROLE_INBOX.to_string(),
+            freebird_anchor::RoleV1 {
+                version: 2,
+                address: Some(
+                    keys::inbox_instance_id(&vk)
+                        .as_bytes()
+                        .try_into()
+                        .expect("instance id is 32 bytes"),
+                ),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let cell = cell_contract::SignedCellV1::new(
+        sk,
+        freebird_anchor::ANCHOR_PURPOSE,
+        keys::now_ms(),
+        anchor.encode(),
+    );
+    let params = cell_contract::to_cbor(&keys::anchor_params(&vk))?;
+    let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        std::sync::Arc::new(ContractCode::from(keys::CELL_CONTRACT_WASM.to_vec())),
+        Parameters::from(params),
+    )));
+    let state = cell_contract::to_cbor(&cell)?;
+    track(keys::anchor_key(&vk), TrackedKind::Anchor(vk.to_bytes()));
+    send(ClientRequest::ContractOp(ContractRequest::Put {
+        contract: container,
+        state: WrappedState::new(state),
+        related_contracts: RelatedContracts::default(),
+        subscribe: false,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
+/// GET + subscribe someone's feed, inbox, and anchor cell by author key.
+/// During the dual-read window (`read_v1_inbox` flag, default on) the
+/// legacy v1 inbox is fetched too, so pre-migration replies stay visible.
 pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
     // Pending placeholder so effects don't re-spawn the fetch every render
@@ -187,6 +243,7 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
     FEEDS.write().entry(author).or_insert(None);
     track(keys::feed_key(&vk), TrackedKind::Feed(author));
     track(keys::inbox_key(&vk), TrackedKind::Inbox(author));
+    track(keys::anchor_key(&vk), TrackedKind::Anchor(author));
     send(ClientRequest::ContractOp(ContractRequest::Get {
         key: keys::feed_instance_id(&vk),
         return_contract_code: false,
@@ -200,7 +257,26 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
         subscribe: true,
         blocking_subscribe: false,
     }))
-    .await
+    .await?;
+    ANCHORS.write().entry(author).or_insert(None);
+    send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: keys::anchor_instance_id(&vk),
+        return_contract_code: false,
+        subscribe: true,
+        blocking_subscribe: false,
+    }))
+    .await?;
+    if flag_bool("read_v1_inbox", true) {
+        track(keys::inbox_key_v1(&vk), TrackedKind::LegacyInbox(author));
+        send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: keys::inbox_instance_id_v1(&vk),
+            return_contract_code: false,
+            subscribe: true,
+            blocking_subscribe: false,
+        }))
+        .await?;
+    }
+    Ok(())
 }
 
 /// GET someone's avatar. Write-rarely contract: no subscription, session
@@ -248,17 +324,36 @@ pub async fn update_own_feed(delta: FeedStateV1Delta) -> Result<(), String> {
 }
 
 /// Send a reply pointer into the TARGET author's inbox.
-pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV1Delta) -> Result<(), String> {
+///
+/// Put, not Update: during the migration window the target's v2 inbox only
+/// exists once its OWNER has resumed on a new build — an Update to a
+/// nonexistent contract fails asynchronously (console-only) and the reply
+/// would silently vanish behind a success message. Put creates the inbox on
+/// first write (same pattern as the directory and avatars), and the
+/// contract's merge turns a Put over an existing inbox into a plain apply.
+pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV2Delta) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&target_author).map_err(|e| e.to_string())?;
-    let bytes = freebird_core::to_cbor(&delta)?;
-    send(ClientRequest::ContractOp(ContractRequest::Update {
-        key: keys::inbox_key(&vk),
-        data: UpdateData::Delta(StateDelta::from(bytes)),
+    // Materialize the delta as a self-contained state (cred + pointer): the
+    // same verification the contract runs, so a bad delta fails HERE with a
+    // real message instead of as a rejected update.
+    let mut state = InboxStateV2::default();
+    let clone = state.clone();
+    state
+        .apply_delta(&clone, &keys::inbox_params(&vk), &Some(delta))
+        .map_err(|e| format!("inbox pointer rejected locally: {e}"))?;
+    let bytes = freebird_core::to_cbor(&state)?;
+    send(ClientRequest::ContractOp(ContractRequest::Put {
+        contract: inbox_container(&vk),
+        state: WrappedState::new(bytes),
+        related_contracts: RelatedContracts::default(),
+        subscribe: false,
+        blocking_subscribe: false,
     }))
     .await
 }
 
-/// GET + subscribe the well-known public directory (issue #11).
+/// GET + subscribe the well-known public directory (issue #11), plus the
+/// legacy v1 directory during the dual-read window (`read_v1_directory`).
 pub async fn fetch_directory() -> Result<(), String> {
     track(keys::directory_key(), TrackedKind::Directory);
     send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -267,7 +362,18 @@ pub async fn fetch_directory() -> Result<(), String> {
         subscribe: true,
         blocking_subscribe: false,
     }))
-    .await
+    .await?;
+    if flag_bool("read_v1_directory", true) {
+        track(keys::directory_key_v1(), TrackedKind::LegacyDirectory);
+        send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: keys::directory_instance_id_v1(),
+            return_contract_code: false,
+            subscribe: true,
+            blocking_subscribe: false,
+        }))
+        .await?;
+    }
+    Ok(())
 }
 
 /// GET + subscribe the publisher's control cell (update banner + flags).
@@ -285,8 +391,8 @@ pub async fn fetch_control() -> Result<(), String> {
 /// PUT our directory listing. Put creates the directory on the very first
 /// listing network-wide and the contract's per-author LWW merge handles
 /// every later one (same pattern as avatars).
-pub async fn put_directory_listing(listing: &AuthorizedListing) -> Result<(), String> {
-    let mut state = DirectoryStateV1::default();
+pub async fn put_directory_listing(listing: &AuthorizedListingV2) -> Result<(), String> {
+    let mut state = DirectoryStateV2::default();
     state.listings.insert(listing.listing.author, listing.clone());
     let bytes = freebird_core::to_cbor(&state)?;
     track(keys::directory_key(), TrackedKind::Directory);
@@ -496,9 +602,9 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
         TrackedKind::Directory => {
             let params = keys::directory_params();
             let mut dir = DIRECTORY.write();
-            let entry = dir.get_or_insert_with(DirectoryStateV1::default);
+            let entry = dir.get_or_insert_with(DirectoryStateV2::default);
             if is_full_state {
-                match freebird_core::from_cbor::<DirectoryStateV1>(bytes) {
+                match freebird_core::from_cbor::<DirectoryStateV2>(bytes) {
                     Ok(incoming) => {
                         if let Err(e) = entry.merge(&params, &incoming) {
                             log(&format!("directory merge rejected: {e}"));
@@ -507,7 +613,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                     Err(e) => log(&format!("bad directory state: {e}")),
                 }
             } else {
-                match freebird_core::from_cbor::<directory_contract::DirectoryDeltaV1>(bytes) {
+                match freebird_core::from_cbor::<directory_contract::DirectoryDeltaV2>(bytes) {
                     Ok(delta) => {
                         if let Err(e) = entry.apply_delta(&params, &delta) {
                             log(&format!("directory delta rejected: {e}"));
@@ -515,6 +621,81 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                     }
                     Err(e) => log(&format!("bad directory delta: {e}")),
                 }
+            }
+        }
+        TrackedKind::LegacyDirectory => {
+            // Read-only remnant of the v1 directory: the deployed v1 wasm
+            // still enforces its own invariants network-side, but each
+            // listing is re-checked here (mandatory attestation) before the
+            // Discover tab trusts it. Per-author LWW keeps the newest.
+            use directory_contract::legacy::{LegacyAuthorizedListing, LegacyDirectoryState};
+            let master = keys::master_key();
+            let merge_listings = |incoming: Vec<LegacyAuthorizedListing>| {
+                let mut dir = LEGACY_DIRECTORY.write();
+                let entry = dir.get_or_insert_with(LegacyDirectoryState::default);
+                for l in incoming {
+                    if l.check(&master).is_err() {
+                        log("rejected invalid legacy directory listing");
+                        continue;
+                    }
+                    let newer = entry
+                        .listings
+                        .get(&l.listing.author)
+                        .is_none_or(|held| held.listing.last_active < l.listing.last_active);
+                    if newer {
+                        entry.listings.insert(l.listing.author, l);
+                    }
+                }
+            };
+            if is_full_state {
+                match freebird_core::from_cbor::<LegacyDirectoryState>(bytes) {
+                    Ok(incoming) => merge_listings(incoming.listings.into_values().collect()),
+                    Err(e) => log(&format!("bad legacy directory state: {e}")),
+                }
+            } else {
+                match freebird_core::from_cbor::<directory_contract::legacy::LegacyDirectoryDelta>(
+                    bytes,
+                ) {
+                    Ok(delta) => merge_listings(delta),
+                    Err(e) => log(&format!("bad legacy directory delta: {e}")),
+                }
+            }
+        }
+        TrackedKind::Anchor(author) => {
+            // State and delta are both one full signed cell (same shape as
+            // the control cell). Re-verify against the author's key + the
+            // "anchor" purpose before decoding.
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                // TRACKED is self-populated, so this "cannot happen" — but a
+                // silent return would make the broken invariant undiagnosable.
+                log("anchor dispatch: tracked author key is not a valid key");
+                return;
+            };
+            match cell_contract::from_cbor::<cell_contract::SignedCellV1>(bytes) {
+                Ok(cell) => {
+                    if let Err(e) = cell.check(&keys::anchor_params(&vk)) {
+                        log(&format!("rejected invalid anchor cell: {e}"));
+                        return;
+                    }
+                    // LWW by the cell's order key: Get responses and update
+                    // notifications can arrive out of order.
+                    let newer = ANCHOR_ORDER
+                        .read()
+                        .get(&author)
+                        .is_none_or(|held| cell.order_key() > *held);
+                    if !newer {
+                        return;
+                    }
+                    match freebird_anchor::AnchorV1::decode(&cell.body) {
+                        Some(anchor) => {
+                            ANCHOR_ORDER.write().insert(author, cell.order_key());
+                            ANCHORS.write().insert(author, Some(anchor));
+                        }
+                        // A future schema this build can't read: stay quiet.
+                        None => log("anchor cell body undecodable (newer schema?)"),
+                    }
+                }
+                Err(e) => log(&format!("bad anchor cell state: {e}")),
             }
         }
         TrackedKind::Control => {
@@ -550,7 +731,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             let mut inboxes = INBOXES.write();
             let entry = inboxes.entry(author).or_default();
             if is_full_state {
-                match freebird_core::from_cbor::<InboxStateV1>(bytes) {
+                match freebird_core::from_cbor::<InboxStateV2>(bytes) {
                     Ok(incoming) => {
                         let clone = entry.clone();
                         if let Err(e) = entry.merge(&clone, &params, &incoming) {
@@ -560,7 +741,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                     Err(e) => log(&format!("bad inbox state: {e}")),
                 }
             } else {
-                match freebird_core::from_cbor::<InboxStateV1Delta>(bytes) {
+                match freebird_core::from_cbor::<InboxStateV2Delta>(bytes) {
                     Ok(delta) => {
                         let clone = entry.clone();
                         if let Err(e) = entry.apply_delta(&clone, &params, &Some(delta)) {
@@ -568,6 +749,39 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                         }
                     }
                     Err(e) => log(&format!("bad inbox delta: {e}")),
+                }
+            }
+        }
+        TrackedKind::LegacyInbox(author) => {
+            // Read-only remnant of the v1 inbox (dual-read window): decoded
+            // with the FROZEN freebird-core v1 types, merged with the same
+            // v1 merge logic the deployed contract runs.
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                log("legacy inbox dispatch: tracked author key is not a valid key");
+                return;
+            };
+            let params = keys::inbox_params_v1(&vk);
+            let mut inboxes = LEGACY_INBOXES.write();
+            let entry = inboxes.entry(author).or_default();
+            if is_full_state {
+                match freebird_core::from_cbor::<InboxStateV1>(bytes) {
+                    Ok(incoming) => {
+                        let clone = entry.clone();
+                        if let Err(e) = entry.merge(&clone, &params, &incoming) {
+                            log(&format!("legacy inbox merge rejected: {e}"));
+                        }
+                    }
+                    Err(e) => log(&format!("bad legacy inbox state: {e}")),
+                }
+            } else {
+                match freebird_core::from_cbor::<InboxStateV1Delta>(bytes) {
+                    Ok(delta) => {
+                        let clone = entry.clone();
+                        if let Err(e) = entry.apply_delta(&clone, &params, &Some(delta)) {
+                            log(&format!("legacy inbox delta rejected: {e}"));
+                        }
+                    }
+                    Err(e) => log(&format!("bad legacy inbox delta: {e}")),
                 }
             }
         }
@@ -665,12 +879,19 @@ fn dispatch_ghostkey(payload: &[u8]) {
 pub enum TrackedKind {
     Feed([u8; 32]),
     Inbox([u8; 32]),
+    LegacyInbox([u8; 32]),
+    Anchor([u8; 32]),
     Avatar([u8; 32]),
     Directory,
+    LegacyDirectory,
     Control,
 }
 
 pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> =
+    Signal::global(BTreeMap::new);
+
+/// Newest anchor-cell order key seen per author (LWW guard for ANCHORS).
+static ANCHOR_ORDER: GlobalSignal<BTreeMap<[u8; 32], (u64, [u8; 32])>> =
     Signal::global(BTreeMap::new);
 
 fn track(key: ContractKey, kind: TrackedKind) {
