@@ -123,6 +123,17 @@ pub fn App() -> Element {
                     Ok(()) => api::log("sent posting_key Get"),
                     Err(e) => api::log(&format!("posting_key get failed: {e}")),
                 }
+                // Stored theme lives in the delegate; the sandbox has no
+                // localStorage.
+                if let Err(e) = api::kv_request(
+                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                        key: "theme".into(),
+                    },
+                )
+                .await
+                {
+                    api::log(&format!("theme get failed: {e}"));
+                }
                 // Auto-discover the Identity Vault's current delegate.
                 match crate::ghostkey::discover_vault_delegate().await {
                     Ok(key) => {
@@ -189,6 +200,18 @@ pub fn App() -> Element {
                     onclick: move |_| {
                         let next = THEME.peek().next();
                         apply_theme(next);
+                        spawn(async move {
+                            if let Err(e) = api::kv_request(
+                                freebird_core::delegate_api::FreebirdDelegateRequest::Store {
+                                    key: "theme".into(),
+                                    value: next.label().as_bytes().to_vec(),
+                                },
+                            )
+                            .await
+                            {
+                                api::log(&format!("theme save failed: {e}"));
+                            }
+                        });
                     },
                     "theme: {THEME.read().label()}"
                 }
