@@ -58,15 +58,20 @@ pub fn App() -> Element {
                 while *SYNC_STATUS.read() == SyncStatus::Connecting {
                     crate::sleep_ms(100).await;
                 }
-                if let Err(e) = api::register_freebird_delegate().await {
-                    api::log(&format!("delegate registration failed: {e}"));
+                match api::register_freebird_delegate().await {
+                    Ok(()) => api::log("sent RegisterDelegate"),
+                    Err(e) => api::log(&format!("delegate registration failed: {e}")),
                 }
-                let _ = api::kv_request(
+                match api::kv_request(
                     freebird_core::delegate_api::FreebirdDelegateRequest::Get {
                         key: "posting_key".into(),
                     },
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => api::log("sent posting_key Get"),
+                    Err(e) => api::log(&format!("posting_key get failed: {e}")),
+                }
             }
         });
     });
@@ -106,7 +111,9 @@ pub fn App() -> Element {
     let awaiting_key = POSTING_KEY_LOADED.read().is_none();
 
     rsx! {
-        document::Stylesheet { href: asset!("/assets/main.css") }
+        // Inlined: the app is served under /v1/contract/web/<key>/, where
+        // dx's absolute /assets/ URLs 404.
+        style { dangerous_inner_html: include_str!("../assets/main.css") }
         div { class: "app",
             header {
                 h1 { "Freebird" }
@@ -509,6 +516,18 @@ fn VerifyBox() -> Element {
     let mut busy = use_signal(|| false);
     let mut message = use_signal(String::new);
     let verified = own_author().map(|a| is_verified(&a)).unwrap_or(false);
+    let vault_configured = !SETTINGS.read().ghostkey_delegate.is_empty();
+
+    // Auto-detect a Ghost Key: HasIdentity never prompts the user.
+    use_effect(move || {
+        let configured = !SETTINGS.read().ghostkey_delegate.is_empty();
+        if configured && GHOSTKEY_HAS_IDENTITY.read().is_none() {
+            spawn(async {
+                let _ = api::ghostkey_request(crate::ghostkey::GhostkeyRequest::HasIdentity).await;
+            });
+        }
+    });
+    let has_identity = *GHOSTKEY_HAS_IDENTITY.read();
 
     // Complete the flow when the ghostkey delegate answers.
     use_effect(move || {
@@ -544,8 +563,27 @@ fn VerifyBox() -> Element {
                      visible to followers. A Ghost Key adds a check mark and puts your replies \
                      in the thread."
                 }
+                match has_identity {
+                    Some(true) => rsx! {
+                        p { span { class: "check", "✔" } " Ghost Key detected in your vault." }
+                    },
+                    Some(false) => rsx! {
+                        p { class: "muted",
+                            "No Ghost Key in your node's vault yet — "
+                            a { href: "https://freenet.org/ghostkey", target: "_blank", "get one here" }
+                            ", import it in the Identity Vault, then come back."
+                        }
+                    },
+                    None => rsx! {
+                        if !vault_configured {
+                            p { class: "muted",
+                                "Set the ghostkey delegate hash in Settings to enable detection."
+                            }
+                        }
+                    },
+                }
                 button {
-                    disabled: *busy.read(),
+                    disabled: *busy.read() || has_identity == Some(false),
                     onclick: move |_| {
                         busy.set(true);
                         message.set(String::new());
@@ -558,11 +596,6 @@ fn VerifyBox() -> Element {
                     },
                     if *busy.read() { "Waiting for Identity Vault…" } else { "Get check mark" }
                 }
-                p { class: "muted",
-                    "Requires a Ghost Key in your node's Identity Vault — "
-                    a { href: "https://freenet.org/ghostkey", target: "_blank", "get one here" }
-                    "."
-                }
             }
             if !message.read().is_empty() { p { "{message}" } }
         }
@@ -573,6 +606,7 @@ fn VerifyBox() -> Element {
 fn SettingsBox() -> Element {
     let mut value = use_signal(|| SETTINGS.read().ghostkey_delegate.clone());
     let mut saved = use_signal(|| false);
+    let mut arming = use_signal(|| false);
 
     rsx! {
         section { class: "card",
@@ -590,6 +624,29 @@ fn SettingsBox() -> Element {
                 "Save"
             }
             if *saved.read() { span { class: "muted", " saved" } }
+            hr {}
+            if *arming.read() {
+                p { class: "error",
+                    "This destroys your posting key. Your feed can never be \
+                     updated again and will age out of the network. There is \
+                     no undo."
+                }
+                button { class: "danger",
+                    onclick: move |_| {
+                        spawn(async move {
+                            if let Err(e) = actions::nuke_account().await {
+                                api::log(&format!("nuke failed: {e}"));
+                            }
+                        });
+                    },
+                    "Yes, delete forever"
+                }
+                button { class: "link", onclick: move |_| arming.set(false), "cancel" }
+            } else {
+                button { class: "link danger-link", onclick: move |_| arming.set(true),
+                    "Delete account"
+                }
+            }
         }
     }
 }

@@ -63,3 +63,6 @@ input {
 }
 aside h3 { margin: 0 0 0.5rem; font-size: 1rem; }
 .onboarding { max-width: 420px; margin: 3rem auto; }
+button.danger { background: #c0392b; }
+button.danger-link { color: #c0392b; background: none; }
+hr { border: none; border-top: 1px solid #e1e8ed; margin: 0.8rem 0; }

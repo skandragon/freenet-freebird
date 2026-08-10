@@ -197,6 +197,22 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Nuke the account: delete the posting key from the delegate and drop all
+/// local state. As close to "delete" as Freenet allows — the network has no
+/// remove op, but a feed whose key is destroyed can never be updated again
+/// and rots out of node caches once nothing renews its subscriptions.
+pub async fn nuke_account() -> Result<(), String> {
+    api::kv_request(FreebirdDelegateRequest::Delete {
+        key: "posting_key".into(),
+    })
+    .await?;
+    *ACCOUNT.write() = None;
+    FEEDS.write().clear();
+    INBOXES.write().clear();
+    *POSTING_KEY_LOADED.write() = Some(None);
+    Ok(())
+}
+
 /// Start the check-mark flow: ask the ghostkey delegate to sign the
 /// attestation payload. Completion arrives via GHOSTKEY_SIGN_RESULT.
 pub async fn request_verification() -> Result<(), String> {

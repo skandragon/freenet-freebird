@@ -23,8 +23,11 @@ if ! nc -z localhost 7509 2>/dev/null; then
     exit 1
 fi
 
-if fdev website list 2>/dev/null | grep -q "^${KEY_NAME}\b"; then
+if fdev website list 2>/dev/null | grep -q "\b${KEY_NAME}\b"; then
     fdev website update --key "$KEY_NAME" "$SITE_DIR"
 else
+    # Local Ed25519 keygen only; the key lives in fdev's store — back it up,
+    # it is the only way to ever update the site.
+    fdev website init "$KEY_NAME"
     fdev website publish --key "$KEY_NAME" "$SITE_DIR"
 fi

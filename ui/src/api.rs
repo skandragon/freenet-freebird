@@ -274,6 +274,7 @@ pub async fn ghostkey_request(request: GhostkeyRequest) -> Result<(), String> {
 // ---- response dispatch ----
 
 fn dispatch(response: HostResponse) {
+    log(&format!("host response: {}", response_name(&response)));
     match response {
         HostResponse::ContractResponse(cr) => dispatch_contract(cr),
         HostResponse::DelegateResponse { key, values } => {
@@ -290,6 +291,17 @@ fn dispatch(response: HostResponse) {
         }
         HostResponse::Ok => {}
         _ => {}
+    }
+}
+
+fn response_name(r: &HostResponse) -> String {
+    match r {
+        HostResponse::ContractResponse(c) => format!("Contract::{c:?}").chars().take(120).collect(),
+        HostResponse::DelegateResponse { key, values } => {
+            format!("Delegate(key={key}, {} values)", values.len())
+        }
+        HostResponse::Ok => "Ok".into(),
+        other => format!("{other:?}").chars().take(120).collect(),
     }
 }
 
