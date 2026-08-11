@@ -601,7 +601,10 @@ pub fn App() -> Element {
                             view_box: "0 0 24 24",
                             fill: "currentColor",
                             "aria-hidden": "true",
-                            path { d: "M3 13 C7 6 14 4 22 4 C19 7 17 8 14 9 C16 9 18 9 20 9 C17 12 13 13 10 13 C7 13 5 14 4 16 C3.5 15 3 14 3 13 Z" }
+                            // Heraldic bird: solid wing planes with notched trailing
+                            // edges, three tail feathers. All subpaths wind the same
+                            // way so nonzero fill unions them.
+                            path { d: "M12.9 6.4L23.2 8.6L23.51 11.22L20.2 10.8L20.28 13.12L17.2 13L17.06 15.01L14.2 15.2ZM9.8 15.2L6.94 15.01L6.8 13L3.72 13.12L3.8 10.8L0.49 11.22L0.8 8.6L11.1 6.4ZM11 3.6L12.7 1.8L14.2 3.2L17.2 4.6L14.1 5.7L13.2 8.2L14.2 14.6L14.8 20.9L13.3 18.4L12 21.2L10.7 18.4L9.2 20.9L9.8 14.6L10.8 7.8Z" }
                         }
                         "Freebird"
                     }
