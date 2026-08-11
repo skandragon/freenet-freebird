@@ -73,6 +73,13 @@ pub static DISMISSED_BUILD: GlobalSignal<Option<u64>> = Signal::global(|| None);
 /// Some(Some(seed)) = existing account.
 pub static POSTING_KEY_LOADED: GlobalSignal<Option<Option<Vec<u8>>>> = Signal::global(|| None);
 
+/// The posting_key answer will never arrive: either the startup watchdog
+/// timed out, or a second empty freebird-delegate response proved the node
+/// is swallowing delegate errors (e.g. an unattested WebSocket after a node
+/// restart or behind a proxy). Drives an explanatory error screen instead
+/// of an eternal spinner.
+pub static KEY_STORE_UNREACHABLE: GlobalSignal<bool> = Signal::global(|| false);
+
 /// Latest ghostkey-delegate sign flow result:
 /// Ok((scoped_payload, signature, certificate_pem)) or Err(user message).
 pub static GHOSTKEY_SIGN_RESULT: GlobalSignal<Option<Result<(Vec<u8>, Vec<u8>, String), String>>> =

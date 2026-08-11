@@ -364,6 +364,46 @@ fn ago(time: u64) -> String {
     }
 }
 
+/// How long to wait for the delegate's posting_key answer before declaring
+/// the key store unreachable. Delegate requests never leave the node, so a
+/// healthy answer arrives in well under a second; 15s leaves room for a
+/// node busy chewing through contract work at startup.
+const KEY_STORE_TIMEOUT_MS: u32 = 15_000;
+
+/// Which screen fills the app body while the account is unresolved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccountGate {
+    /// Account loaded — the app proper.
+    App,
+    /// Waiting on the delegate's posting_key answer.
+    Loading,
+    /// The answer never arrived (see KEY_STORE_UNREACHABLE) — explain instead
+    /// of spinning. Never falls through to Onboarding: "creating" a fresh
+    /// account against a broken key store would strand any stored identity.
+    KeyStoreStuck,
+    /// The delegate answered: no stored key.
+    Onboarding,
+}
+
+fn account_gate(
+    onboarded: bool,
+    awaiting_key: bool,
+    timed_out: bool,
+    connected_or_connecting: bool,
+) -> AccountGate {
+    if onboarded {
+        AccountGate::App
+    } else if awaiting_key && connected_or_connecting {
+        if timed_out {
+            AccountGate::KeyStoreStuck
+        } else {
+            AccountGate::Loading
+        }
+    } else {
+        AccountGate::Onboarding
+    }
+}
+
 #[component]
 pub fn App() -> Element {
     use_effect(|| {
@@ -411,6 +451,18 @@ pub fn App() -> Element {
                     Ok(()) => api::log("sent posting_key Get"),
                     Err(e) => api::log(&format!("posting_key get failed: {e}")),
                 }
+                // Watchdog: the node answers delegate requests locally, so the
+                // posting_key answer normally lands within a second. When the
+                // node hits a delegate error it responds with an EMPTY message
+                // list instead of an error, so no answer will ever arrive —
+                // flip to an explanatory screen instead of spinning forever.
+                spawn(async {
+                    crate::sleep_ms(KEY_STORE_TIMEOUT_MS).await;
+                    if POSTING_KEY_LOADED.peek().is_none() {
+                        api::log("posting_key answer never arrived — key store unreachable");
+                        *KEY_STORE_UNREACHABLE.write() = true;
+                    }
+                });
                 // Stored theme lives in the delegate; the sandbox has no
                 // localStorage.
                 if let Err(e) = api::kv_request(
@@ -583,22 +635,54 @@ pub fn App() -> Element {
                 }
             }
             UpdateBanner {}
-            if onboarded {
-                nav { class: "tabs",
-                    button { class: "link", onclick: move |_| *VIEW.write() = View::Home, "home" }
-                    button { class: "link", onclick: move |_| *VIEW.write() = View::Discover, "discover" }
-                }
-                match *VIEW.read() {
-                    View::Home => rsx! { Home {} },
-                    View::Profile => rsx! { ProfilePage {} },
-                    View::Thread(r) => rsx! { ThreadPage { author: r.author, post_id_bytes: r.post.0.to_vec() } },
-                    View::Discover => rsx! { Discover {} },
-                    View::Author(a) => rsx! { AuthorPage { author: a } },
-                }
-            } else if awaiting_key && matches!(status, SyncStatus::Connected | SyncStatus::Connecting) {
-                p { class: "muted", "Loading account…" }
-            } else {
-                Onboarding {}
+            match account_gate(
+                onboarded,
+                awaiting_key,
+                *KEY_STORE_UNREACHABLE.read(),
+                matches!(status, SyncStatus::Connected | SyncStatus::Connecting),
+            ) {
+                AccountGate::App => rsx! {
+                    nav { class: "tabs",
+                        button { class: "link", onclick: move |_| *VIEW.write() = View::Home, "home" }
+                        button { class: "link", onclick: move |_| *VIEW.write() = View::Discover, "discover" }
+                    }
+                    match *VIEW.read() {
+                        View::Home => rsx! { Home {} },
+                        View::Profile => rsx! { ProfilePage {} },
+                        View::Thread(r) => rsx! { ThreadPage { author: r.author, post_id_bytes: r.post.0.to_vec() } },
+                        View::Discover => rsx! { Discover {} },
+                        View::Author(a) => rsx! { AuthorPage { author: a } },
+                    }
+                },
+                AccountGate::Loading => rsx! {
+                    p { class: "muted", "Loading account…" }
+                },
+                AccountGate::KeyStoreStuck => rsx! {
+                    section { class: "card onboarding",
+                        h2 { "Your node isn't answering" }
+                        p {
+                            "Freebird asked your node for its stored account key, but no \
+                             answer arrived. This usually means the node stopped honoring \
+                             this page's session — for example after a node restart, or \
+                             when the node is reached through a proxy or container."
+                        }
+                        p { "Reloading the page usually fixes it." }
+                        button {
+                            onclick: move |_| {
+                                #[cfg(target_arch = "wasm32")]
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.location().reload();
+                                }
+                            },
+                            "Reload"
+                        }
+                        p { class: "muted",
+                            "If it keeps happening, check the node's log for delegate \
+                             errors (\"missing message origin\")."
+                        }
+                    }
+                },
+                AccountGate::Onboarding => rsx! { Onboarding {} },
             }
             footer { class: "muted app-footer",
                 a {
@@ -1903,6 +1987,23 @@ mod tests {
         );
         assert_eq!(merged.len(), 3);
         assert_eq!(merged.iter().filter(|p| **p == shared).count(), 1);
+    }
+
+    /// A key-store timeout must show the stuck screen, never Onboarding —
+    /// "creating" an account against a broken key store would strand any
+    /// identity already stored there. A late answer (awaiting_key drops)
+    /// still wins over a stale timeout flag, and an onboarded account
+    /// always renders the app.
+    #[test]
+    fn account_gate_prefers_stuck_over_onboarding() {
+        use super::{account_gate, AccountGate};
+        assert_eq!(account_gate(false, true, false, true), AccountGate::Loading);
+        assert_eq!(account_gate(false, true, true, true), AccountGate::KeyStoreStuck);
+        // Late answer arrived (no stored key): onboard despite the stale flag.
+        assert_eq!(account_gate(false, false, true, true), AccountGate::Onboarding);
+        // Late answer arrived (stored key resumed): the app, timeout or not.
+        assert_eq!(account_gate(true, false, true, true), AccountGate::App);
+        assert_eq!(account_gate(true, true, true, true), AccountGate::App);
     }
 
     /// Dual-read merge for Discover: one row per author, v2 wins even when
