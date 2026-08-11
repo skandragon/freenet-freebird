@@ -500,6 +500,9 @@ fn dispatch(response: HostResponse) {
         HostResponse::ContractResponse(cr) => dispatch_contract(cr),
         HostResponse::DelegateResponse { key, values } => {
             let is_freebird = key == freebird_delegate_key();
+            if values.is_empty() {
+                note_empty_delegate_response(is_freebird);
+            }
             for out in values {
                 if let OutboundDelegateMsg::ApplicationMessage(app_msg) = out {
                     if is_freebird {
@@ -512,6 +515,36 @@ fn dispatch(response: HostResponse) {
         }
         HostResponse::Ok => {}
         _ => {}
+    }
+}
+
+/// An empty delegate response is the node's tell for a swallowed delegate
+/// error: when execution fails (e.g. "missing message origin" on an
+/// unattested connection) the node logs node-side and answers with an EMPTY
+/// message list instead of an error, so the real answer never comes.
+///
+/// For the freebird delegate exactly one empty response is legitimate — the
+/// RegisterDelegate ack — so only a SECOND one proves errors are being
+/// swallowed. The ghostkey delegate is never registered by us, so for it any
+/// empty response is an error; surfacing it through GHOSTKEY_SIGN_RESULT
+/// both explains the situation in the Verification card and unsticks a
+/// pending "Waiting for Identity Vault…" flow.
+fn note_empty_delegate_response(is_freebird: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    if is_freebird {
+        static EMPTY_FREEBIRD: AtomicU32 = AtomicU32::new(0);
+        let seen = EMPTY_FREEBIRD.fetch_add(1, Ordering::SeqCst) + 1;
+        if seen >= 2 && POSTING_KEY_LOADED.peek().is_none() {
+            log("empty freebird delegate response beyond the register ack — node is swallowing delegate errors");
+            *KEY_STORE_UNREACHABLE.write() = true;
+        }
+    } else {
+        *GHOSTKEY_SIGN_RESULT.write() = Some(Err(
+            "The Identity Vault on this node didn't answer (the node reported \
+             an empty response). Verification is optional — everything else \
+             keeps working. Reloading the page may fix it."
+                .into(),
+        ));
     }
 }
 
