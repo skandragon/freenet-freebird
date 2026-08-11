@@ -29,6 +29,29 @@ fn app_base_url() -> String {
     String::new()
 }
 
+/// Mirror the current route onto the shell page's address bar.
+///
+/// Under Freenet the app runs in a sandboxed iframe; our in-app anchors carry
+/// `data-freenet-no-intercept` so hash navigation stays inside the iframe
+/// (the shell's navigate path would reload the whole app — issue: logo click
+/// refreshes the page). The trade-off is the outer URL no longer follows, so
+/// we post the shell's `hash` message, which replaceStates the fragment onto
+/// the outer address bar without touching the iframe.
+#[cfg(target_arch = "wasm32")]
+fn sync_shell_hash(hash: &str) {
+    let Some(win) = web_sys::window() else { return };
+    // Top-level (no shell): the address bar is ours already.
+    let Ok(Some(parent)) = win.parent() else { return };
+    if parent == win {
+        return;
+    }
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&msg, &"__freenet_shell__".into(), &true.into());
+    let _ = js_sys::Reflect::set(&msg, &"type".into(), &"hash".into());
+    let _ = js_sys::Reflect::set(&msg, &"hash".into(), &hash.into());
+    let _ = parent.post_message(&msg, "*");
+}
+
 /// Shareable "this is me, follow me" link.
 pub fn follow_link(author: &[u8; 32]) -> String {
     format!("{}?follow={}", app_base_url(), bs58::encode(author).into_string())
@@ -446,6 +469,9 @@ pub fn App() -> Element {
             if View::from_hash(&loc.hash().unwrap_or_default()) != view {
                 let _ = loc.set_hash(&view.to_hash());
             }
+            // Always mirror to the shell: anchor clicks change our hash
+            // without going through set_hash above.
+            sync_shell_hash(&view.to_hash());
         }
         #[cfg(not(target_arch = "wasm32"))]
         let _ = view;
@@ -518,7 +544,7 @@ pub fn App() -> Element {
         div { class: "app",
             header {
                 h1 {
-                    a { href: "{View::Home.to_hash()}",
+                    a { href: "{View::Home.to_hash()}", "data-freenet-no-intercept": "1",
                         svg {
                             view_box: "0 0 24 24",
                             fill: "currentColor",
@@ -856,15 +882,15 @@ fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thr
         article { class: "card post",
             div { class: "post-head",
                 Avatar { author }
-                a { href: "{View::Author(author).to_hash()}", strong { "{name}" } }
+                a { href: "{View::Author(author).to_hash()}", "data-freenet-no-intercept": "1", strong { "{name}" } }
                 if verified { span { class: "check", title: "Ghost Key verified", "✔" } }
                 span { class: "muted", "@{short_key(&author)} · " }
                 // Timestamp = thread permalink (deep link, issue #2).
-                a { class: "muted", href: "{thread_href}", title: "thread", "{ago(post.post.time)}" }
+                a { class: "muted", href: "{thread_href}", title: "thread", "data-freenet-no-intercept": "1", "{ago(post.post.time)}" }
             }
             if let Some(parent) = post.post.in_reply_to {
                 p { class: "muted replying-to",
-                    a { class: "muted", href: "{View::Thread(parent).to_hash()}",
+                    a { class: "muted", href: "{View::Thread(parent).to_hash()}", "data-freenet-no-intercept": "1",
                         "replying to @{short_key(&parent.author)}"
                     }
                 }
@@ -1292,7 +1318,7 @@ fn Discover() -> Element {
                         span {
                             Avatar { author: a }
                             " "
-                            a { href: "{View::Author(a).to_hash()}", "{author_name(&a)}" }
+                            a { href: "{View::Author(a).to_hash()}", "data-freenet-no-intercept": "1", "{author_name(&a)}" }
                             if is_verified(&a) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                             span { class: "muted", " @{short_key(&a)} · active {ago(last_active)}" }
                             if let Some(latest) = FEEDS.read().get(&a).and_then(|f| f.as_ref()).and_then(|f| f.posts.posts.last()) {
