@@ -246,7 +246,9 @@ mod tests {
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
-            "sCJ9HQJGnHE1NGEWEC73CpWBPymT2ievqDW4iXh7Pgb",
+            // Rotated 2026-08-11 (issue #49): inbox verify rejects
+            // unreferenced creds; rides anchor cells for migration.
+            "4AqHYcjcXHZz5xgsjx9GmEpm4MkSDBQcEh86DvQz82QC",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             "577KsAVancBcWwQfbpYrF9DN4FPzBBXrvuEALf2Gf67g",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",

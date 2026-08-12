@@ -174,13 +174,23 @@ mod inbox_v2_components {
 
         fn verify(
             &self,
-            _parent: &Self::ParentState,
+            parent: &Self::ParentState,
             parameters: &Self::Parameters,
         ) -> Result<(), String> {
             if self.creds.len() > MAX_POINTERS {
                 return Err("more credentials than pointers can reference".into());
             }
+            // A cred no pointer references would be pruned by
+            // post_apply_cleanup: accepting it caches a state that is not a
+            // cleanup fixpoint, and its holder re-offers the pruned creds
+            // forever (issue #49). Reject BEFORE the RSA check — each
+            // attested cred costs a chain verification in wasm.
+            let referenced: BTreeSet<[u8; 32]> =
+                parent.pointers.pointers.iter().map(|p| p.ptr.replier).collect();
             for (key, cred) in &self.creds {
+                if !referenced.contains(key) {
+                    return Err("credential referenced by no pointer".into());
+                }
                 cred.check(key, &parameters.ghostkey_master)?;
             }
             Ok(())
@@ -844,6 +854,64 @@ mod tests {
         let mut s = InboxStateV2::default();
         apply(&mut s, &p, delta_of(vec![&r], vec![]));
         assert!(s.creds.creds.is_empty());
+    }
+
+    /// Issue #49: a state carrying creds no pointer references must fail
+    /// verify — post_apply_cleanup prunes them, so accepting one caches a
+    /// state that is not a cleanup fixpoint.
+    #[test]
+    fn unreferenced_creds_fail_verify() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = anon_replier();
+        let mut s = InboxStateV2::default();
+        s.creds.creds.insert(r.key, r.cred.clone());
+        assert!(s.verify(&s.clone(), &p).is_err());
+    }
+
+    /// Issue #49 quiescence: an attacker state of unreferenced creds is
+    /// rejected at validate (never cached, so no holder re-offers it), and
+    /// even a delta smuggling them in leaves the receiver valid and its
+    /// exchange with an honest replica quiescent.
+    #[test]
+    fn unreferenced_cred_offer_goes_quiescent() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let honest = anon_replier();
+
+        let mut attacker = InboxStateV2::default();
+        for _ in 0..5 {
+            let r = anon_replier();
+            attacker.creds.creds.insert(r.key, r.cred.clone());
+        }
+        assert!(
+            attacker.verify(&attacker.clone(), &p).is_err(),
+            "attacker state must be rejected at validate"
+        );
+
+        let mut receiver = InboxStateV2::default();
+        apply(
+            &mut receiver,
+            &p,
+            delta_of(vec![&honest], vec![pointer(&honest, 5, 0)]),
+        );
+        let clone = receiver.clone();
+        receiver.merge(&clone, &p, &attacker).expect("merge ok");
+        receiver
+            .verify(&receiver.clone(), &p)
+            .expect("receiver stays valid after smuggled creds are pruned");
+        assert_eq!(receiver.creds.creds.len(), 1);
+
+        // Full exchange with an honest replica goes quiescent.
+        let mut peer = InboxStateV2::default();
+        let clone = peer.clone();
+        peer.merge(&clone, &p, &receiver).expect("merge ok");
+        let clone = receiver.clone();
+        receiver.merge(&clone, &p, &peer).expect("merge ok");
+        let ps = peer.summarize(&peer.clone(), &p);
+        assert!(receiver.delta(&receiver.clone(), &p, &ps).is_none());
+        let rs = receiver.summarize(&receiver.clone(), &p);
+        assert!(peer.delta(&peer.clone(), &p, &rs).is_none());
     }
 
     #[test]
