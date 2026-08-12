@@ -23,9 +23,11 @@ WASM_DIR := $(CARGO_TARGET)/$(WASM_TARGET)/release
 # Excludes the FROZEN cell_contract and every *_v1 legacy blob on purpose.
 REPRO_WASMS := feed_contract.wasm avatar_contract.wasm directory_contract.wasm inbox_contract.wasm freebird_delegate.wasm
 DOCKER_IMG := freebird-repro-build
-# Set PLATFORM (e.g. linux/amd64) to build/run under a specific arch — used to
-# prove arm64 (dev) and amd64 (CI) produce identical bytes. Empty = host arch.
-PLATFORM ?=
+# Build-of-record arch. wasm bytes are NOT bit-identical across host arch
+# (rustc/LLVM codegen differs arm64 vs amd64 even with paths remapped), so the
+# reproducible build standardizes on amd64 — native on CI, emulated on Apple
+# Silicon. Override only to experiment; the vendored/reference bytes are amd64.
+PLATFORM ?= linux/amd64
 PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
 DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
 
@@ -192,13 +194,14 @@ build-docker: build-docker-image
 	$(DOCKER_RUN) make wasm-repro
 	cp $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS)) ui/contracts/
 
-# CROSS-ARCH reproducibility gate: build in the pinned container and assert the
-# four non-frozen contracts + delegate match scripts/repro-reference-hashes.txt
-# (canonical hashes of the CURRENT source, produced by this same reproducible
-# build). CI runs this on amd64; the reference was pinned on arm64 — so a pass
-# proves arm64==amd64. It does NOT diff the grandfathered vendored addressing
-# bytes, so it never forces a rotation. When a contract's source legitimately
-# changes, refresh the reference: `make repro-hashes` then paste into the file.
+# Reproducibility gate: build in the pinned amd64 container and assert the four
+# non-frozen contracts + delegate match scripts/repro-reference-hashes.txt
+# (canonical amd64 hashes of the CURRENT source). wasm bytes are NOT bit-
+# identical across host arch, so amd64 is the single build-of-record; CI runs
+# this on amd64 and a pass proves the amd64 build is deterministic against the
+# pinned reference. It does NOT diff the grandfathered vendored addressing bytes,
+# so it never forces a rotation. When a contract's source legitimately changes,
+# refresh the reference on amd64: `make repro-hashes` then paste into the file.
 verify-repro: build-docker-image
 	$(DOCKER_RUN) make wasm-repro
 	@shasum -a 256 $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS))
