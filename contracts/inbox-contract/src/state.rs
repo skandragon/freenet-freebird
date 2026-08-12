@@ -399,8 +399,9 @@ mod inbox_v3_components {
             delta: &Option<Self::Delta>,
         ) -> Result<(), String> {
             let Some(delta) = delta else { return Ok(()) };
-            // Bound the work one delta can demand: each attested cred costs
-            // an RSA chain verification inside wasm.
+            // Bound the work one delta can demand: each attested cred can
+            // cost an RSA chain verification inside wasm (replays and LWW
+            // losers are skipped — issue #52).
             if delta.len() > MAX_POINTERS {
                 return Err("credential delta too large".into());
             }
@@ -997,6 +998,28 @@ mod tests {
             }),
         )
         .expect("losing cred skipped, not verified");
+        assert!(s.creds.creds[&r.key].attestation.is_some());
+    }
+
+    /// Issue #52: an EXACT replay of a held cred (equal content hash) is
+    /// skipped by the `>=` compare, never re-verified — pinned with a
+    /// rogue-master attested cred seated directly in state, which would
+    /// fail check() (RSA) if verification were reached.
+    #[test]
+    fn replayed_cred_not_reverified() {
+        let authority = TestAuthority::new();
+        let rogue = TestAuthority::new();
+        let p = params(&authority);
+        let r = attested_replier(&rogue); // does NOT verify under p.ghostkey_master
+        let mut s = InboxStateV3::default();
+        s.creds.creds.insert(r.key, r.cred.clone()); // seated as if verified
+        apply(&mut s, &p, delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]));
+        // Guard: a held pointer references r.key, so the replayed cred
+        // survives the staple filter and reaches CredsV3::apply_delta.
+        assert!(s.pointers.pointers.iter().any(|ptr| ptr.ptr.replier == r.key));
+        let clone = s.clone();
+        s.apply_delta(&clone, &p, &delta_of(vec![&r], vec![]))
+            .expect("exact replay skipped, not re-verified");
         assert!(s.creds.creds[&r.key].attestation.is_some());
     }
 

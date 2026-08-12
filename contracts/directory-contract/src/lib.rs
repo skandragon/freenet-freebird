@@ -21,7 +21,7 @@
 //! this crate directly with default-features = false. The `legacy` module
 //! keeps the v1 wire types for the dual-read migration window.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use cell_contract::SignedCellV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -139,18 +139,18 @@ impl AuthorizedListingV3 {
     /// attestation slot), and — when present — the attestation chain
     /// verifies and binds this posting key.
     pub fn check(&self, master: &VerifyingKey) -> Result<(), String> {
-        self.check_cached(master, &mut BTreeSet::new())
+        self.check_skipping(master, None)
     }
 
-    /// `check`, memoizing the RSA-heavy attestation verification (issue #52).
-    /// The memo key is (attestation content hash, author): exactly what the
-    /// full attestation check proves, so a hit is a byte-identical replay of
-    /// an attestation already verified for this author. The ed25519 listing
-    /// signature is always verified.
-    pub fn check_cached(
+    /// `check`, skipping the RSA-heavy attestation verification when the
+    /// attestation is byte-identical to `known` — one already verified for
+    /// this author under the same master (issue #52). Sound only because
+    /// `master` is fixed per contract instance (parameters are part of the
+    /// contract address). The ed25519 listing signature is always verified.
+    fn check_skipping(
         &self,
         master: &VerifyingKey,
-        verified: &mut BTreeSet<([u8; 32], [u8; 32])>,
+        known: Option<&AttestationV2>,
     ) -> Result<(), String> {
         let vk = VerifyingKey::from_bytes(&self.listing.author)
             .map_err(|e| format!("bad author key: {e}"))?;
@@ -160,12 +160,10 @@ impl AuthorizedListingV3 {
         )
         .map_err(|e| format!("listing signature invalid: {e}"))?;
         if let Some(att) = &self.attestation {
-            let id = (att.content_hash(), self.listing.author);
-            if !verified.contains(&id) {
+            if known != Some(att) {
                 att.verify(&vk, Some(master))
                     .map(|_tier| ())
                     .map_err(|e| format!("listing attestation invalid: {e}"))?;
-                verified.insert(id);
             }
         }
         Ok(())
@@ -436,8 +434,9 @@ impl DirectoryStateV4 {
         parameters: &DirectoryParametersV3,
         delta: &DirectoryDeltaV3,
     ) -> Result<(), String> {
-        // Bound the work one delta can demand: each attested listing costs
-        // an RSA chain verification inside wasm. A full sync can carry both
+        // Bound the work one delta can demand: each attested listing can
+        // cost an RSA chain verification inside wasm (replays of the held
+        // attestation are skipped — issue #52). A full sync can carry both
         // tiers at their caps.
         if delta.listings.len() > MAX_LISTINGS + ANON_LISTINGS {
             return Err("listing delta too large".into());
@@ -445,26 +444,24 @@ impl DirectoryStateV4 {
         // Admission difficulty: the floor, raised by a valid publisher-signed
         // control-cell record if this write carries one (issue #51).
         let bits = difficulty_bits(delta.pow_difficulty.as_ref());
-        // Attestations already verified, by (content hash, bound author):
-        // seeded from the held state (verified when admitted) and extended as
-        // the delta verifies new ones — replaying a known attestation costs
-        // no RSA (issue #52).
-        let mut verified: BTreeSet<([u8; 32], [u8; 32])> = self
-            .attested
-            .values()
-            .filter_map(|l| l.attestation.as_ref().map(|a| (a.content_hash(), l.listing.author)))
-            .collect();
         for l in &delta.listings {
             // LWW first (issue #52): a losing entry is never verified, so a
-            // replay of already-held listings costs no crypto at all.
+            // replay of already-held listings costs no crypto at all. (A
+            // malformed loser is silently skipped where an empty slot would
+            // have failed the delta — the resulting state converges either
+            // way; only misbehaving-peer signal is lost.)
             let tier = if l.is_anon() { &self.anon } else { &self.attested };
-            if tier
-                .get(&l.listing.author)
-                .is_some_and(|held| held.lww_key() >= l.lww_key())
-            {
+            let held = tier.get(&l.listing.author);
+            if held.is_some_and(|h| h.lww_key() >= l.lww_key()) {
                 continue;
             }
-            l.check_cached(&parameters.ghostkey_master, &mut verified)?;
+            // The only attestation an author could byte-identically replay
+            // is the one seated in their slot, verified at admission (the
+            // memo key would be (attestation, author), and the slot IS the
+            // author) — so a per-slot lookup gets every hit a full memo
+            // would, at O(1) instead of hashing the whole tier (issue #52).
+            let known = held.and_then(|h| h.attestation.as_ref());
+            l.check_skipping(&parameters.ghostkey_master, known)?;
             // Anonymous listings must clear the proof-of-work bar; drop the
             // ones that don't rather than fail the whole delta (an honest
             // peer never forwards an under-bar listing, so this only bites
@@ -1246,7 +1243,7 @@ mod tests {
         assert!(upgrader.delta(&summary).is_some());
     }
 
-    // ---- verify-after-LWW + attestation memo (issue #52) ----
+    // ---- verify-after-LWW + held-attestation skip (issue #52) ----
 
     /// A delta entry losing the per-slot LWW is skipped BEFORE any
     /// verification: a garbage losing entry no longer fails the delta, and
@@ -1285,19 +1282,75 @@ mod tests {
                 Some(att.clone()),
             )
         };
+        // The skip rests on this invariant: full-state verify() can never
+        // seat an unverifiable attestation, so anything held WAS verified.
+        let mut fabricated = DirectoryStateV4::default();
+        fabricated.attested.insert(key, mk(5, &att));
+        assert!(fabricated.verify(&p).is_err(), "rogue attestation must fail verify()");
+
         let mut s = DirectoryStateV4::default();
         s.attested.insert(key, mk(5, &att)); // seated as if verified at admission
-        // Republish with the held attestation: admitted, no RSA re-run.
-        s.apply_delta(&p, &d(vec![mk(7, &att)]))
-            .expect("held attestation memoized");
-        assert_eq!(s.attested[&key].listing.last_active, 7);
+        // Republish with the held attestation — including a second entry in
+        // the same delta riding the just-admitted one: no RSA re-run.
+        s.apply_delta(&p, &d(vec![mk(7, &att), mk(9, &att)]))
+            .expect("held attestation not re-verified");
+        assert_eq!(s.attested[&key].listing.last_active, 9);
         // The ed25519 listing signature is still enforced on winners.
-        let mut bad = mk(9, &att);
+        let mut bad = mk(11, &att);
         bad.signature = Signature::from_bytes(&[0u8; 64]);
         assert!(s.apply_delta(&p, &d(vec![bad])).is_err());
         // An UNSEEN attestation is fully verified (and fails here).
-        let other_att = TestAuthority::new().attest(&sk);
-        assert!(s.apply_delta(&p, &d(vec![mk(11, &other_att)])).is_err());
+        let other_att = rogue.attest(&sk); // fresh mint = different bytes
+        assert!(s.apply_delta(&p, &d(vec![mk(13, &other_att)])).is_err());
+    }
+
+    /// An EXACT replay (equal lww_key) is skipped by the `>=` compare, never
+    /// re-verified — pinned with a held entry whose signature is garbage, so
+    /// reaching verification at all would fail the delta.
+    #[test]
+    fn exact_replay_skipped_before_verification() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let a = author(&authority);
+        let mut bad = listing(&a, 5);
+        bad.signature = Signature::from_bytes(&[0u8; 64]);
+        let mut s = DirectoryStateV4::default();
+        s.attested.insert(a.key, bad.clone());
+        s.apply_delta(&p, &d(vec![bad])).expect("exact replay skipped");
+        assert_eq!(s.attested[&a.key].listing.last_active, 5);
+    }
+
+    /// The LWW skip is PER-TIER: a high-`last_active` listing in the other
+    /// tier must not shield an entry from verification.
+    #[test]
+    fn lww_skip_is_per_tier() {
+        let authority = TestAuthority::new();
+        let rogue = TestAuthority::new();
+        let p = params(&authority);
+        let sk = SigningKey::generate(&mut OsRng);
+        let key = sk.verifying_key().to_bytes();
+        let mut s = DirectoryStateV4::default();
+        // Anon slot held at t=100; an attested t=5 with a rogue attestation
+        // must still be verified (and fail), not skipped via the anon slot.
+        s.anon.insert(
+            key,
+            AuthorizedListingV3::new(ListingV1 { author: key, last_active: 100 }, &sk, None),
+        );
+        let att = rogue.attest(&sk);
+        let l = AuthorizedListingV3::new(
+            ListingV1 { author: key, last_active: 5 },
+            &sk,
+            Some(att),
+        );
+        assert!(s.apply_delta(&p, &d(vec![l])).is_err());
+        // Mirror: attested slot at t=100 must not shield a garbage anon t=5.
+        let a = author(&authority);
+        let mut s = DirectoryStateV4::default();
+        s.apply_delta(&p, &d(vec![listing(&a, 100)])).unwrap();
+        let mut anon_bad =
+            AuthorizedListingV3::new(ListingV1 { author: a.key, last_active: 5 }, &a.sk, None);
+        anon_bad.signature = Signature::from_bytes(&[0u8; 64]);
+        assert!(s.apply_delta(&p, &d(vec![anon_bad])).is_err());
     }
 
     // ---- merge convergence (issue #50) ----
