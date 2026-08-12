@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
+use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::FeedStateV1;
 use freebird_core::inbox::InboxStateV1;
 use freenet_stdlib::client_api::WebApi;
@@ -25,6 +26,13 @@ pub static ACCOUNT: GlobalSignal<Option<SigningKey>> = Signal::global(|| None);
 
 /// Feed states by author key. `None` value = requested, not yet arrived.
 pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
+    Signal::global(BTreeMap::new);
+
+/// LEGACY (pre-#64) feed states by author key — dual-read migration window
+/// (issue #64 rotated the feed contract and changed its format in place).
+/// `None` value = requested, not yet arrived. Read-only: posts here are
+/// merged into the display; nothing writes back. Gated on `read_v1_feed`.
+pub static LEGACY_FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<LegacyFeedState>>> =
     Signal::global(BTreeMap::new);
 
 /// Inbox (v2) states by owner key.

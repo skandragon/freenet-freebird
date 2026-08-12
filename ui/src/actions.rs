@@ -373,6 +373,7 @@ pub async fn nuke_account() -> Result<(), String> {
     .await?;
     *ACCOUNT.write() = None;
     FEEDS.write().clear();
+    LEGACY_FEEDS.write().clear();
     INBOXES.write().clear();
     *POSTING_KEY_LOADED.write() = Some(None);
     Ok(())

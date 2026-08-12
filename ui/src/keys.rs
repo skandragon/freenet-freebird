@@ -20,6 +20,7 @@ pub const FREEBIRD_DELEGATE_WASM: &[u8] = include_bytes!("../contracts/freebird_
 // Frozen v1 bytes, kept ONLY to derive the legacy inbox/directory addresses
 // for the dual-read migration window (issue #23). Reads use the instance id;
 // these wasm modules are never instantiated by this build.
+pub const FEED_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/feed_contract_v1.wasm");
 pub const INBOX_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract_v1.wasm");
 pub const DIRECTORY_V1_CONTRACT_WASM: &[u8] =
     include_bytes!("../contracts/directory_contract_v1.wasm");
@@ -101,6 +102,18 @@ fn contract_key(wasm: &[u8], params_cbor: Vec<u8>) -> ContractKey {
 pub fn feed_key(author: &VerifyingKey) -> ContractKey {
     let params = freebird_core::to_cbor(&feed_params(author)).expect("params serialize");
     contract_key(FEED_CONTRACT_WASM, params)
+}
+
+/// The author's LEGACY (pre-#64) feed address — dual-read window only. Same
+/// params as the current feed; only the frozen v1 wasm bytes differ, so the
+/// derived address differs.
+pub fn feed_key_v1(author: &VerifyingKey) -> ContractKey {
+    let params = freebird_core::to_cbor(&feed_params(author)).expect("params serialize");
+    contract_key(FEED_V1_CONTRACT_WASM, params)
+}
+
+pub fn feed_instance_id_v1(author: &VerifyingKey) -> ContractInstanceId {
+    *feed_key_v1(author).id()
 }
 
 pub fn inbox_key(owner: &VerifyingKey) -> ContractKey {
@@ -248,6 +261,7 @@ mod tests {
             directory_instance_id_v1().to_string(),
             control_cell_instance_id().to_string(),
             feed_instance_id(&author).to_string(),
+            feed_instance_id_v1(&author).to_string(),
             inbox_instance_id(&author).to_string(),
             inbox_instance_id_v1(&author).to_string(),
             avatar_instance_id(&author).to_string(),
@@ -264,6 +278,7 @@ mod tests {
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
+            "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
             "9uNGt6ZEqTFDgM7e8gocP2GsUhG65QkqrDUbwWjk4kZB",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",

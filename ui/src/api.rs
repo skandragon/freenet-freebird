@@ -12,6 +12,7 @@ use dioxus::prelude::*;
 use directory_contract::{AuthorizedListingV3, DirectoryStateV3};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
+use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::{FeedParametersV1, FeedStateV1, FeedStateV1Delta};
 use freebird_core::inbox::{InboxStateV1, InboxStateV1Delta};
 use inbox_contract::state::{InboxStateV3, InboxStateV3Delta};
@@ -270,6 +271,17 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
         track(keys::inbox_key_v1(&vk), TrackedKind::LegacyInbox(author));
         send(ClientRequest::ContractOp(ContractRequest::Get {
             key: keys::inbox_instance_id_v1(&vk),
+            return_contract_code: false,
+            subscribe: true,
+            blocking_subscribe: false,
+        }))
+        .await?;
+    }
+    if flag_bool("read_v1_feed", true) {
+        LEGACY_FEEDS.write().entry(author).or_insert(None);
+        track(keys::feed_key_v1(&vk), TrackedKind::LegacyFeed(author));
+        send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: keys::feed_instance_id_v1(&vk),
             return_contract_code: false,
             subscribe: true,
             blocking_subscribe: false,
@@ -984,6 +996,31 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                 }
             }
         }
+        TrackedKind::LegacyFeed(author) => {
+            // Read-only remnant of the pre-#64 feed (dual-read window): decode
+            // with the FROZEN legacy type and verify under the OLD rules
+            // (bare-CBOR signatures, AttestationV1). Full state only — the old
+            // contract is dead, so no new deltas arrive; a delta would need the
+            // old delta type and there is nothing to apply it to anyway.
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                log("legacy feed dispatch: tracked author key is not a valid key");
+                return;
+            };
+            if !is_full_state {
+                log("ignoring legacy feed delta (dead contract, display-only)");
+                return;
+            }
+            match freebird_core::from_cbor::<LegacyFeedState>(bytes) {
+                Ok(incoming) => {
+                    if let Err(e) = incoming.verify(&vk, &keys::master_key()) {
+                        log(&format!("rejected invalid legacy feed for {key}: {e}"));
+                        return;
+                    }
+                    LEGACY_FEEDS.write().insert(author, Some(incoming));
+                }
+                Err(e) => log(&format!("bad legacy feed state for {key}: {e}")),
+            }
+        }
     }
 }
 
@@ -1143,6 +1180,7 @@ fn dispatch_ghostkey(payload: &[u8]) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrackedKind {
     Feed([u8; 32]),
+    LegacyFeed([u8; 32]),
     Inbox([u8; 32]),
     LegacyInbox([u8; 32]),
     Anchor([u8; 32]),

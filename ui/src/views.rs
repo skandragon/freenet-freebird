@@ -9,6 +9,18 @@ use crate::api;
 use crate::keys;
 use crate::state::*;
 
+/// Posts from an author's LEGACY (pre-#64) feed, for read-only merge into the
+/// display during the dual-read window (issue #64). Empty when the window is
+/// closed (`read_v1_feed=false`) or the author has no legacy feed.
+fn legacy_posts(author: &[u8; 32]) -> Vec<AuthorizedPost> {
+    LEGACY_FEEDS
+        .read()
+        .get(author)
+        .and_then(|f| f.as_ref())
+        .map(|f| f.posts.posts.clone())
+        .unwrap_or_default()
+}
+
 /// The app's own base URL (path through the contract id, no query/hash).
 #[cfg(target_arch = "wasm32")]
 fn app_base_url() -> String {
@@ -975,6 +987,16 @@ fn Timeline() -> Element {
                 s.posts.posts.iter().map(move |p| (*author, p.clone()))
             })
             .collect();
+        // Dual-read: fold in legacy-feed posts for followed authors, deduped.
+        let have: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
+            all.iter().map(|(a, p)| (*a, p.post.id)).collect();
+        for author in &wanted {
+            for p in legacy_posts(author) {
+                if !have.contains(&(*author, p.post.id)) {
+                    all.push((*author, p));
+                }
+            }
+        }
         all.sort_by(|a, b| (b.1.post.time, b.1.post.id).cmp(&(a.1.post.time, a.1.post.id)));
         // A reply whose parent is in the timeline is reachable via the
         // parent's thread — showing it top-level too duplicates it.
@@ -1209,26 +1231,36 @@ fn AuthorPage(author: [u8; 32]) -> Element {
         }
     });
 
-    let loaded = FEEDS.read().get(&author).is_some_and(|f| f.is_some());
-    let posts: Vec<AuthorizedPost> = FEEDS
+    let loaded = FEEDS.read().get(&author).is_some_and(|f| f.is_some())
+        || LEGACY_FEEDS.read().get(&author).is_some_and(|f| f.is_some());
+    let mut posts: Vec<AuthorizedPost> = FEEDS
         .read()
         .get(&author)
         .and_then(|f| f.as_ref())
-        .map(|f| {
-            let mut v = f.posts.posts.clone();
-            v.sort_by(|a, b| (b.post.time, b.post.id).cmp(&(a.post.time, a.post.id)));
-            // Same rule as the home timeline: a reply whose parent is in the
-            // list is reachable via the parent's thread — hide it top-level.
-            let ids: std::collections::BTreeSet<freebird_core::types::PostId> =
-                v.iter().map(|p| p.post.id).collect();
-            v.retain(|p| {
-                p.post
-                    .in_reply_to
-                    .is_none_or(|r| r.author != author || !ids.contains(&r.post))
-            });
-            v
-        })
+        .map(|f| f.posts.posts.clone())
         .unwrap_or_default();
+    // Dual-read: merge legacy-feed posts, deduped by id.
+    {
+        let have: std::collections::BTreeSet<freebird_core::types::PostId> =
+            posts.iter().map(|p| p.post.id).collect();
+        for p in legacy_posts(&author) {
+            if !have.contains(&p.post.id) {
+                posts.push(p);
+            }
+        }
+    }
+    posts.sort_by(|a, b| (b.post.time, b.post.id).cmp(&(a.post.time, a.post.id)));
+    // Same rule as the home timeline: a reply whose parent is in the list is
+    // reachable via the parent's thread — hide it top-level.
+    {
+        let ids: std::collections::BTreeSet<freebird_core::types::PostId> =
+            posts.iter().map(|p| p.post.id).collect();
+        posts.retain(|p| {
+            p.post
+                .in_reply_to
+                .is_none_or(|r| r.author != author || !ids.contains(&r.post))
+        });
+    }
 
     let own = own_author();
     let following = own
