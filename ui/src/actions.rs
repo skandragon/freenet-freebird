@@ -78,7 +78,10 @@ pub async fn create_account(name: String) -> Result<(), String> {
 
     let author = vk.to_bytes();
     FEEDS.write().insert(author, Some(state));
-    *ACCOUNT.write() = Some(sk);
+    *ACCOUNT.write() = Some(sk.clone());
+    // Mark the seed as loaded too, so a late carry-forward answer from an
+    // old delegate generation can never clobber this fresh identity.
+    *POSTING_KEY_LOADED.write() = Some(Some(sk.to_bytes().to_vec()));
     // Track so update notifications route; PUT already subscribed us.
     api::fetch_feed(author).await.ok();
     Ok(())
@@ -118,8 +121,11 @@ pub async fn import_account(encoded: &str) -> Result<(), String> {
         value: seed.to_vec(),
     })
     .await?;
+    // Resume first (it sets ACCOUNT synchronously), THEN publish the loaded
+    // seed — the other order fires the App effect's own resume concurrently.
+    resume_account(seed.to_vec()).await?;
     *POSTING_KEY_LOADED.write() = Some(Some(seed.to_vec()));
-    resume_account(seed.to_vec()).await
+    Ok(())
 }
 
 fn signing_key() -> Result<SigningKey, String> {
@@ -330,24 +336,16 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
 /// remove op, but a feed whose key is destroyed can never be updated again
 /// and rots out of node caches once nothing renews its subscriptions.
 pub async fn nuke_account() -> Result<(), String> {
+    // Old delegate generations hold the seed too (issue #53): suppress the
+    // probe so it can't resurrect the seed, then wipe them FIRST — a wipe
+    // failure aborts the nuke with everything still intact.
+    api::suppress_legacy_probe();
+    #[cfg(target_arch = "wasm32")]
+    api::wipe_legacy_seeds().await?;
     api::kv_request(FreebirdDelegateRequest::Delete {
         key: "posting_key".into(),
     })
     .await?;
-    // Old delegate generations hold the seed too — delete there as well, or
-    // the carry-forward probe (issue #53) would resurrect it on next load.
-    for (_, key) in api::legacy_delegates() {
-        if let Err(e) = api::kv_request_to(
-            key,
-            FreebirdDelegateRequest::Delete {
-                key: "posting_key".into(),
-            },
-        )
-        .await
-        {
-            api::log(&format!("legacy seed delete failed: {e}"));
-        }
-    }
     *ACCOUNT.write() = None;
     FEEDS.write().clear();
     INBOXES.write().clear();

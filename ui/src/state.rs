@@ -78,6 +78,11 @@ pub static POSTING_KEY_LOADED: GlobalSignal<Option<Option<Vec<u8>>>> = Signal::g
 /// fresh account over a seed the probe is about to find.
 pub static LEGACY_PROBE_PENDING: GlobalSignal<bool> = Signal::global(|| false);
 
+/// The carry-forward probe errored or timed out with old generations still
+/// unanswered — "no stored seed" is then unproven, so onboarding warns
+/// instead of silently offering a fresh account.
+pub static LEGACY_PROBE_FAILED: GlobalSignal<bool> = Signal::global(|| false);
+
 /// The posting_key answer will never arrive: either the startup watchdog
 /// timed out, or a second empty freebird-delegate response proved the node
 /// is swallowing delegate errors (e.g. an unattested WebSocket after a node

@@ -533,7 +533,8 @@ pub fn App() -> Element {
     // "No stored seed" first fires the carry-forward probe of old delegate
     // generations (issue #53), once per page load — a found seed lands in
     // POSTING_KEY_LOADED and re-enters here as the resume case.
-    let mut probed = use_signal(|| false);
+    // begin_legacy_probe runs synchronously so the account gate is already
+    // raised before anything can render onboarding.
     use_effect(move || {
         let loaded = POSTING_KEY_LOADED.read().clone();
         match loaded {
@@ -546,14 +547,15 @@ pub fn App() -> Element {
                     });
                 }
             }
-            Some(None) if !*probed.peek() => {
-                probed.set(true);
+            Some(None) => {
                 #[cfg(target_arch = "wasm32")]
-                spawn(async {
-                    api::probe_legacy_delegates().await;
-                });
+                if api::begin_legacy_probe() {
+                    spawn(async {
+                        api::run_legacy_probe().await;
+                    });
+                }
             }
-            _ => {}
+            None => {}
         }
     });
 
@@ -791,6 +793,13 @@ fn Onboarding() -> Element {
     rsx! {
         section { class: "card onboarding",
             h2 { "Welcome" }
+            if *LEGACY_PROBE_FAILED.read() {
+                p { class: "error",
+                    "Couldn't check this node for an existing account (the \
+                     recovery probe failed). If you had an account here, \
+                     reload the page before creating a new one."
+                }
+            }
             p { "Pick a display name. Your account is a locally generated key — no signup, no server." }
             input {
                 placeholder: "Display name",
