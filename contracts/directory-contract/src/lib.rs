@@ -1086,8 +1086,11 @@ mod tests {
         );
 
         let (sk, key) = anon_author();
-        // Floor-only solve is now under the control-cell bar → dropped.
-        let weak = anon_listing(&sk, key, 5);
+        // Stamp pinned to the [floor, control) band → provably under the raised
+        // bar. A plain floor solve also clears `control` ~2^-(control-floor) of
+        // the time, which would flake.
+        let mut weak = anon_listing(&sk, key, 5);
+        weak.pow_nonce = freebird_pow::solve_directory_band(&key, POW_FLOOR_BITS, control);
         let mut s = DirectoryStateV3::default();
         s.apply_delta(
             &p,

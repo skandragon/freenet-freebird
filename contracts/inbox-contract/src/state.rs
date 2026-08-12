@@ -1065,8 +1065,16 @@ mod tests {
         );
         let r = anon_replier();
 
-        // Floor-only stamp, under the raised bar → dropped.
-        let weak = pointer_for(&r, &p, 5, 0); // solved to POW_FLOOR_BITS
+        // Stamp pinned to the [floor, control) band → provably under the
+        // raised bar. A plain floor solve also clears `control` ~2^-(control-
+        // floor) of the time, which would flake.
+        let mut weak = pointer_for(&r, &p, 5, 0);
+        weak.pow_nonce = freebird_pow::solve_inbox_band(
+            &p.owner.to_bytes(),
+            &r.key,
+            freebird_pow::POW_FLOOR_BITS,
+            control,
+        );
         let mut s = InboxStateV3::default();
         let clone = s.clone();
         s.apply_delta(

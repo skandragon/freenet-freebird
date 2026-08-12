@@ -184,6 +184,24 @@ pub fn solve_directory(author: &[u8; 32], bits: u8) -> u64 {
     solve(POW_DOMAIN_DIRECTORY, author, &[], bits)
 }
 
+// ---- test helpers: a stamp provably INSIDE a difficulty band ----
+// A plain `lo`-bit solve also clears `hi` bits with probability 2^-(hi-lo), so
+// tests that need a stamp accepted at `lo` but rejected at `hi` must pin it to
+// the band or they flake. Public (not #[cfg(test)]) because the inbox/directory
+// crates' tests consume them.
+
+pub fn solve_inbox_band(owner: &[u8; 32], replier: &[u8; 32], lo: u8, hi: u8) -> u64 {
+    (0u64..)
+        .find(|&n| meets_inbox(owner, replier, n, lo) && !meets_inbox(owner, replier, n, hi))
+        .expect("u64 nonce space exhausted")
+}
+
+pub fn solve_directory_band(author: &[u8; 32], lo: u8, hi: u8) -> u64 {
+    (0u64..)
+        .find(|&n| meets_directory(author, n, lo) && !meets_directory(author, n, hi))
+        .expect("u64 nonce space exhausted")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
