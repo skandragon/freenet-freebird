@@ -41,11 +41,22 @@ host.
 
 1. `make build-docker` — rebuilds the four non-frozen contracts + delegate
    inside the pinned container (never the cell, never any `*_v1`) and vendors
-   the reproducible bytes into `ui/contracts/`.
+   the reproducible bytes into `ui/contracts/`. **It re-vendors all five**, so
+   `git checkout` the wasms whose source did NOT change — vendoring a fresh
+   build of an unchanged contract still rotates its address if its vendored
+   bytes were grandfathered. (On Apple Silicon, build on a native amd64 host
+   instead — see below.)
 2. `make pin-hashes` — re-pin `scripts/wasm-hashes.txt`.
-3. Update the golden addresses in `ui/src/keys.rs` for whatever rotated.
-4. Add a dual-read window for the rotated contract so existing data stays
-   reachable (see the `*_v1` precedent in `ui/src/keys.rs`).
+3. Update the line for the rotated contract in
+   `scripts/repro-reference-hashes.txt` (leave the others — they must still
+   match, which doubles as proof your build environment is canonical).
+4. Update the golden addresses in `ui/src/keys.rs` for whatever rotated: run
+   `cargo test -p freebird-ui golden_addresses_pinned`, take the new address
+   from the failure output, and pin it with a comment recording the rotation.
+5. Decide the migration story: add a dual-read window so existing data stays
+   reachable (the `*_v1` precedent in `ui/src/keys.rs`), or follow the
+   no-window precedent (#45/#49/#51/#50) for short-lived data like directory
+   listings, where authors re-seat on their next republish.
 
 ## Proving reproducibility (amd64 build-of-record)
 
@@ -67,9 +78,33 @@ output.
 ### Building on Apple Silicon
 
 `rustc` for the amd64 target segfaults under qemu-user (arm64 host emulating
-amd64), so you **cannot** produce the amd64 bytes locally on Apple Silicon. A
-real contract rebuild (`make build-docker` → vendor → `pin-hashes` → goldens)
-must therefore run on a native amd64 host or in CI, not on an M-series Mac. Use
-the `docker-repro` CI job to verify. Everything else (`make test`, the UI build)
-works fine on Apple Silicon; only the address-critical wasm build-of-record is
-amd64-only.
+amd64), so `make build-docker` **cannot** produce the amd64 bytes locally on
+Apple Silicon — and a `PLATFORM=linux/arm64` build runs fine but yields
+different bytes for every crate (arch-dependent codegen), so its output must
+never be vendored. Everything else (`make test`, the UI build) works fine on
+Apple Silicon; only the address-critical wasm build-of-record is amd64-only.
+
+The way out is any **native x86_64 Linux host** with rustup — no Docker
+needed. The container only exists to fix the three embedded path sources, and
+`--remap-path-prefix` does that just as well in a plain build (proven: the
+unchanged crates reproduce their pinned reference hashes exactly):
+
+```bash
+# on the amd64 host, in a checkout of the branch
+# (rust-toolchain.toml pulls the pinned toolchain + wasm32 target via rustup)
+export PATH=$HOME/.cargo/bin:$PATH CARGO_HOME=$HOME/.cargo
+RF="--remap-path-prefix=$PWD=/src \
+    --remap-path-prefix=$CARGO_HOME=/cargo \
+    --remap-path-prefix=$(rustc --print sysroot)=/rust"
+RUSTFLAGS="$RF" cargo build --locked -p <changed-crate> \
+    --target wasm32-unknown-unknown --release
+sha256sum target/wasm32-unknown-unknown/release/*.wasm
+```
+
+**Always build the unchanged crates too and check their sha256 against
+`scripts/repro-reference-hashes.txt` first** — a full match on the untouched
+crates proves the environment is canonical; only then vendor the changed
+crate's wasm (`scp` it into `ui/contracts/`, then `make check-imports
+W=ui/contracts/<name>.wasm` and continue from `pin-hashes` above). The
+`docker-repro` CI job is the final arbiter: it must stay green against the
+refreshed reference hashes.
