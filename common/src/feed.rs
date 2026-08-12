@@ -411,6 +411,167 @@ mod components {
     }
 }
 
+/// The pre-#64 feed wire format, kept ONLY so the UI can decode feeds still
+/// stored under the OLD feed contract during the dual-read window (issue #64
+/// rebuilt the feed contract in place: the attestation slot went
+/// AttestationV1 -> AttestationV2 and post/profile/follows signatures went
+/// bare-CBOR -> domain-tagged). Structurally this equals the current
+/// `FeedStateV1` except the attestation slot holds an `AttestationV1`, so its
+/// CBOR matches what the deployed old contract produced. Nothing here writes
+/// or re-signs; new posts still go to the current feed contract. Display-only.
+pub mod legacy {
+    use super::MAX_POSTS;
+    use crate::attestation::AttestationV1;
+    use crate::types::{AuthorizedFollows, AuthorizedPost, AuthorizedProfile, PostId};
+    use ed25519_dalek::{Signature, VerifyingKey};
+    use serde::{Deserialize, Serialize};
+
+    /// Old attestation slot. Serde-transparent newtype over `Option`, so its
+    /// CBOR is `null` or the bare `AttestationV1` map — byte-for-byte what the
+    /// deployed old contract stored.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+    pub struct LegacyAttestationSlot(pub Option<AttestationV1>);
+
+    /// Old post log: `{ "posts": [...] }`, same layout as the current
+    /// `PostsV1` (whose fields did not change in #64).
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+    pub struct LegacyPosts {
+        pub posts: Vec<AuthorizedPost>,
+    }
+
+    /// The full pre-#64 feed state.
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+    pub struct LegacyFeedState {
+        pub profile: AuthorizedProfile,
+        pub follows: AuthorizedFollows,
+        pub attestation: LegacyAttestationSlot,
+        pub posts: LegacyPosts,
+    }
+
+    /// Verify with the OLD rules: post/profile/follows signatures over BARE
+    /// CBOR (pre-#47) and the AttestationV1 chain. A legacy feed the old
+    /// contract accepted verifies here. Never re-signs.
+    fn verify_bare<T: Serialize>(
+        value: &T,
+        sig: &Signature,
+        author: &VerifyingKey,
+    ) -> Result<(), String> {
+        let bytes = crate::to_cbor(value).map_err(|e| e.to_string())?;
+        author
+            .verify_strict(&bytes, sig)
+            .map_err(|e| format!("legacy signature invalid: {e}"))
+    }
+
+    impl LegacyFeedState {
+        pub fn verify(
+            &self,
+            author: &VerifyingKey,
+            master: &VerifyingKey,
+        ) -> Result<(), String> {
+            verify_bare(&self.profile.profile, &self.profile.signature, author)?;
+            verify_bare(&self.follows.follows, &self.follows.signature, author)?;
+            if let Some(att) = &self.attestation.0 {
+                att.verify(author, Some(master))
+                    .map_err(|e| format!("legacy attestation invalid: {e}"))?;
+            }
+            if self.posts.posts.len() > MAX_POSTS {
+                return Err(format!("legacy feed over {MAX_POSTS} posts"));
+            }
+            for p in &self.posts.posts {
+                if p.post.id
+                    != PostId::compute(author, p.post.time, &p.post.content, &p.post.in_reply_to)
+                {
+                    return Err("legacy post id does not match content".into());
+                }
+                verify_bare(&p.post, &p.signature, author)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::feed::{FeedParametersV1, FeedStateV1};
+        use crate::types::{PostV1, ProfileV1};
+        use ed25519_dalek::{Signer, SigningKey};
+        use freenet_scaffold::ComposableState;
+        use rand::rngs::OsRng;
+
+        /// Sign a value over BARE CBOR — the pre-#47 scheme the old contract used.
+        fn sign_bare<T: Serialize>(value: &T, sk: &SigningKey) -> Signature {
+            sk.sign(&crate::to_cbor(value).unwrap())
+        }
+
+        fn legacy_post(sk: &SigningKey, time: u64, content: &str) -> AuthorizedPost {
+            let vk = sk.verifying_key();
+            let post = PostV1 {
+                id: PostId::compute(&vk, time, content, &None),
+                time,
+                content: content.into(),
+                in_reply_to: None,
+            };
+            let signature = sign_bare(&post, sk);
+            AuthorizedPost { post, signature }
+        }
+
+        fn legacy_state(sk: &SigningKey) -> LegacyFeedState {
+            let profile = ProfileV1 {
+                name: "old".into(),
+                bio: String::new(),
+                version: 1,
+            };
+            let follows = crate::types::FollowsV1::default();
+            LegacyFeedState {
+                profile: AuthorizedProfile {
+                    signature: sign_bare(&profile, sk),
+                    profile,
+                },
+                follows: AuthorizedFollows {
+                    signature: sign_bare(&follows, sk),
+                    follows,
+                },
+                attestation: LegacyAttestationSlot(None),
+                posts: LegacyPosts {
+                    posts: vec![legacy_post(sk, 10, "hello from the old feed")],
+                },
+            }
+        }
+
+        /// A pre-#64 feed state round-trips through CBOR, decodes as the legacy
+        /// type, and verifies under the OLD rules.
+        #[test]
+        fn legacy_state_decodes_and_verifies() {
+            let sk = SigningKey::generate(&mut OsRng);
+            let master = SigningKey::generate(&mut OsRng).verifying_key();
+            let state = legacy_state(&sk);
+            let bytes = crate::to_cbor(&state).unwrap();
+            let decoded: LegacyFeedState = crate::from_cbor(&bytes).unwrap();
+            decoded.verify(&sk.verifying_key(), &master).unwrap();
+            assert_eq!(decoded.posts.posts[0].post.content, "hello from the old feed");
+        }
+
+        /// The CURRENT contract rejects the old bytes two ways — which is why a
+        /// distinct legacy read path is needed: the new `FeedStateV1::verify`
+        /// (domain-tagged signatures) rejects the bare-CBOR post signatures.
+        #[test]
+        fn current_type_rejects_legacy_signatures() {
+            let sk = SigningKey::generate(&mut OsRng);
+            let master = SigningKey::generate(&mut OsRng).verifying_key();
+            let bytes = crate::to_cbor(&legacy_state(&sk)).unwrap();
+            // Old state without an attestation decodes as the new FeedStateV1
+            // (attestation slot is `null` either way), but the bare-CBOR post
+            // signature fails the new domain-tagged verify.
+            let as_new: FeedStateV1 = crate::from_cbor(&bytes).unwrap();
+            let params = FeedParametersV1 {
+                author: sk.verifying_key(),
+                ghostkey_master: master,
+            };
+            assert!(as_new.verify(&as_new.clone(), &params).is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
