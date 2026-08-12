@@ -87,8 +87,13 @@ ui:
 	$(MAKE) check-addresses
 	cd ui && $(DX) build --release
 
+# The UI tests build separately: a joint --workspace build feature-unifies the
+# contract crates (default features re-enable their #[no_mangle] entry points)
+# and the UI test binary then links several contract rlibs with identical
+# symbols — linux lld rejects the duplicates (macOS ld64 happens to tolerate).
 test:
-	$(CARGO) test --workspace --locked
+	$(CARGO) test --workspace --exclude freebird-ui --locked
+	$(CARGO) test -p freebird-ui --locked
 
 # Site first, then the control cell: the advertised build must never get
 # ahead of the bundle users can actually load.
