@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned: a rustc bump changes contract wasm bytes, which rotates every
+# derived address (see check-addresses in the Makefile). Bump deliberately.
+channel = "1.95.0"
 targets = ["wasm32-unknown-unknown"]

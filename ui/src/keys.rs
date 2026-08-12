@@ -222,4 +222,35 @@ mod tests {
     fn directory_address_fixed() {
         assert_eq!(directory_key(), directory_key());
     }
+
+    /// Pins the actual derived addresses (issue #55). A failure here means the
+    /// vendored wasm bytes or the params encoding changed — every user's data
+    /// is about to become unreachable. See check-addresses in the Makefile;
+    /// only update these goldens as part of a deliberate, reviewed rotation
+    /// with a migration plan.
+    #[test]
+    fn golden_addresses_pinned() {
+        let author = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        let got = [
+            directory_instance_id().to_string(),
+            directory_instance_id_v1().to_string(),
+            control_cell_instance_id().to_string(),
+            feed_instance_id(&author).to_string(),
+            inbox_instance_id(&author).to_string(),
+            inbox_instance_id_v1(&author).to_string(),
+            avatar_instance_id(&author).to_string(),
+            anchor_instance_id(&author).to_string(),
+        ];
+        let golden = [
+            "Lci4MiN15tQ41PKqkzbj2mi9qXMuphQG8vU4tqt5CJG",
+            "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
+            "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
+            "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
+            "sCJ9HQJGnHE1NGEWEC73CpWBPymT2ievqDW4iXh7Pgb",
+            "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
+            "577KsAVancBcWwQfbpYrF9DN4FPzBBXrvuEALf2Gf67g",
+            "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
+        ];
+        assert_eq!(got, golden, "derived contract addresses ROTATED");
+    }
 }

@@ -2,8 +2,11 @@
 # Homebrew rust shadows the rustup toolchain and lacks the wasm32 target, and
 # apple's make 3.81 ignores exported PATH on its direct-exec fast path — so
 # tools are addressed absolutely.
-RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin
-CARGO := $(RUSTUP_BIN)/cargo
+TOOLCHAIN := $(shell sed -n 's/^channel = "\(.*\)"$$/\1/p' rust-toolchain.toml)
+RUSTUP_BIN := $(HOME)/.rustup/toolchains/$(TOOLCHAIN)-aarch64-apple-darwin/bin
+# Fall back to the rustup shim (which honors rust-toolchain.toml) when the
+# pinned toolchain dir doesn't exist — e.g. Linux CI or first build.
+CARGO := $(firstword $(wildcard $(RUSTUP_BIN)/cargo) $(wildcard $(HOME)/.cargo/bin/cargo) cargo)
 DX := $(HOME)/.cargo/bin/dx
 # wasm-tools may come from cargo or homebrew; a missing binary must FAIL the
 # import check, not silently pass it (grep of no output looks "clean").
@@ -14,20 +17,20 @@ export PATH := $(RUSTUP_BIN):$(HOME)/.cargo/bin:$(PATH)
 WASM_TARGET := wasm32-unknown-unknown
 WASM_DIR := target/$(WASM_TARGET)/release
 
-.PHONY: all contracts delegate ui test check-imports check-addresses pin-hashes publish clean
+.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses pin-hashes publish clean
 
 all: test contracts delegate ui
 
 contracts:
-	$(CARGO) build -p feed-contract -p avatar-contract --target $(WASM_TARGET) --release
+	$(CARGO) build --locked -p feed-contract -p avatar-contract --target $(WASM_TARGET) --release
 	# directory-contract and inbox-contract build in their own invocations:
 	# joint feature unification with the pinned contracts could alter their
 	# bytes (inbox v2 pulls deps feed/avatar must never unify with).
-	$(CARGO) build -p directory-contract --target $(WASM_TARGET) --release
-	$(CARGO) build -p inbox-contract --target $(WASM_TARGET) --release
+	$(CARGO) build --locked -p directory-contract --target $(WASM_TARGET) --release
+	$(CARGO) build --locked -p inbox-contract --target $(WASM_TARGET) --release
 	# cell-contract likewise — and it is the FROZEN kernel: its vendored wasm
 	# must never change bytes again (see contracts/cell-contract/src/lib.rs).
-	$(CARGO) build -p cell-contract --target $(WASM_TARGET) --release
+	$(CARGO) build --locked -p cell-contract --target $(WASM_TARGET) --release
 	$(MAKE) check-imports W=$(WASM_DIR)/feed_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/inbox_contract.wasm
 	$(MAKE) check-imports W=$(WASM_DIR)/avatar_contract.wasm
@@ -37,7 +40,7 @@ contracts:
 	$(MAKE) check-addresses
 
 delegate:
-	$(CARGO) build -p freebird-delegate --target $(WASM_TARGET) --release
+	$(CARGO) build --locked -p freebird-delegate --target $(WASM_TARGET) --release
 	$(MAKE) check-imports W=$(WASM_DIR)/freebird_delegate.wasm
 	cp $(WASM_DIR)/freebird_delegate.wasm ui/contracts/
 	$(MAKE) check-addresses
@@ -69,6 +72,12 @@ check-imports:
 	if [ -n "$$bad" ]; then echo "FORBIDDEN IMPORTS in $(W):"; echo "$$bad"; exit 1; fi
 	@echo "$(W): imports clean"
 
+# Same check against the committed bytes the UI actually ships — what CI runs.
+check-imports-vendored:
+	@for w in ui/contracts/*.wasm; do \
+	  $(MAKE) --no-print-directory check-imports W=$$w || exit 1; \
+	done
+
 # The UI embeds the VENDORED wasm in ui/contracts/ (include_bytes) — the
 # committed bytes are the source of truth, because compiled bytes are not
 # reproducible across toolchains and any byte change rotates every derived
@@ -79,13 +88,13 @@ ui:
 	cd ui && $(DX) build --release
 
 test:
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --locked
 
 # Site first, then the control cell: the advertised build must never get
 # ahead of the bundle users can actually load.
 publish:
 	scripts/publish-ui.sh
-	$(CARGO) run -p freebird-ctl --release -- publish-control \
+	$(CARGO) run --locked -p freebird-ctl --release -- publish-control \
 	  --build $$(git rev-list --count HEAD) \
 	  --label $$(git rev-parse --short HEAD)
 
