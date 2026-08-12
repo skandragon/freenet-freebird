@@ -27,3 +27,6 @@ getrandom = { workspace = true, features = ["custom"] }
 [dev-dependencies]
 rand.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
+# Test-only: drift-guard that our duplicated PUBLISHER_VK_HEX matches the
+# canonical one in freebird-control (client-side crate, not linked into wasm).
+freebird-control = { path = "../control" }

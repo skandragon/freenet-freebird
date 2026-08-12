@@ -112,8 +112,15 @@ ui:
 # contract crates (default features re-enable their #[no_mangle] entry points)
 # and the UI test binary then links several contract rlibs with identical
 # symbols — linux lld rejects the duplicates (macOS ld64 happens to tolerate).
+#
+# inbox-contract and directory-contract are split out for the SAME reason
+# (issue #51): they link cell-contract for the PoW difficulty type, and a joint
+# --workspace build unifies cell-contract's default freenet-main-contract entry
+# points into their own cdylibs. Testing them in an isolated resolve keeps
+# cell-contract a df=false dependency (no entry points), so nothing duplicates.
 test:
-	$(CARGO) test --workspace --exclude freebird-ui --locked
+	$(CARGO) test --workspace --exclude freebird-ui --exclude inbox-contract --exclude directory-contract --locked
+	$(CARGO) test -p inbox-contract -p directory-contract --locked
 	$(CARGO) test -p freebird-ui --locked
 
 # Site first, then the control cell: the advertised build must never get

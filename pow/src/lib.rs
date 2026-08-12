@@ -50,8 +50,13 @@ pub const POW_CEILING_BITS: u8 = 26;
 /// as a difficulty record or vice versa.
 pub const POW_PURPOSE: &str = "pow";
 
-/// Domain tags: fold the contract generation in so a stamp solved for one
-/// contract family (or generation) is worthless in another.
+/// Domain tags separating the inbox and directory PoW namespaces so a stamp
+/// solved for one is worthless for the other. The `-v1` suffix is the
+/// PoW-SCHEME version — it is independent of the inbox/directory CONTRACT
+/// generation (currently v3) and does not track `DIRECTORY_SEED`. Cross-target
+/// replay is prevented by the per-target binding (inbox owner / directory
+/// author) in `meets_*`, not by these tags; bump a suffix only if the hashcash
+/// scheme itself changes.
 pub const POW_DOMAIN_INBOX: &[u8] = b"freebird-pow-inbox-v1";
 pub const POW_DOMAIN_DIRECTORY: &[u8] = b"freebird-pow-dir-v1";
 
@@ -188,6 +193,15 @@ mod tests {
     // A low bar so the solver stays instant in tests; production uses the
     // floor. leading_zero_bits/meets are difficulty-agnostic.
     const TEST_BITS: u8 = 8;
+
+    /// Drift-guard: our compiled-in publisher key must match the canonical one
+    /// in freebird-control. A future publisher-key rotation that touches only
+    /// one copy fails here instead of silently making difficulty records
+    /// unverifiable in-contract.
+    #[test]
+    fn publisher_key_matches_control() {
+        assert_eq!(PUBLISHER_VK_HEX, freebird_control::PUBLISHER_VK_HEX);
+    }
 
     #[test]
     fn leading_zeros_counts() {
