@@ -15,9 +15,23 @@ WASM_TOOLS := $(shell command -v wasm-tools || command -v $(HOME)/.cargo/bin/was
 export PATH := $(RUSTUP_BIN):$(HOME)/.cargo/bin:$(PATH)
 
 WASM_TARGET := wasm32-unknown-unknown
-WASM_DIR := target/$(WASM_TARGET)/release
+# Honor CARGO_TARGET_DIR (the Docker build points it outside the mount).
+CARGO_TARGET := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
+WASM_DIR := $(CARGO_TARGET)/$(WASM_TARGET)/release
 
-.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built pin-hashes publish clean
+# Non-frozen contract + delegate wasm rebuilt by the reproducible Docker path.
+# Excludes the FROZEN cell_contract and every *_v1 legacy blob on purpose.
+REPRO_WASMS := feed_contract.wasm avatar_contract.wasm directory_contract.wasm inbox_contract.wasm freebird_delegate.wasm
+DOCKER_IMG := freebird-repro-build
+# Build-of-record arch. wasm bytes are NOT bit-identical across host arch
+# (rustc/LLVM codegen differs arm64 vs amd64 even with paths remapped), so the
+# reproducible build standardizes on amd64 — native on CI, emulated on Apple
+# Silicon. Override only to experiment; the vendored/reference bytes are amd64.
+PLATFORM ?= linux/amd64
+PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
+DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
+
+.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
 
 all: test contracts delegate ui
 
@@ -100,10 +114,14 @@ check-imports-vendored:
 	done
 
 # The UI embeds the VENDORED wasm in ui/contracts/ (include_bytes) — the
-# committed bytes are the source of truth, because compiled bytes are not
-# reproducible across toolchains and any byte change rotates every derived
-# address. `make contracts`/`make delegate` are the deliberate acts that
-# refresh them (guarded by check-addresses); the ui build never does.
+# committed bytes are the IMMUTABLE source of truth. A plain host build is NOT
+# byte-reproducible (rustc bakes in absolute paths), so when a contract must be
+# rebuilt it is done reproducibly via Docker (see wasm-repro / build-docker and
+# docs/reproducible-builds.md). Any byte change rotates every derived address,
+# so rebuilding (`make build-docker`, or the frozen-cell-inclusive
+# `make contracts`/`make delegate`) is a deliberate, reviewed act guarded by
+# check-addresses — done only when a contract's source or Cargo.lock actually
+# changes; the ui build never does.
 ui:
 	$(MAKE) check-addresses
 	cd ui && $(DX) build --release
@@ -130,6 +148,64 @@ publish:
 	$(CARGO) run --locked -p freebird-ctl --release -- publish-control \
 	  --build $$(git rev-list --count HEAD) \
 	  --label $$(git rev-parse --short HEAD)
+
+# --- Reproducible Docker build of the non-frozen contract + delegate wasm ---
+#
+# Contract/delegate addresses are content-derived from wasm bytes. rustc bakes
+# absolute paths (source dir, CARGO_HOME, and the rustc sysroot whose triple
+# differs arm64 vs amd64) into the module, so a plain build is NOT reproducible
+# across machines. Running inside the pinned Docker image with --remap-path-prefix
+# maps all three to fixed tokens, making the bytes host/arch-independent.
+#
+# wasm-repro runs INSIDE the container. It builds ONLY the four non-frozen
+# contracts + the delegate — never the frozen cell-contract, never any *_v1
+# blob — then copies the results onto the mount for the host to pick up.
+wasm-repro:
+	@RF="--remap-path-prefix=$(CURDIR)=/src --remap-path-prefix=$${CARGO_HOME}=/cargo --remap-path-prefix=$$(rustc --print sysroot)=/rust"; \
+	set -e; \
+	RUSTFLAGS="$$RF" $(CARGO) build --locked -p feed-contract -p avatar-contract --target $(WASM_TARGET) --release; \
+	RUSTFLAGS="$$RF" $(CARGO) build --locked -p directory-contract --target $(WASM_TARGET) --release; \
+	RUSTFLAGS="$$RF" $(CARGO) build --locked -p inbox-contract --target $(WASM_TARGET) --release; \
+	RUSTFLAGS="$$RF" $(CARGO) build --locked -p freebird-delegate --target $(WASM_TARGET) --release
+	$(MAKE) check-imports W=$(WASM_DIR)/feed_contract.wasm
+	$(MAKE) check-imports W=$(WASM_DIR)/inbox_contract.wasm
+	$(MAKE) check-imports W=$(WASM_DIR)/avatar_contract.wasm
+	$(MAKE) check-imports W=$(WASM_DIR)/directory_contract.wasm
+	$(MAKE) check-imports W=$(WASM_DIR)/freebird_delegate.wasm
+	mkdir -p $(CURDIR)/target/repro
+	cp $(addprefix $(WASM_DIR)/,$(REPRO_WASMS)) $(CURDIR)/target/repro/
+
+build-docker-image:
+	docker build $(PLATFORM_ARG) -t $(DOCKER_IMG) -f docker/Dockerfile .
+
+# Reproducible build then print the sha256 of the 5 non-frozen wasm. Use with
+# PLATFORM=linux/amd64 to compare arch-to-arch.
+repro-hashes: build-docker-image
+	$(DOCKER_RUN) make wasm-repro
+	@shasum -a 256 $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS))
+
+# Run ONLY when a contract legitimately changes (source or Cargo.lock edit that
+# alters its bytes). Refreshes the vendored non-frozen wasm from a reproducible
+# build; this is a deliberate rotation, so follow with `make pin-hashes`, update
+# the goldens in ui/src/keys.rs, and add dual-read for the rotated contract.
+# Cell + *_v1 blobs are never rebuilt. Do NOT run this as a routine step: the
+# vendored bytes are the immutable source of truth (see docs/reproducible-builds.md).
+build-docker: build-docker-image
+	$(DOCKER_RUN) make wasm-repro
+	cp $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS)) ui/contracts/
+
+# Reproducibility gate: build in the pinned amd64 container and assert the four
+# non-frozen contracts + delegate match scripts/repro-reference-hashes.txt
+# (canonical amd64 hashes of the CURRENT source). wasm bytes are NOT bit-
+# identical across host arch, so amd64 is the single build-of-record; CI runs
+# this on amd64 and a pass proves the amd64 build is deterministic against the
+# pinned reference. It does NOT diff the grandfathered vendored addressing bytes,
+# so it never forces a rotation. When a contract's source legitimately changes,
+# refresh the reference on amd64: `make repro-hashes` then paste into the file.
+verify-repro: build-docker-image
+	$(DOCKER_RUN) make wasm-repro
+	@shasum -a 256 $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS))
+	shasum -a 256 -c scripts/repro-reference-hashes.txt
 
 clean:
 	$(CARGO) clean

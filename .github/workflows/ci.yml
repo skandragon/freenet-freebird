@@ -25,3 +25,15 @@ jobs:
       # rustup installs the toolchain pinned in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: make test
+
+  # CROSS-ARCH reproducibility gate. This runner is amd64; it rebuilds the four
+  # non-frozen contracts + delegate in the pinned Docker image and asserts they
+  # match scripts/repro-reference-hashes.txt (pinned on arm64). A pass proves
+  # the arm64 dev build and the amd64 CI build produce byte-identical wasm — so
+  # identical contract addresses. Does NOT diff the grandfathered vendored
+  # addressing bytes, so it never forces a rotation. See docs/reproducible-builds.md.
+  docker-repro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make verify-repro
