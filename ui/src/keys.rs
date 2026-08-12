@@ -268,13 +268,16 @@ mod tests {
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
-            // Rotated 2026-08-12 (issue #51): anonymous writes now carry an
-            // in-contract proof-of-work stamp, so the inbox and directory wasm
-            // (and only those two) change bytes. Following the #49/#45 rotation
-            // precedent, the prior v3 inbox/directory addresses get no dual-read
-            // window; their short-lived traffic is dropped. feed/avatar/cell/
-            // anchor/control and the v1 dual-read paths are untouched.
-            "CC6tfN3m74GV9xnmxHtt9uFfHKxybTMHni9RG5EncAQw",
+            // Directory rotated 2026-08-12 (issue #50): the state is now one
+            // slot per author PER TIER so merges converge regardless of
+            // arrival order. Following the #51/#49/#45 rotation precedent,
+            // the prior directory address gets no dual-read window; listings
+            // are short-lived and authors re-seat on their next republish.
+            // Everything else is untouched.
+            //
+            // (#51, same day: anonymous writes carry an in-contract
+            // proof-of-work stamp — that rotation changed inbox + directory.)
+            "8cuT85zeCCFcebwZqepinbdnE8N78rkvwhy5ZzFyJ8YM",
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
