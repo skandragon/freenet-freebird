@@ -1374,7 +1374,7 @@ fn current_listings() -> Vec<([u8; 32], u64)> {
         .read()
         .as_ref()
         .map(|d| {
-            d.listings
+            d.winners()
                 .values()
                 .map(|l| (l.listing.author, l.listing.last_active))
                 .collect()

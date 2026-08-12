@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
-use directory_contract::{AuthorizedListingV3, DirectoryStateV3};
+use directory_contract::{AuthorizedListingV3, DirectoryStateV4};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::legacy::LegacyFeedState;
@@ -404,8 +404,13 @@ pub async fn fetch_control() -> Result<(), String> {
 /// listing network-wide and the contract's per-author LWW merge handles
 /// every later one (same pattern as avatars).
 pub async fn put_directory_listing(listing: &AuthorizedListingV3) -> Result<(), String> {
-    let mut state = DirectoryStateV3::default();
-    state.listings.insert(listing.listing.author, listing.clone());
+    let mut state = DirectoryStateV4::default();
+    let tier = if listing.is_anon() {
+        &mut state.anon
+    } else {
+        &mut state.attested
+    };
+    tier.insert(listing.listing.author, listing.clone());
     let bytes = freebird_core::to_cbor(&state)?;
     track(keys::directory_key(), TrackedKind::Directory);
     send(ClientRequest::ContractOp(ContractRequest::Put {
@@ -813,9 +818,9 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
         TrackedKind::Directory => {
             let params = keys::directory_params();
             let mut dir = DIRECTORY.write();
-            let entry = dir.get_or_insert_with(DirectoryStateV3::default);
+            let entry = dir.get_or_insert_with(DirectoryStateV4::default);
             if is_full_state {
-                match freebird_core::from_cbor::<DirectoryStateV3>(bytes) {
+                match freebird_core::from_cbor::<DirectoryStateV4>(bytes) {
                     Ok(incoming) => {
                         if let Err(e) = entry.merge(&params, &incoming) {
                             log(&format!("directory merge rejected: {e}"));
