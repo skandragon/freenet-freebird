@@ -58,9 +58,21 @@ struct ScopedPayloadWire {
 
 /// Pinned mirror of the one `SignatureRequestor` variant Freebird accepts
 /// (ghostkeys `common/src/lib.rs`): `WebApp(ContractInstanceId)`, where the
-/// id serializes as a 32-element byte array. Any other variant (current or
-/// future) fails decode and is rejected — the correct default for a check
-/// whose whole point is "only the Freebird webapp may mint attestations".
+/// id serializes as a CBOR array-of-32-ints per freenet-stdlib's
+/// `#[serde_as(as = "[_; CONTRACT_KEY_SIZE]")] [u8; 32]`. That encoding is
+/// BYTE-IDENTICAL in stdlib 0.6.1 (what the deployed ghostkey vault builds
+/// against) and 0.8.x (Freebird), so the requestor KAT below matches the
+/// real vault wire bytes.
+///
+/// AVAILABILITY NOTE (#47 failure mode): the check decodes into `[u8; 32]`,
+/// so it tolerates a byte-string vs int-array shape difference — but a
+/// stdlib bump that changed the requestor's STRUCTURE (a different variant
+/// tag, a nested map) would make verification fail closed: every attempt to
+/// mint a Freebird checkmark rejected, a checkmark-availability loss, never
+/// a forgery. Re-check the KAT on any freenet-stdlib upgrade. Any other
+/// variant (current or future) fails decode and is rejected — the correct
+/// default for a check whose whole point is "only the Freebird webapp may
+/// mint attestations".
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 enum RequestorWire {
     WebApp([u8; 32]),
@@ -485,6 +497,39 @@ mod tests {
         );
         let err = att.verify(&vk, Some(&authority.master_vk)).unwrap_err();
         assert!(err.contains("requestor"), "{err}");
+    }
+
+    /// The decoded VALUE match is load-bearing: an adversarial requestor
+    /// that decodes to the wrong id or a variant Freebird does not accept
+    /// must be REJECTED, never mistaken for the Freebird id. (ciborium is
+    /// lenient on the exact CBOR shape — a byte string vs int array, or
+    /// trailing array elements, still decode to the same `[u8; 32]` — which
+    /// is why a future stdlib shape change would NOT break verification, and
+    /// is safe because the requestor is runtime-attested by the vault, not
+    /// attacker-chosen. What the gate actually enforces is the id and the
+    /// variant, both proven here.)
+    #[test]
+    fn v2_adversarial_requestor_encoding_rejected() {
+        let (sk, vk) = posting_key();
+        let authority = TestAuthority::new();
+
+        // Right variant, right length, but ONE byte of the id flipped.
+        let mut wrong = freebird_webapp_id();
+        wrong[0] ^= 0xff;
+        let wrong_id = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("WebApp".into()),
+            ciborium::Value::Bytes(wrong.to_vec()),
+        )]);
+        let att = authority.mint_v2(wrong_id, &AttestationV2::payload_for(&vk), &sk);
+        assert!(att.verify(&vk, Some(&authority.master_vk)).is_err());
+
+        // Right id, but a variant name Freebird does not accept.
+        let wrong_variant = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("Delegate".into()),
+            ciborium::Value::Bytes(freebird_webapp_id().to_vec()),
+        )]);
+        let att = authority.mint_v2(wrong_variant, &AttestationV2::payload_for(&vk), &sk);
+        assert!(att.verify(&vk, Some(&authority.master_vk)).is_err());
     }
 
     #[test]

@@ -84,6 +84,15 @@ pub fn listing_signing_payload(
         None => out.push(0),
         Some(att) => {
             out.push(1);
+            // ponytail: content_hash() = blake3(to_cbor(AttestationV2)) — a
+            // residual bare-CBOR dependency in #47's manual-canonical
+            // guarantee. Contained: a ciborium encoding change could only
+            // invalidate an attested listing's OWN signature (availability,
+            // self-healing on republish), never forge or substitute one
+            // (the attestation still verifies its own manual-canonical
+            // payload + pop independently). Fold the pop/ghost signature
+            // bytes in here if the attestation ever gains a cheaper stable
+            // identity; not worth rotating the directory address for now.
             out.extend_from_slice(&att.content_hash());
         }
     }
@@ -859,7 +868,13 @@ mod tests {
         };
         assert!(substituted.check(&authority.master_vk).is_err());
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &[substituted]).is_err());
+        assert!(s.apply_delta(&p, &[substituted.clone()]).is_err());
+
+        // Full-state verify parity with the feed/inbox negative tests: a
+        // fabricated state carrying the substituted listing must not verify.
+        let mut fabricated = DirectoryStateV3::default();
+        fabricated.listings.insert(a.key, substituted);
+        assert!(fabricated.verify(&p).is_err());
     }
 
     /// Issue #45: an attestation minted over the author's key WITHOUT the
