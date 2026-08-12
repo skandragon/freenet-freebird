@@ -40,9 +40,25 @@ fixes this with a pinned toolchain (`rust-toolchain.toml`), fixed
 4. Add a dual-read window for the rotated contract so existing data stays
    reachable (see the `*_v1` precedent in `ui/src/keys.rs`).
 
-## Proving reproducibility
+## Proving reproducibility (cross-arch)
 
-`make repro-check` builds twice from clean in the container and asserts the
-wasm is byte-identical run-to-run. It runs in CI (`docker-repro` job). It does
-**not** diff against the vendored bytes, so it never forces a rotation of the
-grandfathered blobs.
+The real requirement is that an arm64 dev machine and the amd64 CI/deploy
+environment produce **identical** wasm (hence identical addresses).
+
+`scripts/repro-reference-hashes.txt` holds the canonical sha256 of the five
+non-frozen wasms for the CURRENT source, produced by the reproducible Docker
+build and pinned on arm64. `make verify-repro` rebuilds in the container and
+checks against it. CI runs this on an **amd64** runner (`docker-repro` job), so
+a green check is a live proof that arm64 == amd64.
+
+These reference hashes are **not** the vendored addressing bytes — those stay
+grandfathered. The reference tracks the current source; when a contract's source
+legitimately changes, refresh it with `make repro-hashes` and paste the output.
+
+### Note on emulation
+
+`rustc` for the amd64 target segfaults under qemu-user (arm64 host emulating
+amd64), so you cannot reliably reproduce amd64 bytes locally on Apple Silicon —
+use the amd64 CI job as the cross-arch check. The build-of-record is the amd64
+image (CI and deployment are amd64); the reference hashes are the amd64 result,
+which the arm64 build matches natively.

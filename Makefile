@@ -23,9 +23,13 @@ WASM_DIR := $(CARGO_TARGET)/$(WASM_TARGET)/release
 # Excludes the FROZEN cell_contract and every *_v1 legacy blob on purpose.
 REPRO_WASMS := feed_contract.wasm avatar_contract.wasm directory_contract.wasm inbox_contract.wasm freebird_delegate.wasm
 DOCKER_IMG := freebird-repro-build
-DOCKER_RUN := docker run --rm -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
+# Set PLATFORM (e.g. linux/amd64) to build/run under a specific arch — used to
+# prove arm64 (dev) and amd64 (CI) produce identical bytes. Empty = host arch.
+PLATFORM ?=
+PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
+DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
 
-.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built pin-hashes publish clean wasm-repro build-docker-image build-docker repro-check
+.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
 
 all: test contracts delegate ui
 
@@ -170,7 +174,13 @@ wasm-repro:
 	cp $(addprefix $(WASM_DIR)/,$(REPRO_WASMS)) $(CURDIR)/target/repro/
 
 build-docker-image:
-	docker build -t $(DOCKER_IMG) -f docker/Dockerfile .
+	docker build $(PLATFORM_ARG) -t $(DOCKER_IMG) -f docker/Dockerfile .
+
+# Reproducible build then print the sha256 of the 5 non-frozen wasm. Use with
+# PLATFORM=linux/amd64 to compare arch-to-arch.
+repro-hashes: build-docker-image
+	$(DOCKER_RUN) make wasm-repro
+	@shasum -a 256 $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS))
 
 # Run ONLY when a contract legitimately changes (source or Cargo.lock edit that
 # alters its bytes). Refreshes the vendored non-frozen wasm from a reproducible
@@ -182,21 +192,17 @@ build-docker: build-docker-image
 	$(DOCKER_RUN) make wasm-repro
 	cp $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS)) ui/contracts/
 
-# Prove the Docker build is byte-reproducible: build twice from clean (each
-# `docker run` gets a fresh container-local target dir) and assert the four
-# non-frozen contracts + delegate are byte-identical run-to-run. This is CI's
-# reproducibility gate; it does NOT diff against the grandfathered vendored
-# bytes, so it never forces a rotation.
-repro-check: build-docker-image
+# CROSS-ARCH reproducibility gate: build in the pinned container and assert the
+# four non-frozen contracts + delegate match scripts/repro-reference-hashes.txt
+# (canonical hashes of the CURRENT source, produced by this same reproducible
+# build). CI runs this on amd64; the reference was pinned on arm64 — so a pass
+# proves arm64==amd64. It does NOT diff the grandfathered vendored addressing
+# bytes, so it never forces a rotation. When a contract's source legitimately
+# changes, refresh the reference: `make repro-hashes` then paste into the file.
+verify-repro: build-docker-image
 	$(DOCKER_RUN) make wasm-repro
-	rm -rf $(CURDIR)/target/repro-a
-	mv $(CURDIR)/target/repro $(CURDIR)/target/repro-a
-	$(DOCKER_RUN) make wasm-repro
-	@for w in $(REPRO_WASMS); do \
-	  cmp $(CURDIR)/target/repro-a/$$w $(CURDIR)/target/repro/$$w || { \
-	    echo "NON-DETERMINISTIC: $$w differs run-to-run"; exit 1; }; \
-	done
-	@echo "Docker contract+delegate build is byte-reproducible run-to-run"
+	@shasum -a 256 $(addprefix $(CURDIR)/target/repro/,$(REPRO_WASMS))
+	shasum -a 256 -c scripts/repro-reference-hashes.txt
 
 clean:
 	$(CARGO) clean
