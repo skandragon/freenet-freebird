@@ -268,21 +268,18 @@ mod tests {
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
-            // Directory rotated 2026-08-12 (issue #50): the state is now one
-            // slot per author PER TIER so merges converge regardless of
-            // arrival order. Following the #51/#49/#45 rotation precedent,
-            // the prior directory address gets no dual-read window; listings
-            // are short-lived and authors re-seat on their next republish.
-            // Everything else is untouched.
-            //
-            // (#51, same day: anonymous writes carry an in-contract
-            // proof-of-work stamp — that rotation changed inbox + directory.)
-            "8cuT85zeCCFcebwZqepinbdnE8N78rkvwhy5ZzFyJ8YM",
+            // Directory + inbox rotated 2026-08-12 (issue #52): LWW before
+            // verification and a held-attestation skip on the delta paths.
+            // Following the #51/#50/#49/#45 rotation precedent, neither
+            // prior address gets a dual-read window (#51 rotated the same
+            // pair without one): listings re-seat on republish, and inbox
+            // creds/pointers re-staple as repliers repost.
+            "6Jj6CndZ2DzkxRyhiriFoj7Bq6ewMDBCMJ4uiofdXyUn",
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
-            "9uNGt6ZEqTFDgM7e8gocP2GsUhG65QkqrDUbwWjk4kZB",
+            "328eVhTm35uvJBnw35kXkNpCAvafvVpH5UoyPg7jGyxm",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",

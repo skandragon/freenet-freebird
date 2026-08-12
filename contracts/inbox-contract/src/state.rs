@@ -399,19 +399,24 @@ mod inbox_v3_components {
             delta: &Option<Self::Delta>,
         ) -> Result<(), String> {
             let Some(delta) = delta else { return Ok(()) };
-            // Bound the work one delta can demand: each attested cred costs
-            // an RSA chain verification inside wasm.
+            // Bound the work one delta can demand: each attested cred can
+            // cost an RSA chain verification inside wasm (replays and LWW
+            // losers are skipped — issue #52).
             if delta.len() > MAX_POINTERS {
                 return Err("credential delta too large".into());
             }
             for (key, cred) in delta {
-                cred.check(key, &parameters.ghostkey_master)?;
-                match self.creds.get(key) {
-                    Some(existing) if existing.content_hash() >= cred.content_hash() => {}
-                    _ => {
-                        self.creds.insert(*key, cred.clone());
-                    }
+                // LWW first (issue #52): a losing or already-held cred is
+                // never verified, so replaying known creds costs no RSA.
+                if self
+                    .creds
+                    .get(key)
+                    .is_some_and(|existing| existing.content_hash() >= cred.content_hash())
+                {
+                    continue;
                 }
+                cred.check(key, &parameters.ghostkey_master)?;
+                self.creds.insert(*key, cred.clone());
             }
             Ok(())
         }
@@ -966,6 +971,56 @@ mod tests {
         assert!(s
             .apply_delta(&clone, &p, &delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]))
             .is_err());
+    }
+
+    /// Issue #52: a cred losing the per-key LWW is skipped before
+    /// verification — a malformed losing cred no longer fails the delta,
+    /// and replaying held creds costs no RSA.
+    #[test]
+    fn losing_cred_never_verified() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = attested_replier(&authority);
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        // Anonymous cred under r's map key but the WRONG posting key:
+        // check() would be fatal, but it loses the LWW (anon hashes as
+        // zero) and must be skipped.
+        let stranger = anon_replier();
+        let clone = s.clone();
+        s.apply_delta(
+            &clone,
+            &p,
+            &Some(InboxStateV3Delta {
+                creds: Some([(r.key, stranger.cred.clone())].into_iter().collect()),
+                pointers: None,
+                pow_difficulty: None,
+            }),
+        )
+        .expect("losing cred skipped, not verified");
+        assert!(s.creds.creds[&r.key].attestation.is_some());
+    }
+
+    /// Issue #52: an EXACT replay of a held cred (equal content hash) is
+    /// skipped by the `>=` compare, never re-verified — pinned with a
+    /// rogue-master attested cred seated directly in state, which would
+    /// fail check() (RSA) if verification were reached.
+    #[test]
+    fn replayed_cred_not_reverified() {
+        let authority = TestAuthority::new();
+        let rogue = TestAuthority::new();
+        let p = params(&authority);
+        let r = attested_replier(&rogue); // does NOT verify under p.ghostkey_master
+        let mut s = InboxStateV3::default();
+        s.creds.creds.insert(r.key, r.cred.clone()); // seated as if verified
+        apply(&mut s, &p, delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]));
+        // Guard: a held pointer references r.key, so the replayed cred
+        // survives the staple filter and reaches CredsV3::apply_delta.
+        assert!(s.pointers.pointers.iter().any(|ptr| ptr.ptr.replier == r.key));
+        let clone = s.clone();
+        s.apply_delta(&clone, &p, &delta_of(vec![&r], vec![]))
+            .expect("exact replay skipped, not re-verified");
+        assert!(s.creds.creds[&r.key].attestation.is_some());
     }
 
     #[test]
