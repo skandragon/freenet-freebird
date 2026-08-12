@@ -26,12 +26,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make test
 
-  # CROSS-ARCH reproducibility gate. This runner is amd64; it rebuilds the four
-  # non-frozen contracts + delegate in the pinned Docker image and asserts they
-  # match scripts/repro-reference-hashes.txt (pinned on arm64). A pass proves
-  # the arm64 dev build and the amd64 CI build produce byte-identical wasm — so
-  # identical contract addresses. Does NOT diff the grandfathered vendored
-  # addressing bytes, so it never forces a rotation. See docs/reproducible-builds.md.
+  # Reproducibility gate. This runner is amd64 — the single build-of-record
+  # arch (wasm bytes are NOT identical across host arch; an arm64 build of the
+  # same source differs). It rebuilds the four non-frozen contracts + delegate
+  # in the pinned Docker image and asserts they match
+  # scripts/repro-reference-hashes.txt (canonical amd64 hashes of the current
+  # source). Does NOT diff the grandfathered vendored addressing bytes, so it
+  # never forces a rotation. See docs/reproducible-builds.md.
   docker-repro:
     runs-on: ubuntu-latest
     steps:

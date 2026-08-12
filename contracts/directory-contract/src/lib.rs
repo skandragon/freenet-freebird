@@ -11,6 +11,10 @@
 //! only each other (a keygen loop can churn the anonymous share, never a
 //! verified author's listing). Same tier discipline as the v2 inbox.
 //!
+//! V4 (issue #50) splits the state into one slot per author PER TIER so a
+//! tier flip can never un-justify an eviction another replica already made —
+//! see `DirectoryStateV4` for the convergence argument.
+//!
 //! State types live HERE, not in freebird-core: adding a module to the
 //! shared crate would change every deployed contract's wasm bytes and rotate
 //! all derived addresses (the 2026-08-10 avatar incident). The UI depends on
@@ -36,13 +40,13 @@ pub const DIRECTORY_SEED: &str = "freebird-directory-v3";
 /// doubles as the directory-generation discriminator.
 pub const LISTING_SIGN_DOMAIN: &[u8] = b"freebird-listing-v3";
 
-/// ponytail: single hot contract; ~1KB/listing (attestation chain) ≈ 1MB at
-/// cap. Shard by author-key prefix if it ever fills.
+/// ponytail: single hot contract; ~1KB/listing (attestation chain) ≈ 1.25MB
+/// with both tiers at cap. Shard by author-key prefix if it ever fills.
 pub const MAX_LISTINGS: usize = 1000;
 
 /// Slots anonymous listings may occupy at most. One listing per posting key
-/// is inherent (the map key), so the share cap is the only thing bounding a
-/// keygen flood — attested listings may use all MAX_LISTINGS.
+/// per tier is inherent (the map key), so the share cap is the only thing
+/// bounding a keygen flood — attested listings may use all MAX_LISTINGS.
 pub const ANON_LISTINGS: usize = 250;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -195,16 +199,17 @@ impl TierHorizon {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct DirectorySummaryV3 {
-    /// author → per-author LWW key held (BTreeMap: canonical summary bytes).
-    pub entries: BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
+pub struct DirectorySummaryV4 {
+    /// author → per-slot LWW key held, one map per tier.
+    pub attested: BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
+    pub anon: BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
     pub attested_horizon: TierHorizon,
     pub anon_horizon: TierHorizon,
 }
 
 /// A directory delta: the listings offered, plus the optional publisher-signed
 /// difficulty record (issue #51) the writer solved against. The record rides
-/// the ORIGINAL client write only; node-to-node gossip (`DirectoryStateV3::
+/// the ORIGINAL client write only; node-to-node gossip (`DirectoryStateV4::
 /// delta`) emits `pow_difficulty: None`, so replicas always re-admit at the
 /// compiled floor and stay convergent.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -214,27 +219,76 @@ pub struct DirectoryDeltaV3 {
     pub pow_difficulty: Option<SignedCellV1>,
 }
 
+/// v4 state (issue #50): TWO slots per author, one per tier, so an entry's
+/// tier is immutable — the precondition the inbox's convergence proof rests
+/// on. With one mutable slot per author, a tier flip (an attested author
+/// republishing anonymously, or the reverse) shrank a tier's count out from
+/// under evictions other replicas had already made, and evicting an author
+/// outright forgot their LWW winner, letting a stale opposite-tier copy
+/// re-seat — merge results depended on arrival order. Readers resolve an
+/// author's displayed listing with `winner`/`winners`; a superseded
+/// other-tier entry just stays seated until eviction ages it out.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct DirectoryStateV3 {
-    /// One listing per author, keyed by posting key.
-    pub listings: BTreeMap<[u8; 32], AuthorizedListingV3>,
+pub struct DirectoryStateV4 {
+    /// One listing per author per tier, keyed by posting key.
+    pub attested: BTreeMap<[u8; 32], AuthorizedListingV3>,
+    pub anon: BTreeMap<[u8; 32], AuthorizedListingV3>,
 }
 
-impl DirectoryStateV3 {
-    fn anon_count(&self) -> usize {
-        self.listings.values().filter(|l| l.is_anon()).count()
+impl DirectoryStateV4 {
+    /// The anonymous share left by the attested tier. The attested count
+    /// only ever grows (its entries are removed solely above the cap), so
+    /// the share only shrinks — an anonymous eviction made on one replica
+    /// stays justified on every replica regardless of arrival order.
+    fn effective_anon_share(&self) -> usize {
+        ANON_LISTINGS.min(MAX_LISTINGS.saturating_sub(self.attested.len()))
+    }
+
+    /// The author's displayed listing: newest publication wins, attested on
+    /// ties — the same LWW rule the single-slot v3 map applied in place.
+    pub fn winner(&self, author: &[u8; 32]) -> Option<&AuthorizedListingV3> {
+        match (self.attested.get(author), self.anon.get(author)) {
+            (Some(a), Some(n)) => Some(if a.lww_key() >= n.lww_key() { a } else { n }),
+            (a, n) => a.or(n),
+        }
+    }
+
+    /// Per-author displayed winners across both tiers (Discover's view).
+    pub fn winners(&self) -> BTreeMap<[u8; 32], &AuthorizedListingV3> {
+        let mut out: BTreeMap<[u8; 32], &AuthorizedListingV3> = BTreeMap::new();
+        for l in self.attested.values().chain(self.anon.values()) {
+            match out.get(&l.listing.author) {
+                Some(held) if held.lww_key() >= l.lww_key() => {}
+                _ => {
+                    out.insert(l.listing.author, l);
+                }
+            }
+        }
+        out
     }
 
     pub fn verify(&self, parameters: &DirectoryParametersV3) -> Result<(), String> {
-        if self.listings.len() > MAX_LISTINGS {
-            return Err(format!("more than {MAX_LISTINGS} listings"));
+        if self.attested.len() > MAX_LISTINGS {
+            return Err(format!("more than {MAX_LISTINGS} attested listings"));
         }
-        if self.anon_count() > ANON_LISTINGS {
-            return Err(format!("more than {ANON_LISTINGS} anonymous listings"));
+        if self.anon.len() > self.effective_anon_share() {
+            return Err("anonymous listings exceed their share".into());
         }
-        for (key, l) in &self.listings {
+        for (key, l) in &self.attested {
             if key != &l.listing.author {
                 return Err("listing stored under wrong author key".into());
+            }
+            if l.is_anon() {
+                return Err("anonymous listing in the attested tier".into());
+            }
+            l.check(&parameters.ghostkey_master)?;
+        }
+        for (key, l) in &self.anon {
+            if key != &l.listing.author {
+                return Err("listing stored under wrong author key".into());
+            }
+            if !l.is_anon() {
+                return Err("attested listing in the anonymous tier".into());
             }
             l.check(&parameters.ghostkey_master)?;
             // Every seated anonymous listing must clear the COMPILED floor
@@ -242,87 +296,91 @@ impl DirectoryStateV3 {
             // fabricated full state cannot seat a free anonymous share. The
             // control-cell difficulty is enforced at admission only, so
             // raising it never retroactively bricks listings already seated.
-            if l.is_anon() && !meets_directory(key, l.pow_nonce, POW_FLOOR_BITS) {
+            if !meets_directory(key, l.pow_nonce, POW_FLOOR_BITS) {
                 return Err("anonymous listing below the proof-of-work floor".into());
             }
         }
         Ok(())
     }
 
-    /// Tiered eviction, idempotent:
-    /// - over the anonymous share: evict the oldest anonymous listing;
-    /// - over the global cap: evict the oldest anonymous listing first, and
-    ///   the oldest attested only when no anonymous remain. Verified is
-    ///   never crowded out by anonymous.
-    pub fn canonicalize(&mut self) {
-        while self.anon_count() > ANON_LISTINGS {
-            let oldest = self
-                .listings
-                .values()
-                .filter(|l| l.is_anon())
-                .map(order_key)
-                .min()
-                .expect("anon over cap implies anon present");
-            self.listings.remove(&oldest.1);
+    /// Seat a listing in its tier, per-slot LWW. Policy only — the caller
+    /// has already checked signatures and proof-of-work.
+    fn admit(&mut self, l: &AuthorizedListingV3) {
+        let tier = if l.is_anon() {
+            &mut self.anon
+        } else {
+            &mut self.attested
+        };
+        match tier.get(&l.listing.author) {
+            Some(held) if held.lww_key() >= l.lww_key() => {}
+            _ => {
+                tier.insert(l.listing.author, l.clone());
+            }
         }
-        while self.listings.len() > MAX_LISTINGS {
-            let victim = self
-                .listings
+    }
+
+    /// Tiered eviction, idempotent and order-independent: each tier keeps
+    /// its newest entries up to its cap. Anonymous never crowds attested —
+    /// the anonymous share only shrinks as the attested tier grows.
+    pub fn canonicalize(&mut self) {
+        while self.attested.len() > MAX_LISTINGS {
+            let oldest = self
+                .attested
                 .values()
-                .filter(|l| l.is_anon())
                 .map(order_key)
                 .min()
-                .or_else(|| self.listings.values().map(order_key).min())
-                .expect("non-empty over cap");
-            self.listings.remove(&victim.1);
+                .expect("over cap implies non-empty");
+            self.attested.remove(&oldest.1);
+        }
+        let share = self.effective_anon_share();
+        while self.anon.len() > share {
+            let oldest = self
+                .anon
+                .values()
+                .map(order_key)
+                .min()
+                .expect("over share implies non-empty");
+            self.anon.remove(&oldest.1);
         }
     }
 
     /// Clock-dependent scrub, called by the contract shell only (host clock
     /// lives there, never inside the pure merge).
     pub fn scrub_future(&mut self, now_ms: u64) {
-        self.listings
-            .retain(|_, l| l.listing.last_active <= now_ms.saturating_add(MAX_FUTURE_MS));
+        let horizon = now_ms.saturating_add(MAX_FUTURE_MS);
+        self.attested.retain(|_, l| l.listing.last_active <= horizon);
+        self.anon.retain(|_, l| l.listing.last_active <= horizon);
     }
 
     fn tier_horizons(&self) -> (TierHorizon, TierHorizon) {
-        let attested: Vec<ListingOrderKey> = self
-            .listings
-            .values()
-            .filter(|l| !l.is_anon())
-            .map(order_key)
-            .collect();
-        let anon: Vec<ListingOrderKey> = self
-            .listings
-            .values()
-            .filter(|l| l.is_anon())
-            .map(order_key)
-            .collect();
-
-        let attested_h = if attested.len() >= MAX_LISTINGS {
-            TierHorizon::OldestRetained(attested.iter().min().copied().expect("at cap"))
+        let attested_h = if self.attested.len() >= MAX_LISTINGS {
+            TierHorizon::OldestRetained(
+                self.attested.values().map(order_key).min().expect("at cap"),
+            )
         } else {
             TierHorizon::Open
         };
-        let effective = ANON_LISTINGS.min(MAX_LISTINGS.saturating_sub(attested.len()));
-        let anon_h = if effective == 0 {
+        let share = self.effective_anon_share();
+        let anon_h = if share == 0 {
             TierHorizon::Closed
-        } else if anon.len() >= effective {
-            TierHorizon::OldestRetained(anon.iter().min().copied().expect("non-empty tier"))
+        } else if self.anon.len() >= share {
+            TierHorizon::OldestRetained(
+                self.anon.values().map(order_key).min().expect("non-empty tier"),
+            )
         } else {
             TierHorizon::Open
         };
         (attested_h, anon_h)
     }
 
-    pub fn summarize(&self) -> DirectorySummaryV3 {
+    pub fn summarize(&self) -> DirectorySummaryV4 {
         let (attested_horizon, anon_horizon) = self.tier_horizons();
-        DirectorySummaryV3 {
-            entries: self
-                .listings
-                .iter()
-                .map(|(k, l)| (*k, l.lww_key()))
-                .collect(),
+        let keys = |m: &BTreeMap<[u8; 32], AuthorizedListingV3>| {
+            m.iter().map(|(k, l)| (*k, l.lww_key())).collect()
+        };
+        DirectorySummaryV4 {
+            attested: keys(&self.attested),
+            anon: keys(&self.anon),
             attested_horizon,
             anon_horizon,
         }
@@ -331,46 +389,40 @@ impl DirectoryStateV3 {
     /// Listings the peer lacks (or holds older), and would retain. Gossip
     /// deltas never carry a difficulty record — admission at the receiver
     /// runs at the compiled floor (issue #51), keeping replicas convergent.
-    pub fn delta(&self, theirs: &DirectorySummaryV3) -> Option<DirectoryDeltaV3> {
-        let listings: Vec<AuthorizedListingV3> = self
-            .listings
-            .values()
-            .filter(|l| match theirs.entries.get(&l.listing.author) {
-                None => true,
-                Some(held) => l.lww_key() > *held,
-            })
-            .filter(|l| {
-                // Horizon-gate only authors the peer does not hold: for a
-                // held author this is an in-place LWW upgrade of an existing
-                // slot, and gating it can permanently withhold an update
-                // whose order key exactly ties the tier's oldest entry.
-                if theirs.entries.contains_key(&l.listing.author) {
-                    return true;
-                }
-                let tier = if l.is_anon() {
-                    &theirs.anon_horizon
-                } else {
-                    &theirs.attested_horizon
-                };
-                tier.admits(order_key(l))
-            })
-            .cloned()
-            .collect();
+    pub fn delta(&self, theirs: &DirectorySummaryV4) -> Option<DirectoryDeltaV3> {
+        let offer = |ours: &BTreeMap<[u8; 32], AuthorizedListingV3>,
+                     held: &BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
+                     horizon: &TierHorizon| {
+            ours.values()
+                .filter(|l| match held.get(&l.listing.author) {
+                    // In-place LWW upgrade of a held slot bypasses the
+                    // horizon: gating it can permanently withhold an update
+                    // whose order key exactly ties the tier's oldest entry.
+                    Some(h) => l.lww_key() > *h,
+                    None => horizon.admits(order_key(l)),
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut listings = offer(&self.attested, &theirs.attested, &theirs.attested_horizon);
+        listings.extend(offer(&self.anon, &theirs.anon, &theirs.anon_horizon));
         (!listings.is_empty()).then_some(DirectoryDeltaV3 {
             listings,
             pow_difficulty: None,
         })
     }
 
-    /// Verify and merge incoming listings: newer per author wins, then cap.
+    /// Verify and merge incoming listings: newer per (author, tier) wins,
+    /// then cap.
     pub fn apply_delta(
         &mut self,
         parameters: &DirectoryParametersV3,
         delta: &DirectoryDeltaV3,
     ) -> Result<(), String> {
         // Bound the work one delta can demand: each attested listing costs
-        // an RSA chain verification inside wasm.
-        if delta.listings.len() > MAX_LISTINGS {
+        // an RSA chain verification inside wasm. A full sync can carry both
+        // tiers at their caps.
+        if delta.listings.len() > MAX_LISTINGS + ANON_LISTINGS {
             return Err("listing delta too large".into());
         }
         // Admission difficulty: the floor, raised by a valid publisher-signed
@@ -386,12 +438,7 @@ impl DirectoryStateV3 {
             if l.is_anon() && !meets_directory(&l.listing.author, l.pow_nonce, bits) {
                 continue;
             }
-            match self.listings.get(&l.listing.author) {
-                Some(held) if held.lww_key() >= l.lww_key() => {}
-                _ => {
-                    self.listings.insert(l.listing.author, l.clone());
-                }
-            }
+            self.admit(l);
         }
         self.canonicalize();
         Ok(())
@@ -402,10 +449,15 @@ impl DirectoryStateV3 {
     pub fn merge(
         &mut self,
         parameters: &DirectoryParametersV3,
-        other: &DirectoryStateV3,
+        other: &DirectoryStateV4,
     ) -> Result<(), String> {
         let delta = DirectoryDeltaV3 {
-            listings: other.listings.values().cloned().collect(),
+            listings: other
+                .attested
+                .values()
+                .chain(other.anon.values())
+                .cloned()
+                .collect(),
             pow_difficulty: None,
         };
         self.apply_delta(parameters, &delta)
@@ -502,7 +554,7 @@ mod contract {
             if bytes.is_empty() {
                 return Ok(ValidateResult::Valid);
             }
-            let dir: DirectoryStateV3 = deser(bytes, "state")?;
+            let dir: DirectoryStateV4 = deser(bytes, "state")?;
             let parameters: DirectoryParametersV3 = deser(parameters.as_ref(), "parameters")?;
 
             let mut scrubbed = dir.clone();
@@ -523,8 +575,8 @@ mod contract {
             data: Vec<UpdateData<'static>>,
         ) -> Result<UpdateModification<'static>, ContractError> {
             let parameters: DirectoryParametersV3 = deser(parameters.as_ref(), "parameters")?;
-            let mut dir: DirectoryStateV3 = if state.as_ref().is_empty() {
-                DirectoryStateV3::default()
+            let mut dir: DirectoryStateV4 = if state.as_ref().is_empty() {
+                DirectoryStateV4::default()
             } else {
                 deser(state.as_ref(), "state")?
             };
@@ -534,7 +586,7 @@ mod contract {
             for update in data {
                 match update {
                     UpdateData::State(new_state) => {
-                        let mut incoming: DirectoryStateV3 =
+                        let mut incoming: DirectoryStateV4 =
                             deser(new_state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         dir.merge(&parameters, &incoming)
@@ -550,7 +602,7 @@ mod contract {
                             .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
                     }
                     UpdateData::StateAndDelta { state, delta } => {
-                        let mut incoming: DirectoryStateV3 =
+                        let mut incoming: DirectoryStateV4 =
                             deser(state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         dir.merge(&parameters, &incoming)
@@ -580,7 +632,7 @@ mod contract {
             if bytes.is_empty() {
                 return Ok(StateSummary::from(vec![]));
             }
-            let dir: DirectoryStateV3 = deser(bytes, "state")?;
+            let dir: DirectoryStateV4 = deser(bytes, "state")?;
             Ok(StateSummary::from(ser(&dir.summarize())?))
         }
 
@@ -593,11 +645,11 @@ mod contract {
             if state.as_ref().is_empty() {
                 return Ok(StateDelta::from(vec![]));
             }
-            let dir: DirectoryStateV3 = deser(state.as_ref(), "state")?;
+            let dir: DirectoryStateV4 = deser(state.as_ref(), "state")?;
             // Zero-byte summary = "peer has nothing" (summarize of empty
             // state emits it); parsing it as CBOR would abort the sync.
-            let summary: DirectorySummaryV3 = if summary.as_ref().is_empty() {
-                DirectorySummaryV3::default()
+            let summary: DirectorySummaryV4 = if summary.as_ref().is_empty() {
+                DirectorySummaryV4::default()
             } else {
                 deser(summary.as_ref(), "summary")?
             };
@@ -700,9 +752,9 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![listing(&a, 5)])).expect("apply ok");
-        assert_eq!(s.listings.len(), 1);
+        assert_eq!(s.attested.len(), 1);
         s.verify(&p).expect("verifies");
     }
 
@@ -711,11 +763,11 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let (sk, key) = anon_author();
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         let l = anon_listing(&sk, key, 5);
         s.apply_delta(&p, &d(vec![l])).expect("apply ok");
-        assert_eq!(s.listings.len(), 1);
-        assert!(s.listings[&key].is_anon());
+        assert_eq!(s.anon.len(), 1);
+        assert!(s.anon.contains_key(&key));
         s.verify(&p).expect("verifies");
     }
 
@@ -725,7 +777,7 @@ mod tests {
         let rogue = TestAuthority::new();
         let p = params(&authority);
         let a = author(&rogue); // attested under the wrong master
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         assert!(s.apply_delta(&p, &d(vec![listing(&a, 5)])).is_err());
     }
 
@@ -744,7 +796,7 @@ mod tests {
             &other,
             None,
         );
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         assert!(s.apply_delta(&p, &d(vec![forged])).is_err());
     }
 
@@ -753,26 +805,26 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![listing(&a, 5)])).unwrap();
         s.apply_delta(&p, &d(vec![listing(&a, 3)])).unwrap(); // stale: no-op
-        assert_eq!(s.listings[&a.key].listing.last_active, 5);
+        assert_eq!(s.attested[&a.key].listing.last_active, 5);
         s.apply_delta(&p, &d(vec![listing(&a, 7)])).unwrap(); // newer: wins
-        assert_eq!(s.listings[&a.key].listing.last_active, 7);
-        assert_eq!(s.listings.len(), 1);
+        assert_eq!(s.attested[&a.key].listing.last_active, 7);
+        assert_eq!(s.attested.len(), 1);
     }
 
     #[test]
     fn anon_share_capped() {
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         for i in 0..(ANON_LISTINGS as u64 + 20) {
             let key = key_of(i, 0);
-            s.listings.insert(key, fake_listing(None, key, i));
+            s.anon.insert(key, fake_listing(None, key, i));
         }
         s.canonicalize();
-        assert_eq!(s.listings.len(), ANON_LISTINGS);
+        assert_eq!(s.anon.len(), ANON_LISTINGS);
         // The oldest were evicted.
-        let min = s.listings.values().map(|l| l.listing.last_active).min().unwrap();
+        let min = s.anon.values().map(|l| l.listing.last_active).min().unwrap();
         assert_eq!(min, 20);
     }
 
@@ -780,23 +832,22 @@ mod tests {
     fn anon_never_evicts_attested() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         // 900 old attested + 250 newer anon: every attested survives, anon
         // squeezed into the remaining 100 slots.
         for i in 0..900u64 {
             let key = key_of(i, 1);
-            s.listings.insert(key, fake_listing(Some(&a.att), key, i));
+            s.attested.insert(key, fake_listing(Some(&a.att), key, i));
         }
         for i in 0..250u64 {
             let key = key_of(i, 2);
-            s.listings.insert(key, fake_listing(None, key, 10_000 + i));
+            s.anon.insert(key, fake_listing(None, key, 10_000 + i));
         }
         s.canonicalize();
-        let anon = s.listings.values().filter(|l| l.is_anon()).count();
-        assert_eq!(s.listings.len(), MAX_LISTINGS);
-        assert_eq!(anon, 100);
+        assert_eq!(s.attested.len() + s.anon.len(), MAX_LISTINGS);
+        assert_eq!(s.anon.len(), 100);
         assert_eq!(
-            s.listings.values().filter(|l| !l.is_anon()).count(),
+            s.attested.len(),
             900,
             "attested listings are never crowded out"
         );
@@ -806,32 +857,32 @@ mod tests {
     fn attested_evicts_anon_at_cap() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         for i in 0..100u64 {
             let key = key_of(i, 2);
-            s.listings.insert(key, fake_listing(None, key, i));
+            s.anon.insert(key, fake_listing(None, key, i));
         }
         for i in 0..MAX_LISTINGS as u64 {
             let key = key_of(i, 1);
-            s.listings.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
+            s.attested.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
         }
         s.canonicalize();
-        assert_eq!(s.listings.len(), MAX_LISTINGS);
-        assert_eq!(s.listings.values().filter(|l| l.is_anon()).count(), 0);
+        assert_eq!(s.attested.len(), MAX_LISTINGS);
+        assert_eq!(s.anon.len(), 0, "attested at the cap closes the anonymous share");
     }
 
     #[test]
     fn attested_only_eviction_when_no_anon_left() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         for i in 0..(MAX_LISTINGS as u64 + 5) {
             let key = key_of(i, 1);
-            s.listings.insert(key, fake_listing(Some(&a.att), key, i));
+            s.attested.insert(key, fake_listing(Some(&a.att), key, i));
         }
         s.canonicalize();
-        assert_eq!(s.listings.len(), MAX_LISTINGS);
-        let min = s.listings.values().map(|l| l.listing.last_active).min().unwrap();
+        assert_eq!(s.attested.len(), MAX_LISTINGS);
+        let min = s.attested.values().map(|l| l.listing.last_active).min().unwrap();
         assert_eq!(min, 5);
     }
 
@@ -840,36 +891,36 @@ mod tests {
         let authority = TestAuthority::new();
         let a = author(&authority);
         // Receiver full of attested listings ⇒ anon tier Closed.
-        let mut receiver = DirectoryStateV3::default();
+        let mut receiver = DirectoryStateV4::default();
         for i in 0..MAX_LISTINGS as u64 {
             let key = key_of(i, 1);
-            receiver.listings.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
+            receiver.attested.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
         }
         let summary = receiver.summarize();
         assert_eq!(summary.anon_horizon, TierHorizon::Closed);
 
         // Sender holds only anon listings ⇒ offers nothing.
-        let mut sender = DirectoryStateV3::default();
+        let mut sender = DirectoryStateV4::default();
         let key = key_of(0, 2);
-        sender.listings.insert(key, fake_listing(None, key, 99_999));
+        sender.anon.insert(key, fake_listing(None, key, 99_999));
         assert!(sender.delta(&summary).is_none());
     }
 
     #[test]
     fn anon_horizon_prevents_reoffer_of_pruned_listings() {
         // Receiver's anon share full with newer entries.
-        let mut receiver = DirectoryStateV3::default();
+        let mut receiver = DirectoryStateV4::default();
         for i in 0..ANON_LISTINGS as u64 {
             let key = key_of(i, 2);
-            receiver.listings.insert(key, fake_listing(None, key, 1000 + i));
+            receiver.anon.insert(key, fake_listing(None, key, 1000 + i));
         }
         let summary = receiver.summarize();
         assert!(matches!(summary.anon_horizon, TierHorizon::OldestRetained(_)));
 
         // Sender holds one OLD anon listing the receiver would prune.
-        let mut sender = DirectoryStateV3::default();
+        let mut sender = DirectoryStateV4::default();
         let old_key = key_of(999, 3);
-        sender.listings.insert(old_key, fake_listing(None, old_key, 1));
+        sender.anon.insert(old_key, fake_listing(None, old_key, 1));
         assert!(
             sender.delta(&summary).is_none(),
             "sender must not re-offer listings below the receiver's anon horizon"
@@ -878,9 +929,9 @@ mod tests {
         // An attested listing is still offered (its tier is Open).
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut attested_sender = DirectoryStateV3::default();
+        let mut attested_sender = DirectoryStateV4::default();
         let akey = key_of(1, 4);
-        attested_sender.listings.insert(akey, fake_listing(Some(&a.att), akey, 1));
+        attested_sender.attested.insert(akey, fake_listing(Some(&a.att), akey, 1));
         assert!(attested_sender.delta(&summary).is_some());
     }
 
@@ -888,24 +939,24 @@ mod tests {
     fn oversized_delta_rejected() {
         let authority = TestAuthority::new();
         let p = params(&authority);
-        let delta: Vec<AuthorizedListingV3> = (0..(MAX_LISTINGS as u64 + 1))
+        let delta: Vec<AuthorizedListingV3> = (0..((MAX_LISTINGS + ANON_LISTINGS) as u64 + 1))
             .map(|i| fake_listing(None, key_of(i, 0), i))
             .collect();
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         assert!(s.apply_delta(&p, &d(delta)).is_err());
     }
 
     #[test]
     fn scrub_future_removes_far_future_listings() {
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         let ok_key = [3u8; 32];
         let bad_key = [4u8; 32];
-        s.listings.insert(ok_key, fake_listing(None, ok_key, 1_000));
-        s.listings
+        s.anon.insert(ok_key, fake_listing(None, ok_key, 1_000));
+        s.anon
             .insert(bad_key, fake_listing(None, bad_key, 1_000 + MAX_FUTURE_MS + 1));
         s.scrub_future(1_000);
-        assert_eq!(s.listings.len(), 1);
-        assert!(s.listings.contains_key(&ok_key));
+        assert_eq!(s.anon.len(), 1);
+        assert!(s.anon.contains_key(&ok_key));
     }
 
     /// Issue #45 directory substitution / stripping: the listing signature
@@ -927,7 +978,7 @@ mod tests {
             pow_nonce: 0,
         };
         assert!(stripped.check(&authority.master_vk).is_err());
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         assert!(s.apply_delta(&p, &d(vec![stripped])).is_err());
 
         // Substituted copy: a stranger's attestation swapped in.
@@ -939,13 +990,13 @@ mod tests {
             pow_nonce: 0,
         };
         assert!(substituted.check(&authority.master_vk).is_err());
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         assert!(s.apply_delta(&p, &d(vec![substituted.clone()])).is_err());
 
         // Full-state verify parity with the feed/inbox negative tests: a
         // fabricated state carrying the substituted listing must not verify.
-        let mut fabricated = DirectoryStateV3::default();
-        fabricated.listings.insert(a.key, substituted);
+        let mut fabricated = DirectoryStateV4::default();
+        fabricated.attested.insert(a.key, substituted);
         assert!(fabricated.verify(&p).is_err());
     }
 
@@ -970,7 +1021,7 @@ mod tests {
             Some(forced),
         );
         assert!(l.check(&authority.master_vk).is_err());
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         assert!(s.apply_delta(&p, &d(vec![l])).is_err());
     }
 
@@ -987,22 +1038,24 @@ mod tests {
         );
     }
 
-    /// An author who verifies upgrades their own listing: attested beats
-    /// anon at equal time, and the author's NEWER publication always wins
-    /// regardless of tier (their listing, their choice).
+    /// An author who verifies upgrades their own DISPLAYED listing: attested
+    /// beats anon at equal time, and the author's NEWER publication always
+    /// wins regardless of tier (their listing, their choice). Both slots
+    /// stay seated — only the winner is what readers show.
     #[test]
     fn anon_listing_upgrades_to_attested() {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
         let anon_l = |t| anon_listing(&a.sk, a.key, t);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![anon_l(5)])).unwrap();
         s.apply_delta(&p, &d(vec![listing(&a, 5)])).unwrap(); // equal time: attested wins
-        assert!(s.listings[&a.key].attestation.is_some());
+        assert!(s.winner(&a.key).unwrap().attestation.is_some());
         s.apply_delta(&p, &d(vec![anon_l(7)])).unwrap(); // newer self-publication wins
-        assert!(s.listings[&a.key].is_anon());
-        assert_eq!(s.listings[&a.key].listing.last_active, 7);
+        assert!(s.winner(&a.key).unwrap().is_anon());
+        assert_eq!(s.winner(&a.key).unwrap().listing.last_active, 7);
+        assert_eq!(s.winners().len(), 1, "one Discover row per author");
     }
 
     // ---- proof-of-work (issue #51) ----
@@ -1022,12 +1075,12 @@ mod tests {
         );
         assert_eq!(bad.pow_nonce, 0);
 
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![bad.clone()])).expect("delta ok, listing dropped");
-        assert!(s.listings.is_empty(), "unstamped anon listing must be dropped");
+        assert!(s.anon.is_empty(), "unstamped anon listing must be dropped");
 
-        let mut fabricated = DirectoryStateV3::default();
-        fabricated.listings.insert(key, bad);
+        let mut fabricated = DirectoryStateV4::default();
+        fabricated.anon.insert(key, bad);
         assert!(fabricated.verify(&p).is_err(), "under-floor anon fails verify");
     }
 
@@ -1040,9 +1093,9 @@ mod tests {
         let a = author(&authority);
         let l = listing(&a, 5);
         assert_eq!(l.pow_nonce, 0, "attested writes carry no stamp");
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![l])).expect("attested admitted without PoW");
-        assert_eq!(s.listings.len(), 1);
+        assert_eq!(s.attested.len(), 1);
         s.verify(&p).expect("verifies");
     }
 
@@ -1063,9 +1116,9 @@ mod tests {
         );
         b_listing.pow_nonce = harvested; // A's solve grafted onto B
 
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![b_listing])).expect("delta ok");
-        assert!(s.listings.is_empty(), "A's stamp must not admit B");
+        assert!(s.anon.is_empty(), "A's stamp must not admit B");
     }
 
     /// Difficulty sourced from the control cell: a publisher-signed record
@@ -1091,7 +1144,7 @@ mod tests {
         // the time, which would flake.
         let mut weak = anon_listing(&sk, key, 5);
         weak.pow_nonce = freebird_pow::solve_directory_band(&key, POW_FLOOR_BITS, control);
-        let mut s = DirectoryStateV3::default();
+        let mut s = DirectoryStateV4::default();
         s.apply_delta(
             &p,
             &DirectoryDeltaV3 {
@@ -1100,7 +1153,7 @@ mod tests {
             },
         )
         .expect("delta ok");
-        assert!(s.listings.is_empty(), "floor stamp rejected under raised difficulty");
+        assert!(s.anon.is_empty(), "floor stamp rejected under raised difficulty");
 
         // Solved to the control difficulty → admitted.
         let strong = AuthorizedListingV3::new_anon(
@@ -1116,7 +1169,7 @@ mod tests {
             },
         )
         .expect("delta ok");
-        assert_eq!(s.listings.len(), 1, "control-difficulty stamp accepted");
+        assert_eq!(s.anon.len(), 1, "control-difficulty stamp accepted");
     }
 
     /// Shrunken anon share (900 attested at the 1000 cap ⇒ effective anon
@@ -1126,17 +1179,17 @@ mod tests {
     fn shrunken_anon_horizon_and_held_author_bypass() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut receiver = DirectoryStateV3::default();
+        let mut receiver = DirectoryStateV4::default();
         for i in 0..900u64 {
             let key = key_of(i, 1);
-            receiver.listings.insert(key, fake_listing(Some(&a.att), key, i));
+            receiver.attested.insert(key, fake_listing(Some(&a.att), key, i));
         }
         for i in 0..100u64 {
             let key = key_of(i, 2);
-            receiver.listings.insert(key, fake_listing(None, key, 1000 + i));
+            receiver.anon.insert(key, fake_listing(None, key, 1000 + i));
         }
         receiver.canonicalize();
-        assert_eq!(receiver.listings.len(), MAX_LISTINGS);
+        assert_eq!(receiver.attested.len() + receiver.anon.len(), MAX_LISTINGS);
         let summary = receiver.summarize();
         assert!(
             matches!(summary.anon_horizon, TierHorizon::OldestRetained((t, _)) if t == 1000),
@@ -1145,17 +1198,126 @@ mod tests {
         );
 
         // NEW anon author below the horizon: not offered.
-        let mut old_sender = DirectoryStateV3::default();
+        let mut old_sender = DirectoryStateV4::default();
         let new_key = key_of(999, 3);
-        old_sender.listings.insert(new_key, fake_listing(None, new_key, 1));
+        old_sender.anon.insert(new_key, fake_listing(None, new_key, 1));
         assert!(old_sender.delta(&summary).is_none());
 
         // HELD anon author, newer copy whose order key TIES the horizon
         // exception path: offered despite the horizon (in-place LWW).
         let held_key = key_of(0, 2);
-        let mut upgrader = DirectoryStateV3::default();
-        upgrader.listings.insert(held_key, fake_listing(None, held_key, 5000));
+        let mut upgrader = DirectoryStateV4::default();
+        upgrader.anon.insert(held_key, fake_listing(None, held_key, 5000));
         assert!(upgrader.delta(&summary).is_some());
+    }
+
+    // ---- merge convergence (issue #50) ----
+
+    mod convergence {
+        use super::*;
+        use proptest::prelude::*;
+        use std::sync::OnceLock;
+
+        /// One attestation shared by every policy-path listing: the
+        /// convergence machinery (admit/canonicalize) never verifies it,
+        /// and minting one per author would drown the proptest.
+        fn shared_att() -> &'static AttestationV2 {
+            static ATT: OnceLock<AttestationV2> = OnceLock::new();
+            ATT.get_or_init(|| TestAuthority::new().attest(&SigningKey::from_bytes(&[9u8; 32])))
+        }
+
+        /// Policy-path listing with a dummy signature and no PoW — cheap
+        /// enough to build by the thousand per proptest case.
+        fn raw(anon: bool, author: [u8; 32], time: u64) -> AuthorizedListingV3 {
+            AuthorizedListingV3 {
+                listing: ListingV1 {
+                    author,
+                    last_active: time,
+                },
+                signature: Signature::from_bytes(&[0u8; 64]),
+                attestation: (!anon).then(|| shared_att().clone()),
+                pow_nonce: 0,
+            }
+        }
+
+        /// The lossy incremental path apply_delta takes, minus crypto.
+        fn admit_chunked(listings: &[AuthorizedListingV3], chunk: usize) -> DirectoryStateV4 {
+            let mut s = DirectoryStateV4::default();
+            for c in listings.chunks(chunk) {
+                for l in c {
+                    s.admit(l);
+                }
+                s.canonicalize();
+            }
+            s
+        }
+
+        /// Issue #50's reproducer: 1000 attested + 200 anon + 400 self-
+        /// downgrades. Pre-v4 this converged to 850 listings in one order
+        /// and resurrected stale attested entries to 1000 in the other.
+        #[test]
+        fn downgrade_reproducer_converges() {
+            let attested: Vec<_> = (0..1000).map(|i| raw(false, key_of(i, 1), 100 + i)).collect();
+            let anon: Vec<_> = (0..200).map(|i| raw(true, key_of(i, 2), 100 + i)).collect();
+            let downgrades: Vec<_> =
+                (0..400).map(|i| raw(true, key_of(i, 1), 10_000 + i)).collect();
+            let o1 = [attested.clone(), anon.clone(), downgrades.clone()].concat();
+            let o2 = [downgrades, anon, attested].concat();
+            let s1 = admit_chunked(&o1, 50);
+            let s2 = admit_chunked(&o2, 50);
+            assert_eq!(
+                freebird_core::to_cbor(&s1).unwrap(),
+                freebird_core::to_cbor(&s2).unwrap()
+            );
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(32))]
+
+            /// Incremental convergence at and above the caps INCLUDING tier
+            /// moves: ~1200 authors × mixed tiers at colliding times —
+            /// upgrades, downgrades, attested-cap pressure, the shrunken
+            /// (and Closed) anon share — arriving in two different orders
+            /// and chunk sizes must canonicalize to identical bytes.
+            #[test]
+            fn merge_incremental_convergence_with_tier_moves(
+                entries in proptest::collection::vec((0u64..5000, proptest::bool::ANY), 1400..1700),
+                seed in 0u64..1000,
+            ) {
+                let listings: Vec<_> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (t, anon))| raw(*anon, key_of((i % 1200) as u64, 0), *t))
+                    .collect();
+                let mut order2 = listings.clone();
+                let n = order2.len();
+                for i in 0..n {
+                    let j = ((seed as usize).wrapping_mul(31).wrapping_add(i * 7)) % n;
+                    order2.swap(i, j);
+                }
+                let s1 = admit_chunked(&listings, 13);
+                let s2 = admit_chunked(&order2, 997); // near one-shot
+                prop_assert_eq!(
+                    freebird_core::to_cbor(&s1).unwrap(),
+                    freebird_core::to_cbor(&s2).unwrap()
+                );
+            }
+
+            /// canonicalize(canonicalize(s)) == canonicalize(s).
+            #[test]
+            fn canonicalize_idempotent(
+                entries in proptest::collection::vec((0u64..500, proptest::bool::ANY), 0..300),
+            ) {
+                let mut s = DirectoryStateV4::default();
+                for (i, (t, anon)) in entries.iter().enumerate() {
+                    s.admit(&raw(*anon, key_of((i % 200) as u64, 0), *t));
+                }
+                s.canonicalize();
+                let once = freebird_core::to_cbor(&s).unwrap();
+                s.canonicalize();
+                prop_assert_eq!(once, freebird_core::to_cbor(&s).unwrap());
+            }
+        }
     }
 
     /// The legacy decoder reads what the v1 contract stored: mandatory

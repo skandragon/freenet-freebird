@@ -57,7 +57,7 @@ pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar
     Signal::global(BTreeMap::new);
 
 /// The public author directory, v2 (issue #11). None = not fetched yet.
-pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV3>> =
+pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV4>> =
     Signal::global(|| None);
 
 /// The LEGACY (v1) directory — dual-read migration window (issue #23).
