@@ -146,20 +146,32 @@ impl ComposableState for InboxStateV2 {
         let Some(delta) = delta else { return Ok(()) };
         // A delta cred no existing or incoming pointer references would be
         // pruned by post_apply_cleanup anyway — skip it BEFORE apply pays
-        // its RSA verification (issue #49). The size bound stays a hard
-        // reject, ahead of the filter's linear scan.
+        // its RSA verification (issue #49). An incoming pointer vouches for
+        // its cred only after its ed25519 signature verifies (a junk staple
+        // fails the delta with no RSA paid; a validly signed one buys one
+        // RSA check — the floor for accepting attested creds at all). The
+        // size bound stays a hard reject, ahead of the filter's linear scan.
         let creds = match &delta.creds {
             Some(c) if c.len() > MAX_POINTERS => {
                 return Err("credential delta too large".into())
             }
             Some(c) => {
+                // Bad staple signatures stay FATAL (same doctrine as
+                // check_pointer), and the verified ones vouch for their
+                // creds — one ed25519 verify gates each RSA check.
+                let mut stapled = std::collections::BTreeSet::new();
+                if let Some(ps) = &delta.pointers {
+                    for ptr in ps {
+                        if let Some(cred) = c.get(&ptr.ptr.replier) {
+                            ptr.verify_signature(&cred.posting_key)?;
+                            stapled.insert(ptr.ptr.replier);
+                        }
+                    }
+                }
                 let mut c = c.clone();
                 c.retain(|k, _| {
-                    self.pointers.pointers.iter().any(|p| p.ptr.replier == *k)
-                        || delta
-                            .pointers
-                            .as_ref()
-                            .is_some_and(|ps| ps.iter().any(|p| p.ptr.replier == *k))
+                    stapled.contains(k)
+                        || self.pointers.pointers.iter().any(|p| p.ptr.replier == *k)
                 });
                 (!c.is_empty()).then_some(c)
             }
@@ -1036,6 +1048,32 @@ mod tests {
         );
         assert_eq!(receiver.summarize(&receiver.clone(), &p), before);
         receiver.verify(&receiver.clone(), &p).expect("receiver valid");
+    }
+
+    /// Issue #49: a junk-signature stapling pointer must not buy the cred's
+    /// RSA verification — the delta fails on the pointer signature, never
+    /// reaching cred.check.
+    #[test]
+    fn junk_staple_pointer_does_not_buy_rsa_check() {
+        let authority = TestAuthority::new();
+        let rogue = TestAuthority::new();
+        let p = params(&authority);
+        // Invalid attestation under p's master: cred.check would error at
+        // the RSA stage if it ever ran.
+        let r = attested_replier(&rogue);
+        let mut staple = pointer(&r, 5, 0);
+        staple.signature = Signature::from_bytes(&[0u8; 64]);
+        let mut s = InboxStateV2::default();
+        let clone = s.clone();
+        let err = s
+            .apply_delta(&clone, &p, &delta_of(vec![&r], vec![staple]))
+            .expect_err("junk staple must fail the delta");
+        assert!(
+            err.contains("pointer signature invalid"),
+            "must fail at the pointer stage, not the RSA cred stage: {err}"
+        );
+        assert!(s.creds.creds.is_empty());
+        assert!(s.pointers.pointers.is_empty());
     }
 
     /// Issue #49 quiescence, honest-traffic variant: a sender whose only

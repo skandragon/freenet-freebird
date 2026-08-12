@@ -249,7 +249,7 @@ mod tests {
             // Rotated 2026-08-11 (issue #49): inbox rejects/withholds
             // unreferenced creds. No dual-read of the previous v2 wasm: its
             // day-old address is assumed to hold no real traffic.
-            "J4G9r5fiP2WbGxPuhLxkkrbcXBpNhPH8p1khJX41VxL9",
+            "6vGxb5mqHXdbrHfVrxpMXDTj8s7X2qP7VKV7ECtTV9RX",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             "577KsAVancBcWwQfbpYrF9DN4FPzBBXrvuEALf2Gf67g",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
