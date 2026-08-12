@@ -1,4 +1,4 @@
-//! Public author directory, v2 (issues #11, #23): ONE well-known contract
+//! Public author directory, v3 (issues #11, #23, #45/#47): ONE well-known contract
 //! for the whole network. Params are a version seed + the ghostkey master
 //! key — no author key — so every client derives the same address (doorbell
 //! pattern). Authors opt in by publishing a signed listing; the Discover tab
@@ -20,14 +20,19 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use freebird_core::attestation::AttestationV1;
+use freebird_core::attestation::{AttestationV1, AttestationV2};
 use freebird_core::feed::MAX_FUTURE_MS;
 use serde::{Deserialize, Serialize};
 
 /// Version seed baked into the params; rotating it deliberately mints a new
 /// directory address (with a migration story), never as a rebuild side
-/// effect. v2 = anonymous parity (issue #23), riding the anchor migration.
-pub const DIRECTORY_SEED: &str = "freebird-directory-v2";
+/// effect. v2 = anonymous parity (issue #23); v3 = signed attestation +
+/// domain-tagged listing signature (issues #45/#47).
+pub const DIRECTORY_SEED: &str = "freebird-directory-v3";
+
+/// Domain tag for listing signatures (issue #47); the version suffix
+/// doubles as the directory-generation discriminator.
+pub const LISTING_SIGN_DOMAIN: &[u8] = b"freebird-listing-v3";
 
 /// ponytail: single hot contract; ~1KB/listing (attestation chain) ≈ 1MB at
 /// cap. Shard by author-key prefix if it ever fills.
@@ -39,7 +44,7 @@ pub const MAX_LISTINGS: usize = 1000;
 pub const ANON_LISTINGS: usize = 250;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct DirectoryParametersV2 {
+pub struct DirectoryParametersV3 {
     pub seed: String,
     /// Ghost Key trust anchor; see `FeedParametersV1::ghostkey_master`.
     pub ghostkey_master: VerifyingKey,
@@ -55,20 +60,51 @@ pub struct ListingV1 {
 
 /// Listing + signature by the author's posting key. The Ghost Key
 /// attestation is optional: present = attested tier (uncrowdable), absent =
-/// anonymous tier (bounded share).
+/// anonymous tier (bounded share). The signature covers the listing AND the
+/// attestation slot (issue #45): nobody can re-wrap a victim's listing with
+/// a different attestation (or strip it) without the author's key.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct AuthorizedListingV2 {
+pub struct AuthorizedListingV3 {
     pub listing: ListingV1,
     pub signature: Signature,
-    pub attestation: Option<AttestationV1>,
+    pub attestation: Option<AttestationV2>,
 }
 
-impl AuthorizedListingV2 {
-    pub fn new(listing: ListingV1, sk: &SigningKey, attestation: Option<AttestationV1>) -> Self {
+/// The exact bytes the author signs (issue #47): domain tag + canonical
+/// field layout + the attestation slot's content hash.
+pub fn listing_signing_payload(
+    listing: &ListingV1,
+    attestation: Option<&AttestationV2>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LISTING_SIGN_DOMAIN.len() + 32 + 8 + 1 + 32);
+    out.extend_from_slice(LISTING_SIGN_DOMAIN);
+    out.extend_from_slice(&listing.author);
+    out.extend_from_slice(&listing.last_active.to_le_bytes());
+    match attestation {
+        None => out.push(0),
+        Some(att) => {
+            out.push(1);
+            // ponytail: content_hash() = blake3(to_cbor(AttestationV2)) — a
+            // residual bare-CBOR dependency in #47's manual-canonical
+            // guarantee. Contained: a ciborium encoding change could only
+            // invalidate an attested listing's OWN signature (availability,
+            // self-healing on republish), never forge or substitute one
+            // (the attestation still verifies its own manual-canonical
+            // payload + pop independently). Fold the pop/ghost signature
+            // bytes in here if the attestation ever gains a cheaper stable
+            // identity; not worth rotating the directory address for now.
+            out.extend_from_slice(&att.content_hash());
+        }
+    }
+    out
+}
+
+impl AuthorizedListingV3 {
+    pub fn new(listing: ListingV1, sk: &SigningKey, attestation: Option<AttestationV2>) -> Self {
         use ed25519_dalek::Signer;
-        let bytes = freebird_core::to_cbor(&listing).expect("listing serializes");
+        let signature = sk.sign(&listing_signing_payload(&listing, attestation.as_ref()));
         Self {
-            signature: sk.sign(&bytes),
+            signature,
             listing,
             attestation,
         }
@@ -78,14 +114,17 @@ impl AuthorizedListingV2 {
         self.attestation.is_none()
     }
 
-    /// Full validity: author key parses, signature verifies, and — when
-    /// present — the attestation chain verifies and binds this posting key.
+    /// Full validity: author key parses, signature verifies (covering the
+    /// attestation slot), and — when present — the attestation chain
+    /// verifies and binds this posting key.
     pub fn check(&self, master: &VerifyingKey) -> Result<(), String> {
         let vk = VerifyingKey::from_bytes(&self.listing.author)
             .map_err(|e| format!("bad author key: {e}"))?;
-        let bytes = freebird_core::to_cbor(&self.listing)?;
-        vk.verify_strict(&bytes, &self.signature)
-            .map_err(|e| format!("listing signature invalid: {e}"))?;
+        vk.verify_strict(
+            &listing_signing_payload(&self.listing, self.attestation.as_ref()),
+            &self.signature,
+        )
+        .map_err(|e| format!("listing signature invalid: {e}"))?;
         if let Some(att) = &self.attestation {
             att.verify(&vk, Some(master))
                 .map(|_tier| ())
@@ -95,12 +134,10 @@ impl AuthorizedListingV2 {
     }
 
     /// Per-author LWW winner: max `(last_active, attested, content hash)`.
-    /// The attested bit outranks the hash tie-break: the signature covers
-    /// only `listing`, so anyone can re-wrap a victim's signed listing with
-    /// `attestation: None` — without this bit the stripped copy would win
-    /// the equal-time hash coin-flip and demote a verified author to the
-    /// evictable anonymous tier. The hash still breaks attested-vs-attested
-    /// ties deterministically (e.g. re-minted attestation).
+    /// The attested bit keeps an author's own equal-time attested republish
+    /// ahead of their anonymous one on every peer (stripping by THIRD
+    /// parties died with #45 — the signature now covers the attestation).
+    /// The hash still breaks attested-vs-attested ties deterministically.
     pub fn lww_key(&self) -> (u64, bool, [u8; 32]) {
         let bytes = freebird_core::to_cbor(self).expect("listing serializes");
         (
@@ -114,7 +151,7 @@ impl AuthorizedListingV2 {
 /// Eviction/horizon order across authors: oldest `(last_active, author)` first.
 pub type ListingOrderKey = (u64, [u8; 32]);
 
-fn order_key(l: &AuthorizedListingV2) -> ListingOrderKey {
+fn order_key(l: &AuthorizedListingV3) -> ListingOrderKey {
     (l.listing.last_active, l.listing.author)
 }
 
@@ -141,27 +178,27 @@ impl TierHorizon {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct DirectorySummaryV2 {
+pub struct DirectorySummaryV3 {
     /// author → per-author LWW key held (BTreeMap: canonical summary bytes).
     pub entries: BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
     pub attested_horizon: TierHorizon,
     pub anon_horizon: TierHorizon,
 }
 
-pub type DirectoryDeltaV2 = Vec<AuthorizedListingV2>;
+pub type DirectoryDeltaV3 = Vec<AuthorizedListingV3>;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct DirectoryStateV2 {
+pub struct DirectoryStateV3 {
     /// One listing per author, keyed by posting key.
-    pub listings: BTreeMap<[u8; 32], AuthorizedListingV2>,
+    pub listings: BTreeMap<[u8; 32], AuthorizedListingV3>,
 }
 
-impl DirectoryStateV2 {
+impl DirectoryStateV3 {
     fn anon_count(&self) -> usize {
         self.listings.values().filter(|l| l.is_anon()).count()
     }
 
-    pub fn verify(&self, parameters: &DirectoryParametersV2) -> Result<(), String> {
+    pub fn verify(&self, parameters: &DirectoryParametersV3) -> Result<(), String> {
         if self.listings.len() > MAX_LISTINGS {
             return Err(format!("more than {MAX_LISTINGS} listings"));
         }
@@ -243,9 +280,9 @@ impl DirectoryStateV2 {
         (attested_h, anon_h)
     }
 
-    pub fn summarize(&self) -> DirectorySummaryV2 {
+    pub fn summarize(&self) -> DirectorySummaryV3 {
         let (attested_horizon, anon_horizon) = self.tier_horizons();
-        DirectorySummaryV2 {
+        DirectorySummaryV3 {
             entries: self
                 .listings
                 .iter()
@@ -257,8 +294,8 @@ impl DirectoryStateV2 {
     }
 
     /// Listings the peer lacks (or holds older), and would retain.
-    pub fn delta(&self, theirs: &DirectorySummaryV2) -> Option<DirectoryDeltaV2> {
-        let delta: Vec<AuthorizedListingV2> = self
+    pub fn delta(&self, theirs: &DirectorySummaryV3) -> Option<DirectoryDeltaV3> {
+        let delta: Vec<AuthorizedListingV3> = self
             .listings
             .values()
             .filter(|l| match theirs.entries.get(&l.listing.author) {
@@ -288,8 +325,8 @@ impl DirectoryStateV2 {
     /// Verify and merge incoming listings: newer per author wins, then cap.
     pub fn apply_delta(
         &mut self,
-        parameters: &DirectoryParametersV2,
-        delta: &[AuthorizedListingV2],
+        parameters: &DirectoryParametersV3,
+        delta: &[AuthorizedListingV3],
     ) -> Result<(), String> {
         // Bound the work one delta can demand: each attested listing costs
         // an RSA chain verification inside wasm.
@@ -312,10 +349,10 @@ impl DirectoryStateV2 {
     /// Full-state merge = apply the other side's listings as a delta.
     pub fn merge(
         &mut self,
-        parameters: &DirectoryParametersV2,
-        other: &DirectoryStateV2,
+        parameters: &DirectoryParametersV3,
+        other: &DirectoryStateV3,
     ) -> Result<(), String> {
-        let entries: Vec<AuthorizedListingV2> = other.listings.values().cloned().collect();
+        let entries: Vec<AuthorizedListingV3> = other.listings.values().cloned().collect();
         self.apply_delta(parameters, &entries)
     }
 }
@@ -390,7 +427,7 @@ mod contract {
 
     /// Drop far-future listings from an incoming delta before the merge — a
     /// poisoned timestamp must never get the chance to outlive honest ones.
-    fn scrub_delta(delta: &mut DirectoryDeltaV2, now: u64) {
+    fn scrub_delta(delta: &mut DirectoryDeltaV3, now: u64) {
         delta.retain(|l| l.listing.last_active <= now.saturating_add(MAX_FUTURE_MS));
     }
 
@@ -408,8 +445,8 @@ mod contract {
             if bytes.is_empty() {
                 return Ok(ValidateResult::Valid);
             }
-            let dir: DirectoryStateV2 = deser(bytes, "state")?;
-            let parameters: DirectoryParametersV2 = deser(parameters.as_ref(), "parameters")?;
+            let dir: DirectoryStateV3 = deser(bytes, "state")?;
+            let parameters: DirectoryParametersV3 = deser(parameters.as_ref(), "parameters")?;
 
             let mut scrubbed = dir.clone();
             scrubbed.scrub_future(now_ms());
@@ -428,9 +465,9 @@ mod contract {
             state: State<'static>,
             data: Vec<UpdateData<'static>>,
         ) -> Result<UpdateModification<'static>, ContractError> {
-            let parameters: DirectoryParametersV2 = deser(parameters.as_ref(), "parameters")?;
-            let mut dir: DirectoryStateV2 = if state.as_ref().is_empty() {
-                DirectoryStateV2::default()
+            let parameters: DirectoryParametersV3 = deser(parameters.as_ref(), "parameters")?;
+            let mut dir: DirectoryStateV3 = if state.as_ref().is_empty() {
+                DirectoryStateV3::default()
             } else {
                 deser(state.as_ref(), "state")?
             };
@@ -440,7 +477,7 @@ mod contract {
             for update in data {
                 match update {
                     UpdateData::State(new_state) => {
-                        let mut incoming: DirectoryStateV2 =
+                        let mut incoming: DirectoryStateV3 =
                             deser(new_state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         dir.merge(&parameters, &incoming)
@@ -450,19 +487,19 @@ mod contract {
                         if d.as_ref().is_empty() {
                             continue;
                         }
-                        let mut delta: DirectoryDeltaV2 = deser(d.as_ref(), "delta")?;
+                        let mut delta: DirectoryDeltaV3 = deser(d.as_ref(), "delta")?;
                         scrub_delta(&mut delta, now);
                         dir.apply_delta(&parameters, &delta)
                             .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
                     }
                     UpdateData::StateAndDelta { state, delta } => {
-                        let mut incoming: DirectoryStateV2 =
+                        let mut incoming: DirectoryStateV3 =
                             deser(state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         dir.merge(&parameters, &incoming)
                             .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
                         if !delta.as_ref().is_empty() {
-                            let mut delta: DirectoryDeltaV2 = deser(delta.as_ref(), "delta")?;
+                            let mut delta: DirectoryDeltaV3 = deser(delta.as_ref(), "delta")?;
                             scrub_delta(&mut delta, now);
                             dir.apply_delta(&parameters, &delta)
                                 .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
@@ -486,7 +523,7 @@ mod contract {
             if bytes.is_empty() {
                 return Ok(StateSummary::from(vec![]));
             }
-            let dir: DirectoryStateV2 = deser(bytes, "state")?;
+            let dir: DirectoryStateV3 = deser(bytes, "state")?;
             Ok(StateSummary::from(ser(&dir.summarize())?))
         }
 
@@ -499,11 +536,11 @@ mod contract {
             if state.as_ref().is_empty() {
                 return Ok(StateDelta::from(vec![]));
             }
-            let dir: DirectoryStateV2 = deser(state.as_ref(), "state")?;
+            let dir: DirectoryStateV3 = deser(state.as_ref(), "state")?;
             // Zero-byte summary = "peer has nothing" (summarize of empty
             // state emits it); parsing it as CBOR would abort the sync.
-            let summary: DirectorySummaryV2 = if summary.as_ref().is_empty() {
-                DirectorySummaryV2::default()
+            let summary: DirectorySummaryV3 = if summary.as_ref().is_empty() {
+                DirectorySummaryV3::default()
             } else {
                 deser(summary.as_ref(), "summary")?
             };
@@ -524,7 +561,7 @@ mod tests {
     struct Author {
         sk: SigningKey,
         key: [u8; 32],
-        att: AttestationV1,
+        att: AttestationV2,
     }
 
     fn author(authority: &TestAuthority) -> Author {
@@ -532,7 +569,7 @@ mod tests {
         let vk = sk.verifying_key();
         Author {
             key: vk.to_bytes(),
-            att: authority.attest(&vk),
+            att: authority.attest(&sk),
             sk,
         }
     }
@@ -543,15 +580,15 @@ mod tests {
         (sk, key)
     }
 
-    fn params(authority: &TestAuthority) -> DirectoryParametersV2 {
-        DirectoryParametersV2 {
+    fn params(authority: &TestAuthority) -> DirectoryParametersV3 {
+        DirectoryParametersV3 {
             seed: DIRECTORY_SEED.into(),
             ghostkey_master: authority.master_vk,
         }
     }
 
-    fn listing(a: &Author, time: u64) -> AuthorizedListingV2 {
-        AuthorizedListingV2::new(
+    fn listing(a: &Author, time: u64) -> AuthorizedListingV3 {
+        AuthorizedListingV3::new(
             ListingV1 {
                 author: a.key,
                 last_active: time,
@@ -563,9 +600,9 @@ mod tests {
 
     /// Structurally valid, never verified — for cap/horizon tests where
     /// minting one real attestation per author would take minutes.
-    fn fake_listing(att: Option<&AttestationV1>, author: [u8; 32], time: u64) -> AuthorizedListingV2 {
+    fn fake_listing(att: Option<&AttestationV2>, author: [u8; 32], time: u64) -> AuthorizedListingV3 {
         let sk = SigningKey::from_bytes(&[9u8; 32]);
-        AuthorizedListingV2::new(
+        AuthorizedListingV3::new(
             ListingV1 {
                 author,
                 last_active: time,
@@ -586,7 +623,7 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         s.apply_delta(&p, &[listing(&a, 5)]).expect("apply ok");
         assert_eq!(s.listings.len(), 1);
         s.verify(&p).expect("verifies");
@@ -597,8 +634,8 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let (sk, key) = anon_author();
-        let mut s = DirectoryStateV2::default();
-        let l = AuthorizedListingV2::new(
+        let mut s = DirectoryStateV3::default();
+        let l = AuthorizedListingV3::new(
             ListingV1 {
                 author: key,
                 last_active: 5,
@@ -618,7 +655,7 @@ mod tests {
         let rogue = TestAuthority::new();
         let p = params(&authority);
         let a = author(&rogue); // attested under the wrong master
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         assert!(s.apply_delta(&p, &[listing(&a, 5)]).is_err());
     }
 
@@ -629,7 +666,7 @@ mod tests {
         let (_, key) = anon_author();
         let other = SigningKey::generate(&mut OsRng);
         // Claims another author's identity but signed by a different key.
-        let forged = AuthorizedListingV2::new(
+        let forged = AuthorizedListingV3::new(
             ListingV1 {
                 author: key,
                 last_active: 5,
@@ -637,7 +674,7 @@ mod tests {
             &other,
             None,
         );
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         assert!(s.apply_delta(&p, &[forged]).is_err());
     }
 
@@ -646,7 +683,7 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         s.apply_delta(&p, &[listing(&a, 5)]).unwrap();
         s.apply_delta(&p, &[listing(&a, 3)]).unwrap(); // stale: no-op
         assert_eq!(s.listings[&a.key].listing.last_active, 5);
@@ -657,7 +694,7 @@ mod tests {
 
     #[test]
     fn anon_share_capped() {
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         for i in 0..(ANON_LISTINGS as u64 + 20) {
             let key = key_of(i, 0);
             s.listings.insert(key, fake_listing(None, key, i));
@@ -673,7 +710,7 @@ mod tests {
     fn anon_never_evicts_attested() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         // 900 old attested + 250 newer anon: every attested survives, anon
         // squeezed into the remaining 100 slots.
         for i in 0..900u64 {
@@ -699,7 +736,7 @@ mod tests {
     fn attested_evicts_anon_at_cap() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         for i in 0..100u64 {
             let key = key_of(i, 2);
             s.listings.insert(key, fake_listing(None, key, i));
@@ -717,7 +754,7 @@ mod tests {
     fn attested_only_eviction_when_no_anon_left() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         for i in 0..(MAX_LISTINGS as u64 + 5) {
             let key = key_of(i, 1);
             s.listings.insert(key, fake_listing(Some(&a.att), key, i));
@@ -733,7 +770,7 @@ mod tests {
         let authority = TestAuthority::new();
         let a = author(&authority);
         // Receiver full of attested listings ⇒ anon tier Closed.
-        let mut receiver = DirectoryStateV2::default();
+        let mut receiver = DirectoryStateV3::default();
         for i in 0..MAX_LISTINGS as u64 {
             let key = key_of(i, 1);
             receiver.listings.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
@@ -742,7 +779,7 @@ mod tests {
         assert_eq!(summary.anon_horizon, TierHorizon::Closed);
 
         // Sender holds only anon listings ⇒ offers nothing.
-        let mut sender = DirectoryStateV2::default();
+        let mut sender = DirectoryStateV3::default();
         let key = key_of(0, 2);
         sender.listings.insert(key, fake_listing(None, key, 99_999));
         assert!(sender.delta(&summary).is_none());
@@ -751,7 +788,7 @@ mod tests {
     #[test]
     fn anon_horizon_prevents_reoffer_of_pruned_listings() {
         // Receiver's anon share full with newer entries.
-        let mut receiver = DirectoryStateV2::default();
+        let mut receiver = DirectoryStateV3::default();
         for i in 0..ANON_LISTINGS as u64 {
             let key = key_of(i, 2);
             receiver.listings.insert(key, fake_listing(None, key, 1000 + i));
@@ -760,7 +797,7 @@ mod tests {
         assert!(matches!(summary.anon_horizon, TierHorizon::OldestRetained(_)));
 
         // Sender holds one OLD anon listing the receiver would prune.
-        let mut sender = DirectoryStateV2::default();
+        let mut sender = DirectoryStateV3::default();
         let old_key = key_of(999, 3);
         sender.listings.insert(old_key, fake_listing(None, old_key, 1));
         assert!(
@@ -771,7 +808,7 @@ mod tests {
         // An attested listing is still offered (its tier is Open).
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut attested_sender = DirectoryStateV2::default();
+        let mut attested_sender = DirectoryStateV3::default();
         let akey = key_of(1, 4);
         attested_sender.listings.insert(akey, fake_listing(Some(&a.att), akey, 1));
         assert!(attested_sender.delta(&summary).is_some());
@@ -781,16 +818,16 @@ mod tests {
     fn oversized_delta_rejected() {
         let authority = TestAuthority::new();
         let p = params(&authority);
-        let delta: Vec<AuthorizedListingV2> = (0..(MAX_LISTINGS as u64 + 1))
+        let delta: Vec<AuthorizedListingV3> = (0..(MAX_LISTINGS as u64 + 1))
             .map(|i| fake_listing(None, key_of(i, 0), i))
             .collect();
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         assert!(s.apply_delta(&p, &delta).is_err());
     }
 
     #[test]
     fn scrub_future_removes_far_future_listings() {
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         let ok_key = [3u8; 32];
         let bad_key = [4u8; 32];
         s.listings.insert(ok_key, fake_listing(None, ok_key, 1_000));
@@ -801,35 +838,80 @@ mod tests {
         assert!(s.listings.contains_key(&ok_key));
     }
 
-    /// Attestation-stripping downgrade (PR #24 review): the signature covers
-    /// only `listing`, so anyone can re-wrap a victim's attested listing
-    /// with `attestation: None`. The attested bit in lww_key must make the
-    /// real listing win at equal time — in BOTH application orders.
+    /// Issue #45 directory substitution / stripping: the listing signature
+    /// covers the attestation slot, so re-wrapping a victim's signed listing
+    /// with `attestation: None` — or with a stranger's attestation — fails
+    /// `check` outright.
     #[test]
-    fn stripped_attestation_never_beats_attested_listing() {
+    fn attestation_substitution_and_stripping_rejected() {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
         let real = listing(&a, 5);
-        let stripped = AuthorizedListingV2 {
+
+        // Stripped copy: signature no longer matches the payload.
+        let stripped = AuthorizedListingV3 {
             listing: real.listing.clone(),
-            signature: real.signature, // valid: covers only `listing`
+            signature: real.signature,
             attestation: None,
         };
-        stripped.check(&authority.master_vk).expect("stripped copy still checks");
+        assert!(stripped.check(&authority.master_vk).is_err());
+        let mut s = DirectoryStateV3::default();
+        assert!(s.apply_delta(&p, &[stripped]).is_err());
 
-        let mut s1 = DirectoryStateV2::default();
-        s1.apply_delta(&p, &[real.clone()]).unwrap();
-        s1.apply_delta(&p, &[stripped.clone()]).unwrap();
-        assert!(s1.listings[&a.key].attestation.is_some(), "attested wins");
+        // Substituted copy: a stranger's attestation swapped in.
+        let stranger = author(&authority);
+        let substituted = AuthorizedListingV3 {
+            listing: real.listing.clone(),
+            signature: real.signature,
+            attestation: Some(stranger.att.clone()),
+        };
+        assert!(substituted.check(&authority.master_vk).is_err());
+        let mut s = DirectoryStateV3::default();
+        assert!(s.apply_delta(&p, &[substituted.clone()]).is_err());
 
-        let mut s2 = DirectoryStateV2::default();
-        s2.apply_delta(&p, &[stripped]).unwrap();
-        s2.apply_delta(&p, &[real]).unwrap();
-        assert!(s2.listings[&a.key].attestation.is_some(), "attested wins both orders");
+        // Full-state verify parity with the feed/inbox negative tests: a
+        // fabricated state carrying the substituted listing must not verify.
+        let mut fabricated = DirectoryStateV3::default();
+        fabricated.listings.insert(a.key, substituted);
+        assert!(fabricated.verify(&p).is_err());
+    }
+
+    /// Issue #45: an attestation minted over the author's key WITHOUT the
+    /// author's cooperation (pop by the attacker) fails the listing check.
+    #[test]
+    fn nonconsensual_attestation_rejected_in_directory() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let (sk, key) = anon_author();
+        let attacker_sk = SigningKey::generate(&mut OsRng);
+        let forced = authority.mint_v2(
+            TestAuthority::freebird_requestor(),
+            &AttestationV2::payload_for(&sk.verifying_key()),
+            &attacker_sk,
+        );
+        // Even if the AUTHOR's own key wraps it (the attacker can't, but be
+        // strict): the attestation itself must fail verification.
+        let l = AuthorizedListingV3::new(
+            ListingV1 { author: key, last_active: 5 },
+            &sk,
+            Some(forced),
+        );
+        assert!(l.check(&authority.master_vk).is_err());
+        let mut s = DirectoryStateV3::default();
+        assert!(s.apply_delta(&p, &[l]).is_err());
+    }
+
+    /// Wire-format KAT (issue #47) for the listing signing payload.
+    #[test]
+    fn listing_signing_payload_kat() {
+        let l = ListingV1 {
+            author: [0xAB; 32],
+            last_active: 0x0102030405060708,
+        };
         assert_eq!(
-            freebird_core::to_cbor(&s1).unwrap(),
-            freebird_core::to_cbor(&s2).unwrap()
+            data_encoding::HEXLOWER.encode(&listing_signing_payload(&l, None)),
+            "66726565626972642d6c697374696e672d7633abababababababababababababababababababababababababababababababab080706050403020100"
         );
     }
 
@@ -842,7 +924,7 @@ mod tests {
         let p = params(&authority);
         let a = author(&authority);
         let anon_l = |t| {
-            AuthorizedListingV2::new(
+            AuthorizedListingV3::new(
                 ListingV1 {
                     author: a.key,
                     last_active: t,
@@ -851,7 +933,7 @@ mod tests {
                 None,
             )
         };
-        let mut s = DirectoryStateV2::default();
+        let mut s = DirectoryStateV3::default();
         s.apply_delta(&p, &[anon_l(5)]).unwrap();
         s.apply_delta(&p, &[listing(&a, 5)]).unwrap(); // equal time: attested wins
         assert!(s.listings[&a.key].attestation.is_some());
@@ -867,7 +949,7 @@ mod tests {
     fn shrunken_anon_horizon_and_held_author_bypass() {
         let authority = TestAuthority::new();
         let a = author(&authority);
-        let mut receiver = DirectoryStateV2::default();
+        let mut receiver = DirectoryStateV3::default();
         for i in 0..900u64 {
             let key = key_of(i, 1);
             receiver.listings.insert(key, fake_listing(Some(&a.att), key, i));
@@ -886,7 +968,7 @@ mod tests {
         );
 
         // NEW anon author below the horizon: not offered.
-        let mut old_sender = DirectoryStateV2::default();
+        let mut old_sender = DirectoryStateV3::default();
         let new_key = key_of(999, 3);
         old_sender.listings.insert(new_key, fake_listing(None, new_key, 1));
         assert!(old_sender.delta(&summary).is_none());
@@ -894,7 +976,7 @@ mod tests {
         // HELD anon author, newer copy whose order key TIES the horizon
         // exception path: offered despite the horizon (in-place LWW).
         let held_key = key_of(0, 2);
-        let mut upgrader = DirectoryStateV2::default();
+        let mut upgrader = DirectoryStateV3::default();
         upgrader.listings.insert(held_key, fake_listing(None, held_key, 5000));
         assert!(upgrader.delta(&summary).is_some());
     }
@@ -905,6 +987,7 @@ mod tests {
     fn legacy_decode_and_check() {
         let authority = TestAuthority::new();
         let a = author(&authority);
+        let att_v1 = authority.attest_v1(&a.sk.verifying_key());
         let l = legacy::LegacyAuthorizedListing {
             listing: ListingV1 {
                 author: a.key,
@@ -919,7 +1002,7 @@ mod tests {
                 .unwrap();
                 a.sk.sign(&bytes)
             },
-            attestation: a.att.clone(),
+            attestation: att_v1,
         };
         let mut state = legacy::LegacyDirectoryState::default();
         state.listings.insert(a.key, l.clone());

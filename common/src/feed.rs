@@ -52,7 +52,7 @@ impl FeedStateV1 {
 }
 
 mod components {
-    use crate::attestation::AttestationV1;
+    use crate::attestation::AttestationV2;
     use crate::types::{
         AuthorizedFollows, AuthorizedPost, AuthorizedProfile, PostId,
     };
@@ -205,12 +205,12 @@ mod components {
     /// attestation beats none; two different valid attestations tie-break by
     /// max content hash so all peers converge on the same one.
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-    pub struct AttestationSlot(pub Option<AttestationV1>);
+    pub struct AttestationSlot(pub Option<AttestationV2>);
 
     impl ComposableState for AttestationSlot {
         type ParentState = FeedStateV1;
         type Summary = Option<[u8; 32]>;
-        type Delta = AttestationV1;
+        type Delta = AttestationV2;
         type Parameters = FeedParametersV1;
 
         fn verify(
@@ -623,8 +623,8 @@ mod tests {
         let (sk, vk) = author();
         let authority = TestAuthority::new();
         let p = params(vk, authority.master_vk);
-        let att_a = authority.attest(&vk);
-        let att_b = authority.attest(&vk);
+        let att_a = authority.attest(&sk);
+        let att_b = authority.attest(&sk);
 
         let mut s1 = base_state(&sk);
         let mut s2 = base_state(&sk);
@@ -652,10 +652,10 @@ mod tests {
     #[test]
     fn attestation_for_wrong_author_rejected() {
         let (sk, vk) = author();
-        let (_, other_vk) = author();
+        let (other_sk, _) = author();
         let authority = TestAuthority::new();
         let p = params(vk, authority.master_vk);
-        let att = authority.attest(&other_vk);
+        let att = authority.attest(&other_sk);
         let mut s = base_state(&sk);
         let clone = s.clone();
         assert!(s
@@ -670,6 +670,46 @@ mod tests {
                 }),
             )
             .is_err());
+    }
+
+    /// Issue #45 "forced checkmark": a stranger minting an attestation over
+    /// a deliberately anonymous author's posting key (pop signed by the
+    /// stranger, not the author) must be rejected — `None` stays `None`.
+    #[test]
+    fn forced_checkmark_without_consent_rejected() {
+        use crate::attestation::AttestationV2;
+        let (sk, vk) = author();
+        let (stranger_sk, _) = author();
+        let authority = TestAuthority::new();
+        let p = params(vk, authority.master_vk);
+        let forced = authority.mint_v2(
+            TestAuthority::freebird_requestor(),
+            &AttestationV2::payload_for(&vk),
+            &stranger_sk,
+        );
+        let mut s = base_state(&sk);
+        let clone = s.clone();
+        assert!(s
+            .apply_delta(
+                &clone,
+                &p,
+                &Some(FeedStateV1Delta {
+                    profile: None,
+                    follows: None,
+                    attestation: Some(forced),
+                    posts: None,
+                }),
+            )
+            .is_err());
+        assert!(s.attestation.0.is_none(), "author stays anonymous");
+        // And a fabricated full state carrying it must not verify.
+        let mut fabricated = base_state(&sk);
+        fabricated.attestation = AttestationSlot(Some(authority.mint_v2(
+            TestAuthority::freebird_requestor(),
+            &AttestationV2::payload_for(&vk),
+            &stranger_sk,
+        )));
+        assert!(fabricated.verify(&fabricated.clone(), &p).is_err());
     }
 
     #[test]
