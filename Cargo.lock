@@ -1302,6 +1302,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ciborium",
+ "data-encoding",
  "ed25519-dalek",
  "freebird-core",
  "freenet-stdlib",
@@ -2168,6 +2169,7 @@ dependencies = [
  "blake3",
  "bs58",
  "ciborium",
+ "data-encoding",
  "ed25519-dalek",
  "freebird-core",
  "freenet-scaffold",

@@ -1,6 +1,8 @@
-//! Per-author reply inbox, v2 (issue #23): anonymous-parity slot policy.
+//! Per-author reply inbox, v3 (issues #45/#46/#47; v2 was issue #23):
+//! anonymous-parity slot policy, instance-bound domain-tagged pointers,
+//! proof-of-possession attestations.
 //!
-//! V2 state types live HERE, not in freebird-core: that crate is byte-frozen
+//! V3 state types live HERE, not in freebird-core: that crate is byte-frozen
 //! (any edit rotates every deployed contract's derived address — the
 //! 2026-08-10 avatar incident), and the v1 types it holds keep decoding the
 //! legacy inboxes during the dual-read migration window. The UI depends on
@@ -15,7 +17,7 @@ mod contract {
     use freenet_stdlib::prelude::*;
 
     use freebird_core::feed::MAX_FUTURE_MS;
-    use crate::state::{InboxParametersV2, InboxStateV2, InboxStateV2Delta, InboxStateV2Summary};
+    use crate::state::{InboxParametersV3, InboxStateV3, InboxStateV3Delta, InboxStateV3Summary};
 
     fn now_ms() -> u64 {
         freenet_stdlib::time::now().timestamp_millis().max(0) as u64
@@ -33,7 +35,7 @@ mod contract {
 
     /// Drop far-future pointers from an incoming delta before the merge — a
     /// poisoned timestamp must never get the chance to outlive honest ones.
-    fn scrub_delta(delta: &mut InboxStateV2Delta, now: u64) {
+    fn scrub_delta(delta: &mut InboxStateV3Delta, now: u64) {
         if let Some(pointers) = &mut delta.pointers {
             pointers.retain(|p| p.ptr.time <= now.saturating_add(MAX_FUTURE_MS));
         }
@@ -53,8 +55,8 @@ mod contract {
             if bytes.is_empty() {
                 return Ok(ValidateResult::Valid);
             }
-            let inbox: InboxStateV2 = deser(bytes, "state")?;
-            let parameters: InboxParametersV2 = deser(parameters.as_ref(), "parameters")?;
+            let inbox: InboxStateV3 = deser(bytes, "state")?;
+            let parameters: InboxParametersV3 = deser(parameters.as_ref(), "parameters")?;
 
             let mut scrubbed = inbox.clone();
             scrubbed.scrub_future(now_ms());
@@ -73,9 +75,9 @@ mod contract {
             state: State<'static>,
             data: Vec<UpdateData<'static>>,
         ) -> Result<UpdateModification<'static>, ContractError> {
-            let parameters: InboxParametersV2 = deser(parameters.as_ref(), "parameters")?;
-            let mut inbox: InboxStateV2 = if state.as_ref().is_empty() {
-                InboxStateV2::default()
+            let parameters: InboxParametersV3 = deser(parameters.as_ref(), "parameters")?;
+            let mut inbox: InboxStateV3 = if state.as_ref().is_empty() {
+                InboxStateV3::default()
             } else {
                 deser(state.as_ref(), "state")?
             };
@@ -85,7 +87,7 @@ mod contract {
             for update in data {
                 match update {
                     UpdateData::State(new_state) => {
-                        let mut incoming: InboxStateV2 = deser(new_state.as_ref(), "incoming state")?;
+                        let mut incoming: InboxStateV3 = deser(new_state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         inbox
                             .merge(&inbox.clone(), &parameters, &incoming)
@@ -95,20 +97,20 @@ mod contract {
                         if d.as_ref().is_empty() {
                             continue;
                         }
-                        let mut delta: InboxStateV2Delta = deser(d.as_ref(), "delta")?;
+                        let mut delta: InboxStateV3Delta = deser(d.as_ref(), "delta")?;
                         scrub_delta(&mut delta, now);
                         inbox
                             .apply_delta(&inbox.clone(), &parameters, &Some(delta))
                             .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
                     }
                     UpdateData::StateAndDelta { state, delta } => {
-                        let mut incoming: InboxStateV2 = deser(state.as_ref(), "incoming state")?;
+                        let mut incoming: InboxStateV3 = deser(state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         inbox
                             .merge(&inbox.clone(), &parameters, &incoming)
                             .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
                         if !delta.as_ref().is_empty() {
-                            let mut delta: InboxStateV2Delta = deser(delta.as_ref(), "delta")?;
+                            let mut delta: InboxStateV3Delta = deser(delta.as_ref(), "delta")?;
                             scrub_delta(&mut delta, now);
                             inbox
                                 .apply_delta(&inbox.clone(), &parameters, &Some(delta))
@@ -132,8 +134,8 @@ mod contract {
             if bytes.is_empty() {
                 return Ok(StateSummary::from(vec![]));
             }
-            let parameters: InboxParametersV2 = deser(parameters.as_ref(), "parameters")?;
-            let inbox: InboxStateV2 = deser(bytes, "state")?;
+            let parameters: InboxParametersV3 = deser(parameters.as_ref(), "parameters")?;
+            let inbox: InboxStateV3 = deser(bytes, "state")?;
             let summary = inbox.summarize(&inbox, &parameters);
             Ok(StateSummary::from(ser(&summary)?))
         }
@@ -146,12 +148,12 @@ mod contract {
             if state.as_ref().is_empty() {
                 return Ok(StateDelta::from(vec![]));
             }
-            let parameters: InboxParametersV2 = deser(parameters.as_ref(), "parameters")?;
-            let inbox: InboxStateV2 = deser(state.as_ref(), "state")?;
+            let parameters: InboxParametersV3 = deser(parameters.as_ref(), "parameters")?;
+            let inbox: InboxStateV3 = deser(state.as_ref(), "state")?;
             // Zero-byte summary = "peer has nothing" (summarize of empty
             // state emits it); parsing it as CBOR would abort the sync.
-            let summary: InboxStateV2Summary = if summary.as_ref().is_empty() {
-                let empty = InboxStateV2::default();
+            let summary: InboxStateV3Summary = if summary.as_ref().is_empty() {
+                let empty = InboxStateV3::default();
                 empty.summarize(&empty, &parameters)
             } else {
                 deser(summary.as_ref(), "summary")?

@@ -2,16 +2,16 @@
 //! and the api layer; every action signs locally with the posting key.
 
 use dioxus::prelude::*;
-use directory_contract::{AuthorizedListingV2, ListingV1};
+use directory_contract::{AuthorizedListingV3, ListingV1};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use freebird_core::attestation::AttestationV1;
+use freebird_core::attestation::AttestationV2;
 use freebird_core::delegate_api::FreebirdDelegateRequest;
 use freebird_core::feed::{AttestationSlot, FeedStateV1, FeedStateV1Delta, PostsV1};
 use freebird_core::types::{
     AuthorizedFollows, AuthorizedProfile, FollowsV1, PostId, PostRef, ProfileV1,
 };
 use inbox_contract::state::{
-    AuthorizedReplyPointerV2, InboxStateV2Delta, ReplierCredV2, ReplyPointerV2,
+    AuthorizedReplyPointerV3, InboxStateV3Delta, ReplierCredV3, ReplyPointerV3,
 };
 
 use crate::api;
@@ -183,26 +183,28 @@ pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Resu
 /// picks the slot tier (attested = uncrowdable, None = anonymous share).
 async fn send_inbox_pointer(
     sk: &SigningKey,
-    attestation: Option<AttestationV1>,
+    attestation: Option<AttestationV2>,
     target_author: [u8; 32],
     target_post: PostId,
     reply_post: PostId,
     time: u64,
 ) -> Result<(), String> {
     let replier = sk.verifying_key().to_bytes();
-    let cred = ReplierCredV2 {
+    let cred = ReplierCredV3 {
         posting_key: sk.verifying_key(),
         attestation,
     };
-    let ptr = ReplyPointerV2 {
+    let ptr = ReplyPointerV3 {
+        // v3 (issue #46): pointers are bound to their inbox instance.
+        owner: target_author,
         replier,
         fingerprint: cred.fingerprint(),
         target_post,
         reply_post,
         time,
     };
-    let authorized = AuthorizedReplyPointerV2::new(ptr, sk);
-    let delta = InboxStateV2Delta {
+    let authorized = AuthorizedReplyPointerV3::new(ptr, sk);
+    let delta = InboxStateV3Delta {
         creds: Some([(replier, cred)].into_iter().collect()),
         pointers: Some(vec![authorized]),
     };
@@ -315,7 +317,7 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
             author: sk.verifying_key().to_bytes(),
             last_active: keys::now_ms(),
         };
-        let authorized = AuthorizedListingV2::new(listing, &sk, att);
+        let authorized = AuthorizedListingV3::new(listing, &sk, att);
         api::put_directory_listing(&authorized).await?;
         // Optimistic local apply so Discover shows us immediately.
         if let Some(dir) = DIRECTORY.write().as_mut() {
@@ -359,7 +361,7 @@ pub async fn request_verification() -> Result<(), String> {
     let sk = signing_key()?;
     *GHOSTKEY_SIGN_RESULT.write() = None;
     api::ghostkey_request(GhostkeyRequest::SignWithDefault {
-        message: AttestationV1::payload_for(&sk.verifying_key()),
+        message: AttestationV2::payload_for(&sk.verifying_key()),
     })
     .await
 }
@@ -371,8 +373,10 @@ pub async fn complete_verification(
     certificate_pem: String,
 ) -> Result<String, String> {
     let sk = signing_key()?;
+    // The posting key counter-signs the ghost signature (issue #45): proof
+    // of possession, without which the network rejects the attestation.
     let attestation =
-        ghostkey::attestation_from_sign_result(scoped_payload, signature, &certificate_pem)?;
+        ghostkey::attestation_from_sign_result(scoped_payload, signature, &certificate_pem, &sk)?;
     // Verify locally against the real master key before publishing, so a
     // wrong-key vault answer surfaces as an error here, not a rejected update.
     let tier = attestation.verify(&sk.verifying_key(), None)?;

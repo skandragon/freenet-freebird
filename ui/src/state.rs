@@ -7,7 +7,7 @@ use ed25519_dalek::SigningKey;
 use freebird_core::feed::FeedStateV1;
 use freebird_core::inbox::InboxStateV1;
 use freenet_stdlib::client_api::WebApi;
-use inbox_contract::state::InboxStateV2;
+use inbox_contract::state::InboxStateV3;
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub enum SyncStatus {
@@ -28,7 +28,7 @@ pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
     Signal::global(BTreeMap::new);
 
 /// Inbox (v2) states by owner key.
-pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV2>> =
+pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV3>> =
     Signal::global(BTreeMap::new);
 
 /// LEGACY (v1) inbox states by owner key — dual-read migration window
@@ -49,7 +49,7 @@ pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar
     Signal::global(BTreeMap::new);
 
 /// The public author directory, v2 (issue #11). None = not fetched yet.
-pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV2>> =
+pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV3>> =
     Signal::global(|| None);
 
 /// The LEGACY (v1) directory — dual-read migration window (issue #23).

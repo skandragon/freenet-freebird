@@ -1,4 +1,8 @@
-//! Inbox v2 (issue #23): two-tier reply inbox with anonymous parity.
+//! Inbox v3 (issues #45/#46/#47, formerly v2 / issue #23): two-tier reply
+//! inbox with anonymous parity. V3 binds every pointer to its inbox instance
+//! (owner in the signed bytes — cross-inbox replay dies), signs pointers
+//! over a domain-tagged manual canonical layout instead of bare CBOR, and
+//! carries v2 attestations (proof of possession + requestor binding).
 //!
 //! V1 (in `freebird-core::inbox`, byte-frozen with the rest of that crate)
 //! used the Ghost Key attestation as the write gate: no checkmark, no
@@ -22,7 +26,7 @@
 
 use freenet_scaffold::ComposableState;
 
-pub use inbox_v2_components::*;
+pub use inbox_v3_components::*;
 
 pub const MAX_POINTERS: usize = 300;
 /// Slots anonymous pointers may occupy at most (attested writers may use all
@@ -58,30 +62,30 @@ pub fn is_anon_fingerprint(fp: &str) -> bool {
 /// `#[composable]`: the cred delta must be gated on the pointer delta, and
 /// the macro gives each component only its own summary slice.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct InboxStateV2 {
-    pub creds: CredsV2,
-    pub pointers: PointersV2,
+pub struct InboxStateV3 {
+    pub creds: CredsV3,
+    pub pointers: PointersV3,
 }
 
 /// Same shape the `#[composable]` macro generated.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
-pub struct InboxStateV2Summary {
-    pub creds: <CredsV2 as ComposableState>::Summary,
-    pub pointers: <PointersV2 as ComposableState>::Summary,
+pub struct InboxStateV3Summary {
+    pub creds: <CredsV3 as ComposableState>::Summary,
+    pub pointers: <PointersV3 as ComposableState>::Summary,
 }
 
 /// Same shape the `#[composable]` macro generated.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
-pub struct InboxStateV2Delta {
-    pub creds: Option<<CredsV2 as ComposableState>::Delta>,
-    pub pointers: Option<<PointersV2 as ComposableState>::Delta>,
+pub struct InboxStateV3Delta {
+    pub creds: Option<<CredsV3 as ComposableState>::Delta>,
+    pub pointers: Option<<PointersV3 as ComposableState>::Delta>,
 }
 
-impl ComposableState for InboxStateV2 {
-    type ParentState = InboxStateV2;
-    type Summary = InboxStateV2Summary;
-    type Delta = InboxStateV2Delta;
-    type Parameters = InboxParametersV2;
+impl ComposableState for InboxStateV3 {
+    type ParentState = InboxStateV3;
+    type Summary = InboxStateV3Summary;
+    type Delta = InboxStateV3Delta;
+    type Parameters = InboxParametersV3;
 
     fn verify(
         &self,
@@ -98,7 +102,7 @@ impl ComposableState for InboxStateV2 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Self::Summary {
-        InboxStateV2Summary {
+        InboxStateV3Summary {
             creds: self.creds.summarize(parent_state, parameters),
             pointers: self.pointers.summarize(parent_state, parameters),
         }
@@ -134,7 +138,7 @@ impl ComposableState for InboxStateV2 {
             })
             .filter(|c| !c.is_empty());
         (creds.is_some() || pointers.is_some())
-            .then_some(InboxStateV2Delta { creds, pointers })
+            .then_some(InboxStateV3Delta { creds, pointers })
     }
 
     fn apply_delta(
@@ -162,6 +166,11 @@ impl ComposableState for InboxStateV2 {
                 let mut stapled = std::collections::BTreeSet::new();
                 if let Some(ps) = &delta.pointers {
                     for ptr in ps {
+                        // Wrong-inbox staples fail here, BEFORE any RSA is
+                        // paid (issue #46) — same doctrine as bad signatures.
+                        if ptr.ptr.owner != parameters.owner.to_bytes() {
+                            return Err("pointer bound to another inbox".into());
+                        }
                         if let Some(cred) = c.get(&ptr.ptr.replier) {
                             ptr.verify_signature(&cred.posting_key)?;
                             stapled.insert(ptr.ptr.replier);
@@ -189,7 +198,7 @@ impl ComposableState for InboxStateV2 {
     }
 }
 
-impl InboxStateV2 {
+impl InboxStateV3 {
     /// Idempotent: enforce caps and drop credentials no pointer references.
     ///
     /// Also drops pointers whose fingerprint no longer matches their
@@ -199,7 +208,7 @@ impl InboxStateV2 {
     /// "stale pointers gone".
     pub fn post_apply_cleanup(
         &mut self,
-        _parameters: &InboxParametersV2,
+        _parameters: &InboxParametersV3,
     ) -> Result<(), String> {
         let creds = &self.creds.creds;
         self.pointers.pointers.retain(|p| {
@@ -226,23 +235,23 @@ impl InboxStateV2 {
     }
 }
 
-mod inbox_v2_components {
+mod inbox_v3_components {
     use ed25519_dalek::{Signature, VerifyingKey};
-    use freebird_core::attestation::AttestationV1;
+    use freebird_core::attestation::AttestationV2;
     use freebird_core::types::PostId;
     use freenet_scaffold::ComposableState;
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        anon_fingerprint, is_anon_fingerprint, InboxStateV2, ANON_POINTER_SLOTS,
+        anon_fingerprint, is_anon_fingerprint, InboxStateV3, ANON_POINTER_SLOTS,
         MAX_PER_ANON_KEY, MAX_PER_FINGERPRINT, MAX_POINTERS,
     };
 
     /// CBOR-identical shape to the v1 params (owner + trust anchor); a
     /// distinct type because the two schemas must never be conflated in code.
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-    pub struct InboxParametersV2 {
+    pub struct InboxParametersV3 {
         /// The inbox owner's posting key — only used to derive the address.
         pub owner: VerifyingKey,
         /// Ghost Key trust anchor; see `FeedParametersV1::ghostkey_master`.
@@ -251,12 +260,12 @@ mod inbox_v2_components {
 
     /// A replier's credential. `attestation: None` = anonymous tier.
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-    pub struct ReplierCredV2 {
+    pub struct ReplierCredV3 {
         pub posting_key: VerifyingKey,
-        pub attestation: Option<AttestationV1>,
+        pub attestation: Option<AttestationV2>,
     }
 
-    impl ReplierCredV2 {
+    impl ReplierCredV3 {
         fn check(&self, map_key: &[u8; 32], master: &VerifyingKey) -> Result<(), String> {
             if self.posting_key.as_bytes() != map_key {
                 return Err("credential stored under wrong posting key".into());
@@ -289,17 +298,17 @@ mod inbox_v2_components {
     // ---- creds: map keyed by posting key; LWW per entry by content hash ----
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-    pub struct CredsV2 {
-        pub creds: BTreeMap<[u8; 32], ReplierCredV2>,
+    pub struct CredsV3 {
+        pub creds: BTreeMap<[u8; 32], ReplierCredV3>,
     }
 
-    impl ComposableState for CredsV2 {
-        type ParentState = InboxStateV2;
+    impl ComposableState for CredsV3 {
+        type ParentState = InboxStateV3;
         /// posting key → cred content hash: peers holding DIFFERENT creds
         /// for one key must look different, or they never reconcile.
         type Summary = BTreeMap<[u8; 32], [u8; 32]>;
-        type Delta = BTreeMap<[u8; 32], ReplierCredV2>;
-        type Parameters = InboxParametersV2;
+        type Delta = BTreeMap<[u8; 32], ReplierCredV3>;
+        type Parameters = InboxParametersV3;
 
         fn verify(
             &self,
@@ -342,7 +351,7 @@ mod inbox_v2_components {
             _parameters: &Self::Parameters,
             old_summary: &Self::Summary,
         ) -> Option<Self::Delta> {
-            let delta: BTreeMap<[u8; 32], ReplierCredV2> = self
+            let delta: BTreeMap<[u8; 32], ReplierCredV3> = self
                 .creds
                 .iter()
                 .filter(|(k, c)| {
@@ -384,8 +393,17 @@ mod inbox_v2_components {
 
     // ---- pointers: capped log, tiered caps and eviction ----
 
+    /// Domain tag for pointer signatures (issue #47); the version suffix
+    /// doubles as the inbox-generation discriminator.
+    pub const INBOX_PTR_SIGN_DOMAIN: &[u8] = b"freebird-inbox-ptr-v3";
+
     #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-    pub struct ReplyPointerV2 {
+    pub struct ReplyPointerV3 {
+        /// The INBOX OWNER's posting key bytes (issue #46): part of the
+        /// signed payload and checked against `parameters.owner`, so a
+        /// pointer signed for one inbox is invalid in every other. Also what
+        /// makes the v3 pointer CBOR-distinct from v2.
+        pub owner: [u8; 32],
         /// The replier's posting key; must resolve in `creds`.
         pub replier: [u8; 32],
         /// Fairness-cap group: the credential's fingerprint (ghost key
@@ -399,27 +417,44 @@ mod inbox_v2_components {
         pub time: u64,
     }
 
+    impl ReplyPointerV3 {
+        /// The exact bytes the replier signs (issue #47): domain tag +
+        /// canonical field layout, never bare CBOR.
+        pub fn signing_payload(&self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(
+                INBOX_PTR_SIGN_DOMAIN.len() + 32 + 32 + 4 + self.fingerprint.len() + 16 + 16 + 8,
+            );
+            out.extend_from_slice(INBOX_PTR_SIGN_DOMAIN);
+            out.extend_from_slice(&self.owner);
+            out.extend_from_slice(&self.replier);
+            out.extend_from_slice(&(self.fingerprint.len() as u32).to_le_bytes());
+            out.extend_from_slice(self.fingerprint.as_bytes());
+            out.extend_from_slice(&self.target_post.0);
+            out.extend_from_slice(&self.reply_post.0);
+            out.extend_from_slice(&self.time.to_le_bytes());
+            out
+        }
+    }
+
     /// Pointer + signature by the replier's POSTING key.
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-    pub struct AuthorizedReplyPointerV2 {
-        pub ptr: ReplyPointerV2,
+    pub struct AuthorizedReplyPointerV3 {
+        pub ptr: ReplyPointerV3,
         pub signature: Signature,
     }
 
-    impl AuthorizedReplyPointerV2 {
-        pub fn new(ptr: ReplyPointerV2, signing_key: &ed25519_dalek::SigningKey) -> Self {
+    impl AuthorizedReplyPointerV3 {
+        pub fn new(ptr: ReplyPointerV3, signing_key: &ed25519_dalek::SigningKey) -> Self {
             use ed25519_dalek::Signer;
-            let bytes = freebird_core::to_cbor(&ptr).expect("pointer serializes");
             Self {
-                signature: signing_key.sign(&bytes),
+                signature: signing_key.sign(&ptr.signing_payload()),
                 ptr,
             }
         }
 
         pub fn verify_signature(&self, posting_key: &VerifyingKey) -> Result<(), String> {
-            let bytes = freebird_core::to_cbor(&self.ptr)?;
             posting_key
-                .verify_strict(&bytes, &self.signature)
+                .verify_strict(&self.ptr.signing_payload(), &self.signature)
                 .map_err(|e| format!("pointer signature invalid: {e}"))
         }
 
@@ -430,7 +465,7 @@ mod inbox_v2_components {
 
     pub type PointerOrderKey = (u64, PostId);
 
-    fn order_key(p: &AuthorizedReplyPointerV2) -> PointerOrderKey {
+    fn order_key(p: &AuthorizedReplyPointerV3) -> PointerOrderKey {
         (p.ptr.time, p.ptr.reply_post)
     }
 
@@ -443,15 +478,21 @@ mod inbox_v2_components {
     }
 
     /// Check a pointer against the credential map of the (in-progress)
-    /// state. A missing cred OR a fingerprint mismatch drops the pointer
-    /// rather than failing the delta: the mismatch happens honestly when a
-    /// posting key's cred upgrades anon→attested while old pointers are
-    /// still circulating, and an honest peer's delta must never be
-    /// poison-pilled by it. Only a bad signature is fatal.
+    /// state and its inbox binding (issue #46). A missing cred OR a
+    /// fingerprint mismatch drops the pointer rather than failing the delta:
+    /// the mismatch happens honestly when a posting key's cred upgrades
+    /// anon→attested while old pointers are still circulating, and an honest
+    /// peer's delta must never be poison-pilled by it. A bad signature or a
+    /// pointer bound to ANOTHER inbox is fatal — no honest peer ever holds
+    /// one.
     fn check_pointer(
-        p: &AuthorizedReplyPointerV2,
-        creds: &BTreeMap<[u8; 32], ReplierCredV2>,
+        p: &AuthorizedReplyPointerV3,
+        creds: &BTreeMap<[u8; 32], ReplierCredV3>,
+        parameters: &InboxParametersV3,
     ) -> Result<bool, String> {
+        if p.ptr.owner != parameters.owner.to_bytes() {
+            return Err("pointer bound to another inbox".into());
+        }
         let Some(cred) = creds.get(&p.ptr.replier) else {
             return Ok(false);
         };
@@ -484,7 +525,7 @@ mod inbox_v2_components {
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-    pub struct PointersV2Summary {
+    pub struct PointersV3Summary {
         pub ids: BTreeSet<PostId>,
         pub attested_horizon: TierHorizon,
         pub anon_horizon: TierHorizon,
@@ -495,12 +536,12 @@ mod inbox_v2_components {
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
-    pub struct PointersV2 {
+    pub struct PointersV3 {
         /// Sorted ascending by `(time, reply_post)`.
-        pub pointers: Vec<AuthorizedReplyPointerV2>,
+        pub pointers: Vec<AuthorizedReplyPointerV3>,
     }
 
-    impl PointersV2 {
+    impl PointersV3 {
         /// Sort, dedupe, then enforce the tiered caps. Idempotent, and a pure
         /// function of the pointer SET — merge order cannot change the
         /// outcome.
@@ -609,16 +650,16 @@ mod inbox_v2_components {
         }
     }
 
-    impl ComposableState for PointersV2 {
-        type ParentState = InboxStateV2;
-        type Summary = PointersV2Summary;
-        type Delta = Vec<AuthorizedReplyPointerV2>;
-        type Parameters = InboxParametersV2;
+    impl ComposableState for PointersV3 {
+        type ParentState = InboxStateV3;
+        type Summary = PointersV3Summary;
+        type Delta = Vec<AuthorizedReplyPointerV3>;
+        type Parameters = InboxParametersV3;
 
         fn verify(
             &self,
             parent: &Self::ParentState,
-            _parameters: &Self::Parameters,
+            parameters: &Self::Parameters,
         ) -> Result<(), String> {
             if self.pointers.len() > MAX_POINTERS {
                 return Err(format!("more than {MAX_POINTERS} pointers"));
@@ -648,7 +689,7 @@ mod inbox_v2_components {
             }
             let mut seen = BTreeSet::new();
             for p in &self.pointers {
-                if !check_pointer(p, &parent.creds.creds)? {
+                if !check_pointer(p, &parent.creds.creds, parameters)? {
                     return Err("pointer without matching credential".into());
                 }
                 if !seen.insert(p.ptr.reply_post) {
@@ -664,7 +705,7 @@ mod inbox_v2_components {
             _parameters: &Self::Parameters,
         ) -> Self::Summary {
             let (attested_horizon, anon_horizon) = self.tier_horizons();
-            PointersV2Summary {
+            PointersV3Summary {
                 ids: self.pointers.iter().map(|p| p.ptr.reply_post).collect(),
                 attested_horizon,
                 anon_horizon,
@@ -678,7 +719,7 @@ mod inbox_v2_components {
             _parameters: &Self::Parameters,
             old_summary: &Self::Summary,
         ) -> Option<Self::Delta> {
-            let retained = |p: &AuthorizedReplyPointerV2| {
+            let retained = |p: &AuthorizedReplyPointerV3| {
                 let tier = if p.is_anon() {
                     &old_summary.anon_horizon
                 } else {
@@ -690,7 +731,7 @@ mod inbox_v2_components {
                 };
                 tier.admits(order_key(p)) && above_fp
             };
-            let delta: Vec<AuthorizedReplyPointerV2> = self
+            let delta: Vec<AuthorizedReplyPointerV3> = self
                 .pointers
                 .iter()
                 .filter(|p| !old_summary.ids.contains(&p.ptr.reply_post))
@@ -703,16 +744,16 @@ mod inbox_v2_components {
         fn apply_delta(
             &mut self,
             parent: &Self::ParentState,
-            _parameters: &Self::Parameters,
+            parameters: &Self::Parameters,
             delta: &Option<Self::Delta>,
         ) -> Result<(), String> {
             let Some(delta) = delta else { return Ok(()) };
             // parent here is the in-progress state: the macro applies creds
             // first (field order), so a self-contained delta's creds are
             // visible. Pointers with no credential are dropped, not fatal.
-            let mut accepted: Vec<AuthorizedReplyPointerV2> = Vec::new();
+            let mut accepted: Vec<AuthorizedReplyPointerV3> = Vec::new();
             for p in delta {
-                if check_pointer(p, &parent.creds.creds)? {
+                if check_pointer(p, &parent.creds.creds, parameters)? {
                     accepted.push(p.clone());
                 }
             }
@@ -735,17 +776,17 @@ mod tests {
 
     struct Replier {
         sk: SigningKey,
-        cred: ReplierCredV2,
+        cred: ReplierCredV3,
         key: [u8; 32],
     }
 
     fn attested_replier(authority: &TestAuthority) -> Replier {
         let sk = SigningKey::generate(&mut OsRng);
         let vk = sk.verifying_key();
-        let attestation = authority.attest(&vk);
+        let attestation = authority.attest(&sk);
         Replier {
             key: vk.to_bytes(),
-            cred: ReplierCredV2 {
+            cred: ReplierCredV3 {
                 posting_key: vk,
                 attestation: Some(attestation),
             },
@@ -758,7 +799,7 @@ mod tests {
         let vk = sk.verifying_key();
         Replier {
             key: vk.to_bytes(),
-            cred: ReplierCredV2 {
+            cred: ReplierCredV3 {
                 posting_key: vk,
                 attestation: None,
             },
@@ -766,39 +807,45 @@ mod tests {
         }
     }
 
-    fn params(authority: &TestAuthority) -> InboxParametersV2 {
-        InboxParametersV2 {
+    fn params(authority: &TestAuthority) -> InboxParametersV3 {
+        InboxParametersV3 {
             owner: SigningKey::generate(&mut OsRng).verifying_key(),
             ghostkey_master: authority.master_vk,
         }
     }
 
-    fn pointer(r: &Replier, time: u64, tag: u64) -> AuthorizedReplyPointerV2 {
-        let ptr = ReplyPointerV2 {
+    fn pointer_for(
+        r: &Replier,
+        p: &InboxParametersV3,
+        time: u64,
+        tag: u64,
+    ) -> AuthorizedReplyPointerV3 {
+        let ptr = ReplyPointerV3 {
+            owner: p.owner.to_bytes(),
             replier: r.key,
             fingerprint: r.cred.fingerprint(),
             target_post: PostId([1u8; 16]),
             reply_post: PostId::compute(&r.sk.verifying_key(), time, &format!("r{tag}"), &None),
             time,
         };
-        AuthorizedReplyPointerV2::new(ptr, &r.sk)
+        AuthorizedReplyPointerV3::new(ptr, &r.sk)
     }
 
     fn delta_of(
         creds: Vec<&Replier>,
-        pointers: Vec<AuthorizedReplyPointerV2>,
-    ) -> Option<InboxStateV2Delta> {
-        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCredV2> = creds
+        pointers: Vec<AuthorizedReplyPointerV3>,
+    ) -> Option<InboxStateV3Delta> {
+        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCredV3> = creds
             .into_iter()
             .map(|r| (r.key, r.cred.clone()))
             .collect();
-        Some(InboxStateV2Delta {
+        Some(InboxStateV3Delta {
             creds: (!creds_map.is_empty()).then_some(creds_map),
             pointers: (!pointers.is_empty()).then_some(pointers),
         })
     }
 
-    fn apply(state: &mut InboxStateV2, p: &InboxParametersV2, delta: Option<InboxStateV2Delta>) {
+    fn apply(state: &mut InboxStateV3, p: &InboxParametersV3, delta: Option<InboxStateV3Delta>) {
         let clone = state.clone();
         state.apply_delta(&clone, p, &delta).expect("apply ok");
     }
@@ -810,8 +857,8 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let r = anon_replier();
-        let mut s = InboxStateV2::default();
-        apply(&mut s, &p, delta_of(vec![&r], vec![pointer(&r, 5, 0)]));
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
         assert_eq!(s.pointers.pointers.len(), 1);
         assert!(is_anon_fingerprint(&s.pointers.pointers[0].ptr.fingerprint));
         s.verify(&s.clone(), &p).expect("verifies");
@@ -822,8 +869,8 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let r = attested_replier(&authority);
-        let mut s = InboxStateV2::default();
-        apply(&mut s, &p, delta_of(vec![&r], vec![pointer(&r, 5, 0)]));
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
         assert_eq!(s.pointers.pointers.len(), 1);
         s.verify(&s.clone(), &p).expect("verifies");
     }
@@ -833,8 +880,8 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let r = anon_replier();
-        let mut s = InboxStateV2::default();
-        apply(&mut s, &p, delta_of(vec![], vec![pointer(&r, 5, 0)]));
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]));
         assert!(s.pointers.pointers.is_empty());
     }
 
@@ -844,10 +891,10 @@ mod tests {
         let rogue_authority = TestAuthority::new();
         let p = params(&authority);
         let r = attested_replier(&rogue_authority); // wrong master
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         let clone = s.clone();
         assert!(s
-            .apply_delta(&clone, &p, &delta_of(vec![&r], vec![pointer(&r, 5, 0)]))
+            .apply_delta(&clone, &p, &delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]))
             .is_err());
     }
 
@@ -857,16 +904,140 @@ mod tests {
         let p = params(&authority);
         let r = anon_replier();
         let other = anon_replier();
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         // Pointer claims r's identity but is signed by other's key.
-        let mut fake = pointer(&other, 5, 0);
+        let mut fake = pointer_for(&other, &p, 5, 0);
         fake.ptr.replier = r.key;
         fake.ptr.fingerprint = r.cred.fingerprint();
-        let fake = AuthorizedReplyPointerV2::new(fake.ptr, &other.sk);
+        let fake = AuthorizedReplyPointerV3::new(fake.ptr, &other.sk);
         let clone = s.clone();
         assert!(s
             .apply_delta(&clone, &p, &delta_of(vec![&r], vec![fake]))
             .is_err());
+    }
+
+    /// Issue #46: a pointer signed for inbox A must fail validation in
+    /// inbox B — cross-inbox replay is dead.
+    #[test]
+    fn cross_inbox_replay_rejected() {
+        let authority = TestAuthority::new();
+        let pa = params(&authority);
+        let pb = params(&authority); // different random owner
+        assert_ne!(pa.owner, pb.owner);
+        let r = anon_replier();
+        let harvested = pointer_for(&r, &pa, 5, 0);
+
+        // Replayed verbatim into inbox B: fatal at apply.
+        let mut b = InboxStateV3::default();
+        let clone = b.clone();
+        let err = b
+            .apply_delta(&clone, &pb, &delta_of(vec![&r], vec![harvested.clone()]))
+            .expect_err("replay must fail");
+        assert!(err.contains("another inbox"), "{err}");
+
+        // A fabricated full state carrying it must not verify either.
+        let mut fabricated = InboxStateV3::default();
+        fabricated.creds.creds.insert(r.key, r.cred.clone());
+        fabricated.pointers.pointers.push(harvested.clone());
+        assert!(fabricated.verify(&fabricated.clone(), &pb).is_err());
+
+        // Rewriting the owner field breaks the signature instead.
+        let mut rewritten = harvested;
+        rewritten.ptr.owner = pb.owner.to_bytes();
+        let mut b = InboxStateV3::default();
+        let clone = b.clone();
+        assert!(b
+            .apply_delta(&clone, &pb, &delta_of(vec![&r], vec![rewritten]))
+            .is_err());
+    }
+
+    /// Issue #46: the v3 pointer wire type is CBOR-distinct from v2.
+    #[test]
+    fn v3_pointer_cbor_distinct_from_v2() {
+        // The exact v2 wire shape (no `owner`), as the retired v2 contract
+        // serialized it.
+        #[derive(serde::Serialize)]
+        struct ReplyPointerV2Wire {
+            replier: [u8; 32],
+            fingerprint: String,
+            target_post: PostId,
+            reply_post: PostId,
+            time: u64,
+        }
+        let v2 = freebird_core::to_cbor(&ReplyPointerV2Wire {
+            replier: [9u8; 32],
+            fingerprint: "gk".into(),
+            target_post: PostId([1u8; 16]),
+            reply_post: PostId([2u8; 16]),
+            time: 5,
+        })
+        .unwrap();
+        assert!(
+            freebird_core::from_cbor::<ReplyPointerV3>(&v2).is_err(),
+            "a v2 pointer must not decode as v3"
+        );
+    }
+
+    /// Wire-format KAT (issue #47) for the pointer signing payload.
+    #[test]
+    fn pointer_signing_payload_kat() {
+        let ptr = ReplyPointerV3 {
+            owner: [0xAAu8; 32],
+            replier: [0xBBu8; 32],
+            fingerprint: "fp".into(),
+            target_post: PostId([0x11; 16]),
+            reply_post: PostId([0x22; 16]),
+            time: 0x0102030405060708,
+        };
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&ptr.signing_payload()),
+            "66726565626972642d696e626f782d7074722d7633aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02000000667011111111111111111111111111111111222222222222222222222222222222220807060504030201"
+        );
+    }
+
+    /// Issue #45 "cred-slot seizure": an attacker minting an attestation
+    /// over the victim's posting key WITHOUT the victim's cooperation must
+    /// not be able to seize the victim's cred slot (the attested cred would
+    /// out-rank the victim's anon cred in the LWW and orphan every honest
+    /// pointer).
+    #[test]
+    fn cred_slot_seizure_without_consent_rejected() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let victim = anon_replier();
+        let attacker_sk = SigningKey::generate(&mut OsRng);
+
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&victim], vec![pointer_for(&victim, &p, 5, 0)]));
+        s.verify(&s.clone(), &p).expect("honest state valid");
+
+        // Attacker's forged cred: attestation over the victim's key, pop by
+        // the attacker.
+        let forged = ReplierCredV3 {
+            posting_key: victim.sk.verifying_key(),
+            attestation: Some(authority.mint_v2(
+                TestAuthority::freebird_requestor(),
+                &freebird_core::attestation::AttestationV2::payload_for(
+                    &victim.sk.verifying_key(),
+                ),
+                &attacker_sk,
+            )),
+        };
+        let clone = s.clone();
+        assert!(s
+            .apply_delta(
+                &clone,
+                &p,
+                &Some(InboxStateV3Delta {
+                    creds: Some([(victim.key, forged)].into_iter().collect()),
+                    pointers: None,
+                }),
+            )
+            .is_err());
+        // The victim's anon cred and pointer are untouched.
+        assert!(s.creds.creds[&victim.key].attestation.is_none());
+        assert_eq!(s.pointers.pointers.len(), 1);
+        s.verify(&s.clone(), &p).expect("still valid");
     }
 
     /// An anonymous key must not be able to claim an attested-style
@@ -878,15 +1049,15 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let r = anon_replier();
-        let mut forged = pointer(&r, 5, 0);
+        let mut forged = pointer_for(&r, &p, 5, 0);
         forged.ptr.fingerprint = "NotMyHash".into(); // unprefixed = attested tier
-        let forged = AuthorizedReplyPointerV2::new(forged.ptr, &r.sk);
-        let mut s = InboxStateV2::default();
+        let forged = AuthorizedReplyPointerV3::new(forged.ptr, &r.sk);
+        let mut s = InboxStateV3::default();
         apply(&mut s, &p, delta_of(vec![&r], vec![forged.clone()]));
         assert!(s.pointers.pointers.is_empty(), "forged-tier pointer dropped");
 
         // A full state holding a mismatched fingerprint must not verify.
-        let mut fabricated = InboxStateV2::default();
+        let mut fabricated = InboxStateV3::default();
         fabricated.creds.creds.insert(r.key, r.cred.clone());
         fabricated.pointers.pointers.push(forged);
         assert!(fabricated.verify(&fabricated.clone(), &p).is_err());
@@ -901,12 +1072,12 @@ mod tests {
         let r1 = attested_replier(&authority);
         let r2 = attested_replier(&authority);
 
-        let mut s = InboxStateV2::default();
-        apply(&mut s, &p, delta_of(vec![&r1], vec![pointer(&r1, 5, 0)]));
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r1], vec![pointer_for(&r1, &p, 5, 0)]));
         s.verify(&s.clone(), &p).expect("valid after first reply");
 
         apply(&mut s, &p, delta_of(vec![&r2], vec![]));
-        apply(&mut s, &p, delta_of(vec![&r2], vec![pointer(&r2, 6, 1)]));
+        apply(&mut s, &p, delta_of(vec![&r2], vec![pointer_for(&r2, &p, 6, 1)]));
 
         s.verify(&s.clone(), &p)
             .expect("old pointers must still verify after another cred arrives");
@@ -923,20 +1094,20 @@ mod tests {
         let p = params(&authority);
         let anon = anon_replier();
         let attested = Replier {
-            cred: ReplierCredV2 {
+            cred: ReplierCredV3 {
                 posting_key: anon.sk.verifying_key(),
-                attestation: Some(authority.attest(&anon.sk.verifying_key())),
+                attestation: Some(authority.attest(&anon.sk)),
             },
             sk: SigningKey::from_bytes(&anon.sk.to_bytes()),
             key: anon.key,
         };
 
-        let mut s = InboxStateV2::default();
-        apply(&mut s, &p, delta_of(vec![&anon], vec![pointer(&anon, 5, 0)]));
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]));
         apply(
             &mut s,
             &p,
-            delta_of(vec![&attested], vec![pointer(&attested, 6, 1)]),
+            delta_of(vec![&attested], vec![pointer_for(&attested, &p, 6, 1)]),
         );
         assert!(s.creds.creds[&anon.key].attestation.is_some());
         // The anon-fingerprint pointer is orphaned by the upgrade; the
@@ -954,9 +1125,9 @@ mod tests {
         let spammer = anon_replier();
         let honest = anon_replier();
 
-        let mut s = InboxStateV2::default();
-        apply(&mut s, &p, delta_of(vec![&honest], vec![pointer(&honest, 1, 0)]));
-        let flood: Vec<_> = (0..20).map(|i| pointer(&spammer, 100 + i, i)).collect();
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&honest], vec![pointer_for(&honest, &p, 1, 0)]));
+        let flood: Vec<_> = (0..20).map(|i| pointer_for(&spammer, &p, 100 + i, i)).collect();
         apply(&mut s, &p, delta_of(vec![&spammer], flood));
 
         let spam_count = s
@@ -980,7 +1151,7 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let r = anon_replier();
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         apply(&mut s, &p, delta_of(vec![&r], vec![]));
         assert!(s.creds.creds.is_empty());
     }
@@ -993,7 +1164,7 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let r = anon_replier();
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         s.creds.creds.insert(r.key, r.cred.clone());
         assert!(s.verify(&s.clone(), &p).is_err());
     }
@@ -1008,11 +1179,11 @@ mod tests {
 
         // Attacker: one legitimate cred+pointer plus 5 orphan creds.
         let legit = anon_replier();
-        let mut attacker = InboxStateV2::default();
+        let mut attacker = InboxStateV3::default();
         apply(
             &mut attacker,
             &p,
-            delta_of(vec![&legit], vec![pointer(&legit, 5, 0)]),
+            delta_of(vec![&legit], vec![pointer_for(&legit, &p, 5, 0)]),
         );
         for _ in 0..5 {
             let r = anon_replier();
@@ -1024,7 +1195,7 @@ mod tests {
         );
 
         // Round 1: only the referenced cred and its pointer are offered.
-        let mut receiver = InboxStateV2::default();
+        let mut receiver = InboxStateV3::default();
         let rs = receiver.summarize(&receiver.clone(), &p);
         let d = attacker.delta(&attacker.clone(), &p, &rs).expect("offers");
         assert_eq!(d.creds.as_ref().map(|c| c.len()), Some(1), "orphans withheld");
@@ -1041,7 +1212,7 @@ mod tests {
         apply(
             &mut receiver,
             &p,
-            Some(InboxStateV2Delta {
+            Some(InboxStateV3Delta {
                 creds: Some(attacker.creds.creds.clone()),
                 pointers: None,
             }),
@@ -1061,9 +1232,9 @@ mod tests {
         // Invalid attestation under p's master: cred.check would error at
         // the RSA stage if it ever ran.
         let r = attested_replier(&rogue);
-        let mut staple = pointer(&r, 5, 0);
+        let mut staple = pointer_for(&r, &p, 5, 0);
         staple.signature = Signature::from_bytes(&[0u8; 64]);
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         let clone = s.clone();
         let err = s
             .apply_delta(&clone, &p, &delta_of(vec![&r], vec![staple]))
@@ -1086,13 +1257,13 @@ mod tests {
 
         // Receiver: anon share at cap (ANON_POINTER_SLOTS), all newer than
         // the sender's pointer.
-        let mut receiver = InboxStateV2::default();
+        let mut receiver = InboxStateV3::default();
         let mut seated = 0;
         while seated < ANON_POINTER_SLOTS {
             let r = anon_replier();
             let n = MAX_PER_ANON_KEY.min(ANON_POINTER_SLOTS - seated);
             let ptrs: Vec<_> = (0..n)
-                .map(|i| pointer(&r, 1000 + (seated + i) as u64, (seated + i) as u64))
+                .map(|i| pointer_for(&r, &p, 1000 + (seated + i) as u64, (seated + i) as u64))
                 .collect();
             apply(&mut receiver, &p, delta_of(vec![&r], ptrs));
             seated += n;
@@ -1101,8 +1272,8 @@ mod tests {
 
         // Sender: one honest cred+pointer, older than everything retained.
         let old = anon_replier();
-        let mut sender = InboxStateV2::default();
-        apply(&mut sender, &p, delta_of(vec![&old], vec![pointer(&old, 5, 0)]));
+        let mut sender = InboxStateV3::default();
+        apply(&mut sender, &p, delta_of(vec![&old], vec![pointer_for(&old, &p, 5, 0)]));
         sender.verify(&sender.clone(), &p).expect("sender valid");
 
         // The pointer is below the horizon, so the cred must be withheld
@@ -1126,13 +1297,13 @@ mod tests {
             key[1] = (i / 256) as u8;
             creds_map.insert(key, r.cred.clone());
         }
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         let clone = s.clone();
         assert!(s
             .apply_delta(
                 &clone,
                 &p,
-                &Some(InboxStateV2Delta {
+                &Some(InboxStateV3Delta {
                     creds: Some(creds_map),
                     pointers: None,
                 }),
@@ -1146,12 +1317,13 @@ mod tests {
     // as directory-contract's fake_listing) — minting hundreds of real RSA
     // attestation chains would take minutes.
 
-    fn fake(fingerprint: &str, time: u64, tag: u64) -> AuthorizedReplyPointerV2 {
+    fn fake(fingerprint: &str, time: u64, tag: u64) -> AuthorizedReplyPointerV3 {
         let mut reply = [0u8; 16];
         reply[..8].copy_from_slice(&time.to_be_bytes());
         reply[8..].copy_from_slice(&tag.to_be_bytes());
-        AuthorizedReplyPointerV2 {
-            ptr: ReplyPointerV2 {
+        AuthorizedReplyPointerV3 {
+            ptr: ReplyPointerV3 {
+                owner: [0u8; 32],
                 replier: [9u8; 32],
                 fingerprint: fingerprint.into(),
                 target_post: PostId([1u8; 16]),
@@ -1170,13 +1342,13 @@ mod tests {
         format!("gk{i}")
     }
 
-    fn pointers_of(v: Vec<AuthorizedReplyPointerV2>) -> PointersV2 {
-        let mut p = PointersV2 { pointers: v };
+    fn pointers_of(v: Vec<AuthorizedReplyPointerV3>) -> PointersV3 {
+        let mut p = PointersV3 { pointers: v };
         p.canonicalize();
         p
     }
 
-    fn count_anon(p: &PointersV2) -> usize {
+    fn count_anon(p: &PointersV3) -> usize {
         p.pointers
             .iter()
             .filter(|x| is_anon_fingerprint(&x.ptr.fingerprint))
@@ -1223,24 +1395,24 @@ mod tests {
         assert!(p.pointers.iter().all(|x| x.ptr.time >= 10), "oldest attested dropped");
     }
 
-    fn summarize_pointers(p: &PointersV2) -> PointersV2Summary {
-        let parent = InboxStateV2 {
+    fn summarize_pointers(p: &PointersV3) -> PointersV3Summary {
+        let parent = InboxStateV3 {
             creds: Default::default(),
             pointers: p.clone(),
         };
-        let params = InboxParametersV2 {
+        let params = InboxParametersV3 {
             owner: SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
             ghostkey_master: SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
         };
         p.summarize(&parent, &params)
     }
 
-    fn delta_against(p: &PointersV2, summary: &PointersV2Summary) -> Option<Vec<AuthorizedReplyPointerV2>> {
-        let parent = InboxStateV2 {
+    fn delta_against(p: &PointersV3, summary: &PointersV3Summary) -> Option<Vec<AuthorizedReplyPointerV3>> {
+        let parent = InboxStateV3 {
             creds: Default::default(),
             pointers: p.clone(),
         };
-        let params = InboxParametersV2 {
+        let params = InboxParametersV3 {
             owner: SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
             ghostkey_master: SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
         };
@@ -1287,18 +1459,18 @@ mod tests {
         let p = params(&authority);
         let spammer = anon_replier();
 
-        let mut sender = InboxStateV2::default();
+        let mut sender = InboxStateV3::default();
         apply(
             &mut sender,
             &p,
             delta_of(
                 vec![&spammer],
                 (0..MAX_PER_ANON_KEY as u64 + 5)
-                    .map(|i| pointer(&spammer, 100 + i, i))
+                    .map(|i| pointer_for(&spammer, &p, 100 + i, i))
                     .collect(),
             ),
         );
-        let mut receiver = InboxStateV2::default();
+        let mut receiver = InboxStateV3::default();
         let clone = receiver.clone();
         receiver.merge(&clone, &p, &sender).expect("first merge ok");
 
@@ -1325,7 +1497,7 @@ mod tests {
 
             let pointers: Vec<_> = times.iter().enumerate().map(|(i, t)| {
                 let r = match i % 3 { 0 => &r1, 1 => &r2, _ => &r3 };
-                pointer(r, *t, i as u64)
+                pointer_for(r, &p, *t, i as u64)
             }).collect();
             let mut order2 = pointers.clone();
             let n = order2.len();
@@ -1334,7 +1506,7 @@ mod tests {
                 order2.swap(i, j);
             }
 
-            let mut s1 = InboxStateV2::default();
+            let mut s1 = InboxStateV3::default();
             apply(&mut s1, &p, delta_of(vec![&r1, &r2, &r3], vec![]));
             let mut s2 = s1.clone();
 
@@ -1350,7 +1522,7 @@ mod tests {
         /// cleanup(cleanup(s)) == cleanup(s), mixed tiers.
         #[test]
         fn cleanup_idempotent(times in proptest::collection::vec(0u64..100, 0..40)) {
-            let mut pointers = PointersV2 {
+            let mut pointers = PointersV3 {
                 pointers: times.iter().enumerate().map(|(i, t)| {
                     let fp = if i % 2 == 0 { anon_fp((i % 6) as u64) } else { gk_fp((i % 4) as u64) };
                     fake(&fp, *t, i as u64)
@@ -1385,12 +1557,12 @@ mod tests {
                 order2.swap(i, j);
             }
 
-            let mut s1 = PointersV2::default();
+            let mut s1 = PointersV3::default();
             for chunk in pointers.chunks(7) {
                 s1.pointers.extend(chunk.iter().cloned());
                 s1.canonicalize();
             }
-            let mut s2 = PointersV2::default();
+            let mut s2 = PointersV3::default();
             for chunk in order2.chunks(11) {
                 s2.pointers.extend(chunk.iter().cloned());
                 s2.canonicalize();
@@ -1406,9 +1578,9 @@ mod tests {
     // pointers were evicted by the share cap gets pruned by cleanup.
     #[test]
     fn verify_rejects_over_anon_share() {
-        let s = InboxStateV2 {
+        let s = InboxStateV3 {
             creds: Default::default(),
-            pointers: PointersV2 {
+            pointers: PointersV3 {
                 pointers: {
                     let mut v: Vec<_> =
                         (0..101).map(|i| fake(&anon_fp(i), i, i)).collect();
@@ -1417,7 +1589,7 @@ mod tests {
                 },
             },
         };
-        let params = InboxParametersV2 {
+        let params = InboxParametersV3 {
             owner: SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
             ghostkey_master: SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
         };
@@ -1434,8 +1606,9 @@ mod tests {
         let p = params(&authority);
         let r = anon_replier();
         let mk = |time: u64, reply: PostId| {
-            AuthorizedReplyPointerV2::new(
-                ReplyPointerV2 {
+            AuthorizedReplyPointerV3::new(
+                ReplyPointerV3 {
+                    owner: p.owner.to_bytes(),
                     replier: r.key,
                     fingerprint: r.cred.fingerprint(),
                     target_post: PostId([1u8; 16]),
@@ -1447,7 +1620,7 @@ mod tests {
         };
         let dup = PostId([7u8; 16]);
         let other = PostId([8u8; 16]);
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         // (t=50, other) sorts BETWEEN the two dup entries.
         apply(
             &mut s,
@@ -1475,22 +1648,22 @@ mod tests {
     /// heal it on the NEXT update.
     #[test]
     fn verify_rejects_over_per_fingerprint_cap() {
-        let params = InboxParametersV2 {
+        let params = InboxParametersV3 {
             owner: SigningKey::from_bytes(&[1u8; 32]).verifying_key(),
             ghostkey_master: SigningKey::from_bytes(&[2u8; 32]).verifying_key(),
         };
-        let over_anon = InboxStateV2 {
+        let over_anon = InboxStateV3 {
             creds: Default::default(),
-            pointers: PointersV2 {
+            pointers: PointersV3 {
                 pointers: (0..MAX_PER_ANON_KEY as u64 + 1)
                     .map(|i| fake(&anon_fp(0), i, i))
                     .collect(),
             },
         };
         assert!(over_anon.pointers.verify(&over_anon, &params).is_err());
-        let over_gk = InboxStateV2 {
+        let over_gk = InboxStateV3 {
             creds: Default::default(),
-            pointers: PointersV2 {
+            pointers: PointersV3 {
                 pointers: (0..MAX_PER_FINGERPRINT as u64 + 1)
                     .map(|i| fake(&gk_fp(0), i, i))
                     .collect(),
@@ -1550,13 +1723,13 @@ mod tests {
         let r = anon_replier();
         let now = 1_000;
         let boundary = now + freebird_core::feed::MAX_FUTURE_MS;
-        let mut s = InboxStateV2::default();
+        let mut s = InboxStateV3::default();
         apply(
             &mut s,
             &p,
             delta_of(
                 vec![&r],
-                vec![pointer(&r, boundary, 0), pointer(&r, boundary + 1, 1)],
+                vec![pointer_for(&r, &p, boundary, 0), pointer_for(&r, &p, boundary + 1, 1)],
             ),
         );
         assert_eq!(s.pointers.pointers.len(), 2);
@@ -1576,21 +1749,21 @@ mod tests {
         let p = params(&authority);
         let anon = anon_replier();
         let attested = Replier {
-            cred: ReplierCredV2 {
+            cred: ReplierCredV3 {
                 posting_key: anon.sk.verifying_key(),
-                attestation: Some(authority.attest(&anon.sk.verifying_key())),
+                attestation: Some(authority.attest(&anon.sk)),
             },
             sk: SigningKey::from_bytes(&anon.sk.to_bytes()),
             key: anon.key,
         };
-        let anon_delta = delta_of(vec![&anon], vec![pointer(&anon, 5, 0)]);
-        let att_delta = delta_of(vec![&attested], vec![pointer(&attested, 6, 1)]);
+        let anon_delta = delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]);
+        let att_delta = delta_of(vec![&attested], vec![pointer_for(&attested, &p, 6, 1)]);
 
-        let mut a = InboxStateV2::default();
+        let mut a = InboxStateV3::default();
         apply(&mut a, &p, anon_delta.clone());
         apply(&mut a, &p, att_delta.clone());
 
-        let mut b = InboxStateV2::default();
+        let mut b = InboxStateV3::default();
         apply(&mut b, &p, att_delta);
         apply(&mut b, &p, anon_delta);
 
@@ -1611,22 +1784,22 @@ mod tests {
         let p = params(&authority);
         let anon = anon_replier();
         let attested = Replier {
-            cred: ReplierCredV2 {
+            cred: ReplierCredV3 {
                 posting_key: anon.sk.verifying_key(),
-                attestation: Some(authority.attest(&anon.sk.verifying_key())),
+                attestation: Some(authority.attest(&anon.sk)),
             },
             sk: SigningKey::from_bytes(&anon.sk.to_bytes()),
             key: anon.key,
         };
 
         // Sender: pre-upgrade anon state. Receiver: post-upgrade state.
-        let mut sender = InboxStateV2::default();
-        apply(&mut sender, &p, delta_of(vec![&anon], vec![pointer(&anon, 5, 0)]));
-        let mut receiver = InboxStateV2::default();
+        let mut sender = InboxStateV3::default();
+        apply(&mut sender, &p, delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]));
+        let mut receiver = InboxStateV3::default();
         apply(
             &mut receiver,
             &p,
-            delta_of(vec![&attested], vec![pointer(&attested, 6, 1)]),
+            delta_of(vec![&attested], vec![pointer_for(&attested, &p, 6, 1)]),
         );
 
         // Full exchange both ways.

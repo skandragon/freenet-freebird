@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_AVATAR_BYTES: usize = 64 * 1024;
 
+pub const AVATAR_SIGN_DOMAIN: &[u8] = b"freebird-avatar-v1";
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct AvatarParametersV1 {
     /// The author's posting key; determines the contract address, so the UI
@@ -24,7 +26,22 @@ pub struct AvatarV1 {
     pub time: u64,
 }
 
-/// An avatar plus the author's signature over `to_cbor(avatar)`.
+impl AvatarV1 {
+    /// The exact bytes the author signs (issue #47): domain tag + canonical
+    /// layout; the blob is hashed so the signed message stays small.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            AVATAR_SIGN_DOMAIN.len() + 8 + 4 + self.content_type.len() + 32,
+        );
+        out.extend_from_slice(AVATAR_SIGN_DOMAIN);
+        out.extend_from_slice(&self.time.to_le_bytes());
+        crate::types::put_bytes(&mut out, self.content_type.as_bytes());
+        out.extend_from_slice(blake3::hash(&self.data).as_bytes());
+        out
+    }
+}
+
+/// An avatar plus the author's signature over `avatar.signing_payload()`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct AuthorizedAvatar {
     pub avatar: AvatarV1,
@@ -34,15 +51,13 @@ pub struct AuthorizedAvatar {
 impl AuthorizedAvatar {
     pub fn new(avatar: AvatarV1, signing_key: &ed25519_dalek::SigningKey) -> Self {
         use ed25519_dalek::Signer;
-        let bytes = crate::to_cbor(&avatar).expect("avatar serializes");
-        let signature = signing_key.sign(&bytes);
+        let signature = signing_key.sign(&avatar.signing_payload());
         Self { avatar, signature }
     }
 
     pub fn verify_signature(&self, author: &VerifyingKey) -> Result<(), String> {
-        let bytes = crate::to_cbor(&self.avatar)?;
         author
-            .verify_strict(&bytes, &self.signature)
+            .verify_strict(&self.avatar.signing_payload(), &self.signature)
             .map_err(|e| format!("avatar signature invalid: {e}"))
     }
 }
@@ -138,6 +153,21 @@ mod tests {
         assert!(check_avatar(&a, &sk.verifying_key()).is_err());
         let gif = make(&sk, 10, b"GIF89a-rest".to_vec(), "image/gif");
         assert!(check_avatar(&gif, &sk.verifying_key()).is_err());
+    }
+
+    /// Wire-format KAT (issue #47): reordering a signed field fails here
+    /// before it silently invalidates network signatures.
+    #[test]
+    fn avatar_signing_payload_kat() {
+        let a = AvatarV1 {
+            content_type: "image/png".into(),
+            data: vec![0xAA; 4],
+            time: 0x0102030405060708,
+        };
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&a.signing_payload()),
+            "66726565626972642d6176617461722d7631080706050403020109000000696d6167652f706e675060d74e3a0aa7d386d56902daa27555df84c242068855e97a563d5ca05b0691"
+        );
     }
 
     #[test]

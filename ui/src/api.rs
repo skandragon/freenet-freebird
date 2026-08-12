@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 
 use dioxus::prelude::*;
-use directory_contract::{AuthorizedListingV2, DirectoryStateV2};
+use directory_contract::{AuthorizedListingV3, DirectoryStateV3};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::{FeedParametersV1, FeedStateV1, FeedStateV1Delta};
 use freebird_core::inbox::{InboxStateV1, InboxStateV1Delta};
-use inbox_contract::state::{InboxStateV2, InboxStateV2Delta};
+use inbox_contract::state::{InboxStateV3, InboxStateV3Delta};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse};
 #[cfg(target_arch = "wasm32")]
@@ -176,7 +176,7 @@ pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Res
 /// contract's merge makes a re-Put over an existing inbox a no-op — safe to
 /// call on every resume (the owner-republish half of the #23 migration).
 pub async fn ensure_own_inbox(author: &VerifyingKey) -> Result<(), String> {
-    let inbox_state = freebird_core::to_cbor(&InboxStateV2::default())?;
+    let inbox_state = freebird_core::to_cbor(&InboxStateV3::default())?;
     track(keys::inbox_key(author), TrackedKind::Inbox(author.to_bytes()));
     send(ClientRequest::ContractOp(ContractRequest::Put {
         contract: inbox_container(author),
@@ -331,12 +331,12 @@ pub async fn update_own_feed(delta: FeedStateV1Delta) -> Result<(), String> {
 /// would silently vanish behind a success message. Put creates the inbox on
 /// first write (same pattern as the directory and avatars), and the
 /// contract's merge turns a Put over an existing inbox into a plain apply.
-pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV2Delta) -> Result<(), String> {
+pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV3Delta) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&target_author).map_err(|e| e.to_string())?;
     // Materialize the delta as a self-contained state (cred + pointer): the
     // same verification the contract runs, so a bad delta fails HERE with a
     // real message instead of as a rejected update.
-    let mut state = InboxStateV2::default();
+    let mut state = InboxStateV3::default();
     let clone = state.clone();
     state
         .apply_delta(&clone, &keys::inbox_params(&vk), &Some(delta))
@@ -391,8 +391,8 @@ pub async fn fetch_control() -> Result<(), String> {
 /// PUT our directory listing. Put creates the directory on the very first
 /// listing network-wide and the contract's per-author LWW merge handles
 /// every later one (same pattern as avatars).
-pub async fn put_directory_listing(listing: &AuthorizedListingV2) -> Result<(), String> {
-    let mut state = DirectoryStateV2::default();
+pub async fn put_directory_listing(listing: &AuthorizedListingV3) -> Result<(), String> {
+    let mut state = DirectoryStateV3::default();
     state.listings.insert(listing.listing.author, listing.clone());
     let bytes = freebird_core::to_cbor(&state)?;
     track(keys::directory_key(), TrackedKind::Directory);
@@ -801,9 +801,9 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
         TrackedKind::Directory => {
             let params = keys::directory_params();
             let mut dir = DIRECTORY.write();
-            let entry = dir.get_or_insert_with(DirectoryStateV2::default);
+            let entry = dir.get_or_insert_with(DirectoryStateV3::default);
             if is_full_state {
-                match freebird_core::from_cbor::<DirectoryStateV2>(bytes) {
+                match freebird_core::from_cbor::<DirectoryStateV3>(bytes) {
                     Ok(incoming) => {
                         if let Err(e) = entry.merge(&params, &incoming) {
                             log(&format!("directory merge rejected: {e}"));
@@ -812,7 +812,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                     Err(e) => log(&format!("bad directory state: {e}")),
                 }
             } else {
-                match freebird_core::from_cbor::<directory_contract::DirectoryDeltaV2>(bytes) {
+                match freebird_core::from_cbor::<directory_contract::DirectoryDeltaV3>(bytes) {
                     Ok(delta) => {
                         if let Err(e) = entry.apply_delta(&params, &delta) {
                             log(&format!("directory delta rejected: {e}"));
@@ -930,7 +930,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             let mut inboxes = INBOXES.write();
             let entry = inboxes.entry(author).or_default();
             if is_full_state {
-                match freebird_core::from_cbor::<InboxStateV2>(bytes) {
+                match freebird_core::from_cbor::<InboxStateV3>(bytes) {
                     Ok(incoming) => {
                         let clone = entry.clone();
                         if let Err(e) = entry.merge(&clone, &params, &incoming) {
@@ -940,7 +940,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                     Err(e) => log(&format!("bad inbox state: {e}")),
                 }
             } else {
-                match freebird_core::from_cbor::<InboxStateV2Delta>(bytes) {
+                match freebird_core::from_cbor::<InboxStateV3Delta>(bytes) {
                     Ok(delta) => {
                         let clone = entry.clone();
                         if let Err(e) = entry.apply_delta(&clone, &params, &Some(delta)) {

@@ -1,11 +1,11 @@
 //! Key material and contract-address derivation.
 
-use directory_contract::{DirectoryParametersV2, DIRECTORY_SEED};
+use directory_contract::{DirectoryParametersV3, DIRECTORY_SEED};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::avatar::AvatarParametersV1;
 use freebird_core::feed::{FeedParametersV1, MAX_FUTURE_MS};
 use freebird_core::inbox::InboxParametersV1;
-use inbox_contract::state::InboxParametersV2;
+use inbox_contract::state::InboxParametersV3;
 use freebird_core::types::{AuthorizedPost, PostId, PostV1};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use ghostkey_lib::armorable::Armorable;
@@ -55,8 +55,8 @@ pub fn feed_params(author: &VerifyingKey) -> FeedParametersV1 {
     }
 }
 
-pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV2 {
-    InboxParametersV2 {
+pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV3 {
+    InboxParametersV3 {
         owner: *owner,
         ghostkey_master: master_key(),
     }
@@ -76,8 +76,8 @@ pub fn avatar_params(author: &VerifyingKey) -> AvatarParametersV1 {
 
 /// The public directory (issue #11): no author key in the params, so every
 /// client derives the SAME address — one instance for the whole network.
-pub fn directory_params() -> DirectoryParametersV2 {
-    DirectoryParametersV2 {
+pub fn directory_params() -> DirectoryParametersV3 {
+    DirectoryParametersV3 {
         seed: DIRECTORY_SEED.into(),
         ghostkey_master: master_key(),
     }
@@ -254,17 +254,21 @@ mod tests {
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
-            "Lci4MiN15tQ41PKqkzbj2mi9qXMuphQG8vU4tqt5CJG",
+            // Rotated 2026-08-12 (issues #45/#46/#47): single deliberate
+            // wire break — domain-tagged signatures everywhere, attestation
+            // v2 (proof of possession + requestor binding), inbox v3
+            // (instance-bound pointers), directory v3 (attestation under the
+            // listing signature). Following the #49 precedent, the previous
+            // v2 inbox/directory wasms get no dual-read window; their short-
+            // lived addresses are assumed to hold no real traffic. The v1
+            // dual-read paths (directory_v1, inbox_v1) stay.
+            "7SEHNDzeX61JDrMgUrWJPF1nAepAFZpDKyhpNH73Qmt2",
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
-            "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
-            // Rotated 2026-08-11 (issue #49): inbox rejects/withholds
-            // unreferenced creds. No dual-read of the previous v2 wasm: its
-            // day-old address is assumed to hold no real traffic.
-            "6vGxb5mqHXdbrHfVrxpMXDTj8s7X2qP7VKV7ECtTV9RX",
+            "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
+            "5YNT8SuF33buEUdYhsdmJWma6SJzsPZER6H2UheNomoj",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
-            // Rotated: avatar self-heal fix (#48) re-keyed the wasm.
-            "J6aw2NkRxXiavRhuWVJe4XfHENmbYxc65U68QcaHucsx",
+            "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
         ];
         assert_eq!(got, golden, "derived contract addresses ROTATED");

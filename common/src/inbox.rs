@@ -430,7 +430,7 @@ mod tests {
     fn replier(authority: &TestAuthority) -> Replier {
         let sk = SigningKey::generate(&mut OsRng);
         let vk = sk.verifying_key();
-        let attestation = authority.attest(&vk);
+        let attestation = authority.attest_v1(&vk);
         Replier {
             key: vk.to_bytes(),
             cred: ReplierCred {

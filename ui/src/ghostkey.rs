@@ -5,8 +5,8 @@
 //! variant name; unknown fields ignored, no deny_unknown_fields upstream).
 //! Source of truth: freenet/ghostkeys `common/src/lib.rs`.
 
-use ed25519_dalek::Signature;
-use freebird_core::attestation::AttestationV1;
+use ed25519_dalek::{Signature, SigningKey};
+use freebird_core::attestation::{pop_message, AttestationV2};
 use ghostkey_lib::armorable::Armorable;
 use ghostkey_lib::ghost_key_certificate::GhostkeyCertificateV1;
 use serde::{Deserialize, Serialize};
@@ -95,19 +95,24 @@ pub enum GhostkeyResponse {
     },
 }
 
-/// Convert a SignResult into a Freebird attestation.
+/// Convert a SignResult into a Freebird attestation, counter-signing with
+/// the posting key (proof of possession, issue #45).
 pub fn attestation_from_sign_result(
     scoped_payload: Vec<u8>,
     signature: Vec<u8>,
     certificate_pem: &str,
-) -> Result<AttestationV1, String> {
+    posting_sk: &SigningKey,
+) -> Result<AttestationV2, String> {
+    use ed25519_dalek::Signer;
     let signature = Signature::from_slice(&signature)
         .map_err(|e| format!("bad signature length: {e}"))?;
     let certificate = GhostkeyCertificateV1::from_armored_string(certificate_pem)
         .map_err(|e| format!("bad certificate: {e}"))?;
-    Ok(AttestationV1 {
+    let pop = posting_sk.sign(&pop_message(&signature));
+    Ok(AttestationV2 {
         scoped_payload,
         signature,
+        pop,
         certificate,
     })
 }
