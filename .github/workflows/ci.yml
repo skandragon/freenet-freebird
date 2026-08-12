@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Address stability + forbidden imports on the committed wasm — no rust
+  # build needed; the vendored bytes in ui/contracts/ are the source of truth.
+  vendored-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check-addresses
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - run: make check-imports-vendored
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup installs the toolchain pinned in rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - run: make test
