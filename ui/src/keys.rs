@@ -258,7 +258,10 @@ mod tests {
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
-            "sCJ9HQJGnHE1NGEWEC73CpWBPymT2ievqDW4iXh7Pgb",
+            // Rotated 2026-08-11 (issue #49): inbox rejects/withholds
+            // unreferenced creds. No dual-read of the previous v2 wasm: its
+            // day-old address is assumed to hold no real traffic.
+            "6vGxb5mqHXdbrHfVrxpMXDTj8s7X2qP7VKV7ECtTV9RX",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             // Rotated: avatar self-heal fix (#48) re-keyed the wasm.
             "J6aw2NkRxXiavRhuWVJe4XfHENmbYxc65U68QcaHucsx",
