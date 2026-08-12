@@ -1,0 +1,32 @@
+[package]
+name = "freebird-pow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freebird anonymous-write proof-of-work: hashcash stamp + control-cell difficulty"
+
+[features]
+# Swaps the compiled publisher key for a known test secret so downstream
+# contract tests can mint valid difficulty records. NEVER enabled in a wasm
+# build — only via the contracts' [dev-dependencies].
+test-publisher = []
+
+[dependencies]
+serde.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+data-encoding.workspace = true
+# Types + CBOR + publisher-signature verification only — the difficulty record
+# rides the FROZEN cell kernel (purpose = "pow"), same doctrine as the anchor.
+cell-contract = { path = "../contracts/cell-contract", default-features = false }
+# ed25519 verification calls no RNG, but rand_core needs the stub backend to
+# compile for wasm32 under wasmtime (freenet/river#241).
+getrandom = { workspace = true, features = ["custom"] }
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+# Test-only: drift-guard that our duplicated PUBLISHER_VK_HEX matches the
+# canonical one in freebird-control (client-side crate, not linked into wasm).
+freebird-control = { path = "../control" }

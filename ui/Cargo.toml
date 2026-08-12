@@ -13,6 +13,7 @@ freebird-core = { workspace = true, features = [] }
 directory-contract = { path = "../contracts/directory-contract", default-features = false }
 inbox-contract = { path = "../contracts/inbox-contract", default-features = false }
 cell-contract = { path = "../contracts/cell-contract", default-features = false }
+freebird-pow = { workspace = true }
 freebird-control = { path = "../control" }
 freebird-anchor = { path = "../anchor" }
 freenet-stdlib = { workspace = true, features = ["net"] }

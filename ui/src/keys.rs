@@ -254,19 +254,17 @@ mod tests {
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
-            // Rotated 2026-08-12 (issues #45/#46/#47): single deliberate
-            // wire break — domain-tagged signatures everywhere, attestation
-            // v2 (proof of possession + requestor binding), inbox v3
-            // (instance-bound pointers), directory v3 (attestation under the
-            // listing signature). Following the #49 precedent, the previous
-            // v2 inbox/directory wasms get no dual-read window; their short-
-            // lived addresses are assumed to hold no real traffic. The v1
-            // dual-read paths (directory_v1, inbox_v1) stay.
-            "7SEHNDzeX61JDrMgUrWJPF1nAepAFZpDKyhpNH73Qmt2",
+            // Rotated 2026-08-12 (issue #51): anonymous writes now carry an
+            // in-contract proof-of-work stamp, so the inbox and directory wasm
+            // (and only those two) change bytes. Following the #49/#45 rotation
+            // precedent, the prior v3 inbox/directory addresses get no dual-read
+            // window; their short-lived traffic is dropped. feed/avatar/cell/
+            // anchor/control and the v1 dual-read paths are untouched.
+            "CC6tfN3m74GV9xnmxHtt9uFfHKxybTMHni9RG5EncAQw",
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
-            "5YNT8SuF33buEUdYhsdmJWma6SJzsPZER6H2UheNomoj",
+            "9uNGt6ZEqTFDgM7e8gocP2GsUhG65QkqrDUbwWjk4kZB",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",

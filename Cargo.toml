@@ -9,6 +9,7 @@ members = [
     "contracts/inbox-contract",
     "control",
     "delegates/freebird-delegate",
+    "pow",
     "tools/freebird-ctl",
     "ui",
 ]
@@ -53,6 +54,7 @@ freenet-scaffold-macro = "0.2.2"
 
 # Internal
 freebird-core = { path = "common" }
+freebird-pow = { path = "pow" }
 
 # Dev
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
