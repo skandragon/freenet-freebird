@@ -105,6 +105,23 @@ pub async fn resume_account(seed: Vec<u8>) -> Result<(), String> {
     api::fetch_feed(author).await
 }
 
+/// Restore an account from a user-supplied recovery seed (issue #53): decode,
+/// persist it in the delegate, and resume as if it had been stored all along.
+pub async fn import_account(encoded: &str) -> Result<(), String> {
+    let seed: [u8; 32] = bs58::decode(encoded.trim())
+        .into_vec()
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("not a valid recovery seed")?;
+    api::kv_request(FreebirdDelegateRequest::Store {
+        key: "posting_key".into(),
+        value: seed.to_vec(),
+    })
+    .await?;
+    *POSTING_KEY_LOADED.write() = Some(Some(seed.to_vec()));
+    resume_account(seed.to_vec()).await
+}
+
 fn signing_key() -> Result<SigningKey, String> {
     ACCOUNT
         .read()
@@ -317,6 +334,20 @@ pub async fn nuke_account() -> Result<(), String> {
         key: "posting_key".into(),
     })
     .await?;
+    // Old delegate generations hold the seed too — delete there as well, or
+    // the carry-forward probe (issue #53) would resurrect it on next load.
+    for (_, key) in api::legacy_delegates() {
+        if let Err(e) = api::kv_request_to(
+            key,
+            FreebirdDelegateRequest::Delete {
+                key: "posting_key".into(),
+            },
+        )
+        .await
+        {
+            api::log(&format!("legacy seed delete failed: {e}"));
+        }
+    }
     *ACCOUNT.write() = None;
     FEEDS.write().clear();
     INBOXES.write().clear();

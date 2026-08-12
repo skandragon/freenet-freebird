@@ -24,6 +24,18 @@ pub const INBOX_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_con
 pub const DIRECTORY_V1_CONTRACT_WASM: &[u8] =
     include_bytes!("../contracts/directory_contract_v1.wasm");
 
+/// Frozen v1 delegate bytes — same convention as the frozen v1 contracts.
+pub const FREEBIRD_DELEGATE_V1_WASM: &[u8] =
+    include_bytes!("../contracts/freebird_delegate_v1.wasm");
+
+/// Registry of every delegate generation ever shipped, oldest first (issue
+/// #53). When the delegate rotates (any edit to common/ re-keys it), the
+/// startup probe messages each OLD generation whose key differs from the
+/// current one and folds its stored secrets — above all the posting-key seed
+/// — forward into the new delegate. Rotating the delegate means: freeze the
+/// outgoing wasm as `freebird_delegate_vN.wasm`, append it here, re-pin.
+pub const LEGACY_DELEGATE_WASMS: &[&[u8]] = &[FREEBIRD_DELEGATE_V1_WASM];
+
 /// This bundle's build number (git commit count; 0 in git-less dev builds).
 pub fn own_build() -> u64 {
     env!("BUILD_NUMBER").parse().unwrap_or(0)

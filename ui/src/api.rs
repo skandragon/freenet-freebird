@@ -416,9 +416,25 @@ fn freebird_delegate_container() -> DelegateContainer {
 }
 
 pub fn freebird_delegate_key() -> DelegateKey {
-    let code = DelegateCode::from(keys::FREEBIRD_DELEGATE_WASM.to_vec());
+    delegate_key_for(keys::FREEBIRD_DELEGATE_WASM)
+}
+
+fn delegate_key_for(wasm: &[u8]) -> DelegateKey {
+    let code = DelegateCode::from(wasm.to_vec());
     let params = Parameters::from(Vec::<u8>::new());
     DelegateKey::from_params(code.hash_str(), &params).expect("delegate key")
+}
+
+/// Previously-shipped delegate generations whose key differs from the
+/// current build's — the ones the carry-forward probe (issue #53) reads
+/// stored secrets out of. Empty while the delegate hasn't rotated.
+pub fn legacy_delegates() -> Vec<(&'static [u8], DelegateKey)> {
+    let current = freebird_delegate_key();
+    keys::LEGACY_DELEGATE_WASMS
+        .iter()
+        .map(|w| (*w, delegate_key_for(w)))
+        .filter(|(_, k)| *k != current)
+        .collect()
 }
 
 /// Stable-but-local cipher material, same rationale as River (river#397):
@@ -462,15 +478,63 @@ pub async fn register_freebird_delegate() -> Result<(), String> {
 }
 
 pub async fn kv_request(request: FreebirdDelegateRequest) -> Result<(), String> {
+    kv_request_to(freebird_delegate_key(), request).await
+}
+
+/// Same KV request aimed at a specific delegate generation (the current one
+/// for normal traffic, an old one during the carry-forward probe).
+pub async fn kv_request_to(
+    key: DelegateKey,
+    request: FreebirdDelegateRequest,
+) -> Result<(), String> {
     let payload = freebird_core::to_cbor(&request)?;
     send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
-        key: freebird_delegate_key(),
+        key,
         params: Parameters::from(Vec::<u8>::new()),
         inbound: vec![InboundDelegateMsg::ApplicationMessage(
             ApplicationMessage::new(payload),
         )],
     }))
     .await
+}
+
+/// Carry-forward probe (issue #53): when the current delegate has no stored
+/// seed, ask each OLD delegate generation to `List` its secrets; the
+/// responses fold every stored value forward via `dispatch_legacy_kv`.
+/// Registers the old wasm first (same cipher material) so the node can run
+/// it even after a restart. No-op while the delegate has never rotated.
+#[cfg(target_arch = "wasm32")]
+pub async fn probe_legacy_delegates() {
+    let legacy = legacy_delegates();
+    if legacy.is_empty() {
+        return;
+    }
+    // Hold the account gate on "Loading" while the probe runs, so the user
+    // can't create a fresh account over a seed that's about to be found.
+    *LEGACY_PROBE_PENDING.write() = true;
+    let (cipher, nonce) = delegate_cipher_material();
+    for (wasm, key) in legacy {
+        let code = DelegateCode::from(wasm.to_vec());
+        let params = Parameters::from(Vec::<u8>::new());
+        let delegate = Delegate::from((&code, &params));
+        if let Err(e) = send(ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate)),
+            cipher,
+            nonce,
+        }))
+        .await
+        {
+            log(&format!("legacy delegate register failed: {e}"));
+            continue;
+        }
+        if let Err(e) = kv_request_to(key, FreebirdDelegateRequest::List).await {
+            log(&format!("legacy delegate list failed: {e}"));
+        }
+    }
+    // Delegate answers are node-local; a few seconds is generous. After the
+    // window the gate falls through to onboarding if nothing was found.
+    crate::sleep_ms(5000).await;
+    *LEGACY_PROBE_PENDING.write() = false;
 }
 
 /// Ask the ghostkey delegate (auto-discovered from the vault) to sign our
@@ -500,13 +564,21 @@ fn dispatch(response: HostResponse) {
         HostResponse::ContractResponse(cr) => dispatch_contract(cr),
         HostResponse::DelegateResponse { key, values } => {
             let is_freebird = key == freebird_delegate_key();
+            let is_legacy =
+                !is_freebird && legacy_delegates().iter().any(|(_, k)| *k == key);
             if values.is_empty() {
-                note_empty_delegate_response(is_freebird);
+                // A legacy generation's empty response is expected (its
+                // RegisterDelegate ack during the probe) — never an error.
+                if !is_legacy {
+                    note_empty_delegate_response(is_freebird);
+                }
             }
             for out in values {
                 if let OutboundDelegateMsg::ApplicationMessage(app_msg) = out {
                     if is_freebird {
                         dispatch_kv(app_msg.payload.as_ref());
+                    } else if is_legacy {
+                        dispatch_legacy_kv(&key, app_msg.payload.as_ref());
                     } else {
                         dispatch_ghostkey(app_msg.payload.as_ref());
                     }
@@ -876,6 +948,56 @@ fn dispatch_kv(payload: &[u8]) {
     }
 }
 
+/// Fold an OLD delegate generation's answers forward (issue #53): its
+/// KeyList fans out into Gets against the same generation, and every value
+/// that comes back is stored into the CURRENT delegate. The posting-key seed
+/// additionally resumes the account — guarded so a seed already loaded from
+/// the current delegate is never overwritten.
+fn dispatch_legacy_kv(from: &DelegateKey, payload: &[u8]) {
+    match freebird_core::from_cbor::<FreebirdDelegateResponse>(payload) {
+        Ok(FreebirdDelegateResponse::KeyList { keys }) => {
+            let from = from.clone();
+            spawn_local_task(async move {
+                for key in keys {
+                    if let Err(e) =
+                        kv_request_to(from.clone(), FreebirdDelegateRequest::Get { key }).await
+                    {
+                        log(&format!("legacy delegate get failed: {e}"));
+                    }
+                }
+            });
+        }
+        Ok(FreebirdDelegateResponse::Value { key, value: Some(value) }) => {
+            if key == "posting_key" {
+                if POSTING_KEY_LOADED.peek().as_ref().is_some_and(|v| v.is_some()) {
+                    return; // current delegate already holds a seed
+                }
+                *POSTING_KEY_LOADED.write() = Some(Some(value.clone()));
+                *LEGACY_PROBE_PENDING.write() = false;
+                log("posting key carried forward from an old delegate generation");
+            }
+            spawn_local_task(async move {
+                if let Err(e) =
+                    kv_request(FreebirdDelegateRequest::Store { key, value }).await
+                {
+                    log(&format!("carry-forward store failed: {e}"));
+                }
+            });
+        }
+        Ok(_) => {}
+        Err(e) => log(&format!("bad legacy delegate response: {e}")),
+    }
+}
+
+/// Spawn a fire-and-forget future from dispatch context (wasm only; native
+/// test builds drop it — dispatch never runs there).
+fn spawn_local_task<F: std::future::Future<Output = ()> + 'static>(fut: F) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(fut);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = fut;
+}
+
 fn dispatch_ghostkey(payload: &[u8]) {
     match ciborium::de::from_reader::<GhostkeyResponse, _>(payload) {
         Ok(GhostkeyResponse::SignResult {
@@ -933,6 +1055,22 @@ fn track(key: ContractKey, kind: TrackedKind) {
 
 fn lookup(key: &ContractKey) -> Option<TrackedKind> {
     TRACKED.read().get(&key.id().to_string()).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every registered legacy generation derives a key, and the probe list
+    /// never contains the CURRENT delegate (probing yourself would fold
+    /// secrets onto themselves). Today v1 == current, so the list is empty;
+    /// it grows the first time the delegate rotates.
+    #[test]
+    fn legacy_delegate_registry() {
+        let current = super::freebird_delegate_key();
+        for w in crate::keys::LEGACY_DELEGATE_WASMS {
+            let _ = super::delegate_key_for(w);
+        }
+        assert!(super::legacy_delegates().iter().all(|(_, k)| *k != current));
+    }
 }
 
 pub fn log(msg: &str) {
