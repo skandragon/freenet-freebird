@@ -78,7 +78,10 @@ pub async fn create_account(name: String) -> Result<(), String> {
 
     let author = vk.to_bytes();
     FEEDS.write().insert(author, Some(state));
-    *ACCOUNT.write() = Some(sk);
+    *ACCOUNT.write() = Some(sk.clone());
+    // Mark the seed as loaded too, so a late carry-forward answer from an
+    // old delegate generation can never clobber this fresh identity.
+    *POSTING_KEY_LOADED.write() = Some(Some(sk.to_bytes().to_vec()));
     // Track so update notifications route; PUT already subscribed us.
     api::fetch_feed(author).await.ok();
     Ok(())
@@ -103,6 +106,26 @@ pub async fn resume_account(seed: Vec<u8>) -> Result<(), String> {
         api::log(&format!("anchor publish failed: {e}"));
     }
     api::fetch_feed(author).await
+}
+
+/// Restore an account from a user-supplied recovery seed (issue #53): decode,
+/// persist it in the delegate, and resume as if it had been stored all along.
+pub async fn import_account(encoded: &str) -> Result<(), String> {
+    let seed: [u8; 32] = bs58::decode(encoded.trim())
+        .into_vec()
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("not a valid recovery seed")?;
+    api::kv_request(FreebirdDelegateRequest::Store {
+        key: "posting_key".into(),
+        value: seed.to_vec(),
+    })
+    .await?;
+    // Resume first (it sets ACCOUNT synchronously), THEN publish the loaded
+    // seed — the other order fires the App effect's own resume concurrently.
+    resume_account(seed.to_vec()).await?;
+    *POSTING_KEY_LOADED.write() = Some(Some(seed.to_vec()));
+    Ok(())
 }
 
 fn signing_key() -> Result<SigningKey, String> {
@@ -313,6 +336,12 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
 /// remove op, but a feed whose key is destroyed can never be updated again
 /// and rots out of node caches once nothing renews its subscriptions.
 pub async fn nuke_account() -> Result<(), String> {
+    // Old delegate generations hold the seed too (issue #53): suppress the
+    // probe so it can't resurrect the seed, then wipe them FIRST — a wipe
+    // failure aborts the nuke with everything still intact.
+    api::suppress_legacy_probe();
+    #[cfg(target_arch = "wasm32")]
+    api::wipe_legacy_seeds().await?;
     api::kv_request(FreebirdDelegateRequest::Delete {
         key: "posting_key".into(),
     })

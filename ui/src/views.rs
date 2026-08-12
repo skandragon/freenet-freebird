@@ -530,16 +530,32 @@ pub fn App() -> Element {
     });
 
     // When the stored posting key answer arrives, resume or leave onboarding.
+    // "No stored seed" first fires the carry-forward probe of old delegate
+    // generations (issue #53), once per page load — a found seed lands in
+    // POSTING_KEY_LOADED and re-enters here as the resume case.
+    // begin_legacy_probe runs synchronously so the account gate is already
+    // raised before anything can render onboarding.
     use_effect(move || {
         let loaded = POSTING_KEY_LOADED.read().clone();
-        if let Some(Some(seed)) = loaded {
-            if ACCOUNT.read().is_none() {
-                spawn(async move {
-                    if let Err(e) = actions::resume_account(seed).await {
-                        api::log(&format!("resume failed: {e}"));
-                    }
-                });
+        match loaded {
+            Some(Some(seed)) => {
+                if ACCOUNT.read().is_none() {
+                    spawn(async move {
+                        if let Err(e) = actions::resume_account(seed).await {
+                            api::log(&format!("resume failed: {e}"));
+                        }
+                    });
+                }
             }
+            Some(None) => {
+                #[cfg(target_arch = "wasm32")]
+                if api::begin_legacy_probe() {
+                    spawn(async {
+                        api::run_legacy_probe().await;
+                    });
+                }
+            }
+            None => {}
         }
     });
 
@@ -585,7 +601,9 @@ pub fn App() -> Element {
 
     let status = SYNC_STATUS.read().clone();
     let onboarded = ACCOUNT.read().is_some();
-    let awaiting_key = POSTING_KEY_LOADED.read().is_none();
+    // Probing old delegate generations counts as still awaiting the key —
+    // onboarding must not offer a fresh account while a seed may turn up.
+    let awaiting_key = POSTING_KEY_LOADED.read().is_none() || *LEGACY_PROBE_PENDING.read();
 
     rsx! {
         // Inlined: the app is served under /v1/contract/web/<key>/, where
@@ -769,10 +787,19 @@ fn Onboarding() -> Element {
     let mut name = use_signal(String::new);
     let mut busy = use_signal(|| false);
     let mut error = use_signal(String::new);
+    let mut seed = use_signal(String::new);
+    let mut seed_error = use_signal(String::new);
 
     rsx! {
         section { class: "card onboarding",
             h2 { "Welcome" }
+            if *LEGACY_PROBE_FAILED.read() {
+                p { class: "error",
+                    "Couldn't check this node for an existing account (the \
+                     recovery probe failed). If you had an account here, \
+                     reload the page before creating a new one."
+                }
+            }
             p { "Pick a display name. Your account is a locally generated key — no signup, no server." }
             input {
                 placeholder: "Display name",
@@ -797,6 +824,31 @@ fn Onboarding() -> Element {
             }
             if !error.read().is_empty() {
                 p { class: "error", "{error}" }
+            }
+            p { class: "muted keyline", "Already have an account? Restore it from its recovery seed:" }
+            input {
+                placeholder: "Recovery seed",
+                aria_label: "Recovery seed",
+                value: "{seed}",
+                oninput: move |e| seed.set(e.value()),
+            }
+            button {
+                disabled: *busy.read() || seed.read().trim().is_empty(),
+                onclick: move |_| {
+                    busy.set(true);
+                    seed_error.set(String::new());
+                    let s = seed.read().trim().to_string();
+                    spawn(async move {
+                        if let Err(e) = actions::import_account(&s).await {
+                            seed_error.set(e);
+                        }
+                        busy.set(false);
+                    });
+                },
+                if *busy.read() { "Restoring…" } else { "Restore account" }
+            }
+            if !seed_error.read().is_empty() {
+                p { class: "error", "{seed_error}" }
             }
         }
     }
@@ -1677,6 +1729,41 @@ fn VerifyBox() -> Element {
     }
 }
 
+/// Seed backup (issue #53): reveal/copy the posting-key seed so the account
+/// survives a lost browser profile or a delegate rotation gone wrong. The
+/// matching import lives on the onboarding screen.
+#[component]
+fn BackupBox() -> Element {
+    let mut revealed = use_signal(|| false);
+    let seed = ACCOUNT
+        .read()
+        .as_ref()
+        .map(|sk| bs58::encode(sk.to_bytes()).into_string());
+    let Some(seed) = seed else {
+        return rsx! {};
+    };
+
+    rsx! {
+        section { class: "card",
+            h3 { "Backup" }
+            p { class: "muted",
+                "Your recovery seed IS your account — anyone holding it can \
+                 post as you. Write it down somewhere safe; it's the only way \
+                 to restore your account on another browser or node."
+            }
+            if *revealed.read() {
+                code { class: "keyline", "{seed}" }
+                CopyButton { text: seed.clone(), label: "copy seed" }
+                button { class: "link", onclick: move |_| revealed.set(false), "hide" }
+            } else {
+                button { class: "link", onclick: move |_| revealed.set(true),
+                    "Reveal recovery seed"
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn DangerZone() -> Element {
     let mut arming = use_signal(|| false);
@@ -1819,6 +1906,7 @@ fn ProfilePage() -> Element {
             }
             FollowersBox {}
             VerifyBox {}
+            BackupBox {}
             DangerZone {}
         }
     }
