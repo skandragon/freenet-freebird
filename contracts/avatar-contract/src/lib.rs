@@ -62,7 +62,13 @@ fn update_at(
             return Ok(());
         }
         let incoming: AuthorizedAvatar = deser(bytes, "incoming avatar")?;
-        check(&incoming, parameters, now)
+        // Far-future incoming is scrubbed (skipped), matching the sibling
+        // contracts — erroring would abort every sync from a peer still
+        // holding poison, keeping the healed node unhealable in practice.
+        if incoming.avatar.time > now.saturating_add(MAX_FUTURE_MS) {
+            return Ok(());
+        }
+        check_avatar(&incoming, &parameters.author)
             .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
         let newer = match &current {
             None => true,
@@ -196,6 +202,59 @@ mod tests {
         let out = update_at(&params, &stored, update, now).expect("update succeeds");
         let held: AuthorizedAvatar = deser(&out, "out").unwrap();
         assert_eq!(held, honest, "poisoned slot must heal to the honest avatar");
+    }
+
+    /// Stored poison + incoming poison: stored is scrubbed, incoming is
+    /// skipped (not an error path that would persist it), and with nothing
+    /// valid left the update is rejected — poison neither persists nor
+    /// silently becomes an empty slot.
+    #[test]
+    fn poison_in_and_out_rejected_not_persisted() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let params = AvatarParametersV1 {
+            author: sk.verifying_key(),
+        };
+        let now = 1_000_000;
+        let stored = ser(&avatar(&sk, u64::MAX)).unwrap();
+        let update = vec![UpdateData::State(
+            ser(&avatar(&sk, u64::MAX - 1)).unwrap().into(),
+        )];
+        assert!(update_at(&params, &stored, update, now).is_err());
+    }
+
+    /// Incoming far-future poison is skipped, not an abort: an honest delta
+    /// in the same update still lands (StateAndDelta merges state first).
+    #[test]
+    fn incoming_poison_skipped_honest_delta_lands() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let params = AvatarParametersV1 {
+            author: sk.verifying_key(),
+        };
+        let now = 1_000_000;
+        let honest = avatar(&sk, now);
+        let update = vec![UpdateData::StateAndDelta {
+            state: ser(&avatar(&sk, u64::MAX)).unwrap().into(),
+            delta: ser(&honest).unwrap().into(),
+        }];
+        let out = update_at(&params, &[], update, now).expect("update succeeds");
+        let held: AuthorizedAvatar = deser(&out, "out").unwrap();
+        assert_eq!(held, honest);
+    }
+
+    /// Boundary: time == now + MAX_FUTURE_MS is KEPT (the check is strict >),
+    /// matching the inbox contract's pin.
+    #[test]
+    fn boundary_time_kept() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let params = AvatarParametersV1 {
+            author: sk.verifying_key(),
+        };
+        let now = 1_000_000;
+        let edge = avatar(&sk, now + MAX_FUTURE_MS);
+        let update = vec![UpdateData::State(ser(&edge).unwrap().into())];
+        let out = update_at(&params, &ser(&edge).unwrap(), update, now).expect("update succeeds");
+        let held: AuthorizedAvatar = deser(&out, "out").unwrap();
+        assert_eq!(held, edge, "time == now + MAX_FUTURE_MS must be kept");
     }
 
     /// Sanity: a valid stored avatar still wins LWW over an older incoming one.

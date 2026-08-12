@@ -248,8 +248,8 @@ mod tests {
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
             "sCJ9HQJGnHE1NGEWEC73CpWBPymT2ievqDW4iXh7Pgb",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
-            // Rotated 2026-08-11: avatar self-heal fix (#48) re-keyed the wasm.
-            "DpJ9QpELbv36mk2Nr6i1pjCB51Gh98r5hFA78WPcENsb",
+            // Rotated: avatar self-heal fix (#48) re-keyed the wasm.
+            "J6aw2NkRxXiavRhuWVJe4XfHENmbYxc65U68QcaHucsx",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
         ];
         assert_eq!(got, golden, "derived contract addresses ROTATED");
