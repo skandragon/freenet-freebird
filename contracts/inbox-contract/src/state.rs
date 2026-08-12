@@ -20,7 +20,7 @@
 //! Credentials remain keyed by POSTING key, and the same delta/summary
 //! horizon discipline as v1 applies, per tier (see `TierHorizon`).
 
-use freenet_scaffold_macro::composable;
+use freenet_scaffold::ComposableState;
 
 pub use inbox_v2_components::*;
 
@@ -53,11 +53,128 @@ pub fn is_anon_fingerprint(fp: &str) -> bool {
 
 /// Inbox v2 state. Field order is load-bearing: creds must apply before
 /// pointers so a single delta carrying both validates its own pointers.
-#[composable(post_apply_delta = "post_apply_cleanup")]
+///
+/// The `ComposableState` impl is hand-written (issue #49) instead of
+/// `#[composable]`: the cred delta must be gated on the pointer delta, and
+/// the macro gives each component only its own summary slice.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct InboxStateV2 {
     pub creds: CredsV2,
     pub pointers: PointersV2,
+}
+
+/// Same shape the `#[composable]` macro generated.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
+pub struct InboxStateV2Summary {
+    pub creds: <CredsV2 as ComposableState>::Summary,
+    pub pointers: <PointersV2 as ComposableState>::Summary,
+}
+
+/// Same shape the `#[composable]` macro generated.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct InboxStateV2Delta {
+    pub creds: Option<<CredsV2 as ComposableState>::Delta>,
+    pub pointers: Option<<PointersV2 as ComposableState>::Delta>,
+}
+
+impl ComposableState for InboxStateV2 {
+    type ParentState = InboxStateV2;
+    type Summary = InboxStateV2Summary;
+    type Delta = InboxStateV2Delta;
+    type Parameters = InboxParametersV2;
+
+    fn verify(
+        &self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Result<(), String> {
+        self.creds.verify(parent_state, parameters)?;
+        self.pointers.verify(parent_state, parameters)?;
+        Ok(())
+    }
+
+    fn summarize(
+        &self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+    ) -> Self::Summary {
+        InboxStateV2Summary {
+            creds: self.creds.summarize(parent_state, parameters),
+            pointers: self.pointers.summarize(parent_state, parameters),
+        }
+    }
+
+    /// The cred delta is gated on the pointer delta (issue #49): a cred the
+    /// peer lacks is offered only alongside a pointer referencing it in the
+    /// SAME delta (a cred the peer already holds is an upgrade and always
+    /// flows). Otherwise the peer's post_apply_cleanup prunes the cred, its
+    /// cred summary never changes, and we re-offer it forever — the honest
+    /// case being a sender whose pointers all fall below the peer's
+    /// retention horizons.
+    fn delta(
+        &self,
+        parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+        old_state_summary: &Self::Summary,
+    ) -> Option<Self::Delta> {
+        let pointers =
+            self.pointers
+                .delta(parent_state, parameters, &old_state_summary.pointers);
+        let creds = self
+            .creds
+            .delta(parent_state, parameters, &old_state_summary.creds)
+            .map(|mut c| {
+                c.retain(|k, _| {
+                    old_state_summary.creds.contains_key(k)
+                        || pointers
+                            .as_ref()
+                            .is_some_and(|ps| ps.iter().any(|p| p.ptr.replier == *k))
+                });
+                c
+            })
+            .filter(|c| !c.is_empty());
+        (creds.is_some() || pointers.is_some())
+            .then_some(InboxStateV2Delta { creds, pointers })
+    }
+
+    fn apply_delta(
+        &mut self,
+        _parent_state: &Self::ParentState,
+        parameters: &Self::Parameters,
+        delta: &Option<Self::Delta>,
+    ) -> Result<(), String> {
+        let Some(delta) = delta else { return Ok(()) };
+        // A delta cred no existing or incoming pointer references would be
+        // pruned by post_apply_cleanup anyway — skip it BEFORE apply pays
+        // its RSA verification (issue #49). The size bound stays a hard
+        // reject, ahead of the filter's linear scan.
+        let creds = match &delta.creds {
+            Some(c) if c.len() > MAX_POINTERS => {
+                return Err("credential delta too large".into())
+            }
+            Some(c) => {
+                let mut c = c.clone();
+                c.retain(|k, _| {
+                    self.pointers.pointers.iter().any(|p| p.ptr.replier == *k)
+                        || delta
+                            .pointers
+                            .as_ref()
+                            .is_some_and(|ps| ps.iter().any(|p| p.ptr.replier == *k))
+                });
+                (!c.is_empty()).then_some(c)
+            }
+            None => None,
+        };
+        // Creds before pointers, each seeing the in-progress state, then the
+        // idempotent cleanup — same order the macro generated.
+        let self_clone = self.clone();
+        self.creds.apply_delta(&self_clone, parameters, &creds)?;
+        let self_clone = self.clone();
+        self.pointers
+            .apply_delta(&self_clone, parameters, &delta.pointers)?;
+        self.post_apply_cleanup(parameters)?;
+        Ok(())
+    }
 }
 
 impl InboxStateV2 {
@@ -869,17 +986,22 @@ mod tests {
         assert!(s.verify(&s.clone(), &p).is_err());
     }
 
-    /// Issue #49 quiescence: an attacker state of unreferenced creds is
-    /// rejected at validate (never cached, so no holder re-offers it), and
-    /// even a delta smuggling them in leaves the receiver valid and its
-    /// exchange with an honest replica quiescent.
+    /// Issue #49 quiescence, attacker variant: delta→apply round-trips
+    /// against a holder of orphan creds shrink to empty instead of
+    /// re-offering the pruned creds forever.
     #[test]
-    fn unreferenced_cred_offer_goes_quiescent() {
+    fn attacker_orphan_cred_offers_go_quiescent() {
         let authority = TestAuthority::new();
         let p = params(&authority);
-        let honest = anon_replier();
 
+        // Attacker: one legitimate cred+pointer plus 5 orphan creds.
+        let legit = anon_replier();
         let mut attacker = InboxStateV2::default();
+        apply(
+            &mut attacker,
+            &p,
+            delta_of(vec![&legit], vec![pointer(&legit, 5, 0)]),
+        );
         for _ in 0..5 {
             let r = anon_replier();
             attacker.creds.creds.insert(r.key, r.cred.clone());
@@ -889,29 +1011,69 @@ mod tests {
             "attacker state must be rejected at validate"
         );
 
+        // Round 1: only the referenced cred and its pointer are offered.
         let mut receiver = InboxStateV2::default();
+        let rs = receiver.summarize(&receiver.clone(), &p);
+        let d = attacker.delta(&attacker.clone(), &p, &rs).expect("offers");
+        assert_eq!(d.creds.as_ref().map(|c| c.len()), Some(1), "orphans withheld");
+        apply(&mut receiver, &p, Some(d));
+        receiver.verify(&receiver.clone(), &p).expect("receiver valid");
+
+        // Round 2: nothing left to offer — the loop is closed.
+        let rs = receiver.summarize(&receiver.clone(), &p);
+        assert!(attacker.delta(&attacker.clone(), &p, &rs).is_none());
+
+        // A raw delta smuggling the orphans is pruned without changing the
+        // receiver's summary — no progress an attacker can force.
+        let before = receiver.summarize(&receiver.clone(), &p);
         apply(
             &mut receiver,
             &p,
-            delta_of(vec![&honest], vec![pointer(&honest, 5, 0)]),
+            Some(InboxStateV2Delta {
+                creds: Some(attacker.creds.creds.clone()),
+                pointers: None,
+            }),
         );
-        let clone = receiver.clone();
-        receiver.merge(&clone, &p, &attacker).expect("merge ok");
-        receiver
-            .verify(&receiver.clone(), &p)
-            .expect("receiver stays valid after smuggled creds are pruned");
-        assert_eq!(receiver.creds.creds.len(), 1);
+        assert_eq!(receiver.summarize(&receiver.clone(), &p), before);
+        receiver.verify(&receiver.clone(), &p).expect("receiver valid");
+    }
 
-        // Full exchange with an honest replica goes quiescent.
-        let mut peer = InboxStateV2::default();
-        let clone = peer.clone();
-        peer.merge(&clone, &p, &receiver).expect("merge ok");
-        let clone = receiver.clone();
-        receiver.merge(&clone, &p, &peer).expect("merge ok");
-        let ps = peer.summarize(&peer.clone(), &p);
-        assert!(receiver.delta(&receiver.clone(), &p, &ps).is_none());
+    /// Issue #49 quiescence, honest-traffic variant: a sender whose only
+    /// pointer falls below the receiver's anon horizon must not re-offer
+    /// its cred every round (the receiver would prune it each time).
+    #[test]
+    fn below_horizon_cred_not_reoffered() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+
+        // Receiver: anon share at cap (ANON_POINTER_SLOTS), all newer than
+        // the sender's pointer.
+        let mut receiver = InboxStateV2::default();
+        let mut seated = 0;
+        while seated < ANON_POINTER_SLOTS {
+            let r = anon_replier();
+            let n = MAX_PER_ANON_KEY.min(ANON_POINTER_SLOTS - seated);
+            let ptrs: Vec<_> = (0..n)
+                .map(|i| pointer(&r, 1000 + (seated + i) as u64, (seated + i) as u64))
+                .collect();
+            apply(&mut receiver, &p, delta_of(vec![&r], ptrs));
+            seated += n;
+        }
+        assert_eq!(receiver.pointers.pointers.len(), ANON_POINTER_SLOTS);
+
+        // Sender: one honest cred+pointer, older than everything retained.
+        let old = anon_replier();
+        let mut sender = InboxStateV2::default();
+        apply(&mut sender, &p, delta_of(vec![&old], vec![pointer(&old, 5, 0)]));
+        sender.verify(&sender.clone(), &p).expect("sender valid");
+
+        // The pointer is below the horizon, so the cred must be withheld
+        // too: the round-trip is quiescent immediately.
         let rs = receiver.summarize(&receiver.clone(), &p);
-        assert!(peer.delta(&peer.clone(), &p, &rs).is_none());
+        assert!(
+            sender.delta(&sender.clone(), &p, &rs).is_none(),
+            "below-horizon cred re-offered: honest livelock"
+        );
     }
 
     #[test]
