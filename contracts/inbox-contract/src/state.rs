@@ -405,13 +405,17 @@ mod inbox_v3_components {
                 return Err("credential delta too large".into());
             }
             for (key, cred) in delta {
-                cred.check(key, &parameters.ghostkey_master)?;
-                match self.creds.get(key) {
-                    Some(existing) if existing.content_hash() >= cred.content_hash() => {}
-                    _ => {
-                        self.creds.insert(*key, cred.clone());
-                    }
+                // LWW first (issue #52): a losing or already-held cred is
+                // never verified, so replaying known creds costs no RSA.
+                if self
+                    .creds
+                    .get(key)
+                    .is_some_and(|existing| existing.content_hash() >= cred.content_hash())
+                {
+                    continue;
                 }
+                cred.check(key, &parameters.ghostkey_master)?;
+                self.creds.insert(*key, cred.clone());
             }
             Ok(())
         }
@@ -966,6 +970,34 @@ mod tests {
         assert!(s
             .apply_delta(&clone, &p, &delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]))
             .is_err());
+    }
+
+    /// Issue #52: a cred losing the per-key LWW is skipped before
+    /// verification — a malformed losing cred no longer fails the delta,
+    /// and replaying held creds costs no RSA.
+    #[test]
+    fn losing_cred_never_verified() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = attested_replier(&authority);
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        // Anonymous cred under r's map key but the WRONG posting key:
+        // check() would be fatal, but it loses the LWW (anon hashes as
+        // zero) and must be skipped.
+        let stranger = anon_replier();
+        let clone = s.clone();
+        s.apply_delta(
+            &clone,
+            &p,
+            &Some(InboxStateV3Delta {
+                creds: Some([(r.key, stranger.cred.clone())].into_iter().collect()),
+                pointers: None,
+                pow_difficulty: None,
+            }),
+        )
+        .expect("losing cred skipped, not verified");
+        assert!(s.creds.creds[&r.key].attestation.is_some());
     }
 
     #[test]

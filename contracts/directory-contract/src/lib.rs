@@ -21,7 +21,7 @@
 //! this crate directly with default-features = false. The `legacy` module
 //! keeps the v1 wire types for the dual-read migration window.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cell_contract::SignedCellV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -139,6 +139,19 @@ impl AuthorizedListingV3 {
     /// attestation slot), and — when present — the attestation chain
     /// verifies and binds this posting key.
     pub fn check(&self, master: &VerifyingKey) -> Result<(), String> {
+        self.check_cached(master, &mut BTreeSet::new())
+    }
+
+    /// `check`, memoizing the RSA-heavy attestation verification (issue #52).
+    /// The memo key is (attestation content hash, author): exactly what the
+    /// full attestation check proves, so a hit is a byte-identical replay of
+    /// an attestation already verified for this author. The ed25519 listing
+    /// signature is always verified.
+    pub fn check_cached(
+        &self,
+        master: &VerifyingKey,
+        verified: &mut BTreeSet<([u8; 32], [u8; 32])>,
+    ) -> Result<(), String> {
         let vk = VerifyingKey::from_bytes(&self.listing.author)
             .map_err(|e| format!("bad author key: {e}"))?;
         vk.verify_strict(
@@ -147,9 +160,13 @@ impl AuthorizedListingV3 {
         )
         .map_err(|e| format!("listing signature invalid: {e}"))?;
         if let Some(att) = &self.attestation {
-            att.verify(&vk, Some(master))
-                .map(|_tier| ())
-                .map_err(|e| format!("listing attestation invalid: {e}"))?;
+            let id = (att.content_hash(), self.listing.author);
+            if !verified.contains(&id) {
+                att.verify(&vk, Some(master))
+                    .map(|_tier| ())
+                    .map_err(|e| format!("listing attestation invalid: {e}"))?;
+                verified.insert(id);
+            }
         }
         Ok(())
     }
@@ -428,8 +445,26 @@ impl DirectoryStateV4 {
         // Admission difficulty: the floor, raised by a valid publisher-signed
         // control-cell record if this write carries one (issue #51).
         let bits = difficulty_bits(delta.pow_difficulty.as_ref());
+        // Attestations already verified, by (content hash, bound author):
+        // seeded from the held state (verified when admitted) and extended as
+        // the delta verifies new ones — replaying a known attestation costs
+        // no RSA (issue #52).
+        let mut verified: BTreeSet<([u8; 32], [u8; 32])> = self
+            .attested
+            .values()
+            .filter_map(|l| l.attestation.as_ref().map(|a| (a.content_hash(), l.listing.author)))
+            .collect();
         for l in &delta.listings {
-            l.check(&parameters.ghostkey_master)?;
+            // LWW first (issue #52): a losing entry is never verified, so a
+            // replay of already-held listings costs no crypto at all.
+            let tier = if l.is_anon() { &self.anon } else { &self.attested };
+            if tier
+                .get(&l.listing.author)
+                .is_some_and(|held| held.lww_key() >= l.lww_key())
+            {
+                continue;
+            }
+            l.check_cached(&parameters.ghostkey_master, &mut verified)?;
             // Anonymous listings must clear the proof-of-work bar; drop the
             // ones that don't rather than fail the whole delta (an honest
             // peer never forwards an under-bar listing, so this only bites
@@ -1209,6 +1244,60 @@ mod tests {
         let mut upgrader = DirectoryStateV4::default();
         upgrader.anon.insert(held_key, fake_listing(None, held_key, 5000));
         assert!(upgrader.delta(&summary).is_some());
+    }
+
+    // ---- verify-after-LWW + attestation memo (issue #52) ----
+
+    /// A delta entry losing the per-slot LWW is skipped BEFORE any
+    /// verification: a garbage losing entry no longer fails the delta, and
+    /// replaying held listings costs no crypto.
+    #[test]
+    fn losing_lww_entry_never_verified() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let a = author(&authority);
+        let mut s = DirectoryStateV4::default();
+        s.apply_delta(&p, &d(vec![listing(&a, 10)])).unwrap();
+        // Same author, older time, garbage signature: fatal if verified.
+        let mut stale = listing(&a, 5);
+        stale.signature = Signature::from_bytes(&[0u8; 64]);
+        s.apply_delta(&p, &d(vec![stale]))
+            .expect("losing entry skipped, not verified");
+        assert_eq!(s.attested[&a.key].listing.last_active, 10);
+    }
+
+    /// An attestation already held for the author is not re-verified when
+    /// the author republishes — proven with an attestation that would FAIL
+    /// verification (rogue master) seated directly in state. The ed25519
+    /// listing signature and unseen attestations are still enforced.
+    #[test]
+    fn held_attestation_not_reverified_on_republish() {
+        let authority = TestAuthority::new();
+        let rogue = TestAuthority::new();
+        let p = params(&authority);
+        let sk = SigningKey::generate(&mut OsRng);
+        let key = sk.verifying_key().to_bytes();
+        let att = rogue.attest(&sk); // does NOT verify under p.ghostkey_master
+        let mk = |time, att: &AttestationV2| {
+            AuthorizedListingV3::new(
+                ListingV1 { author: key, last_active: time },
+                &sk,
+                Some(att.clone()),
+            )
+        };
+        let mut s = DirectoryStateV4::default();
+        s.attested.insert(key, mk(5, &att)); // seated as if verified at admission
+        // Republish with the held attestation: admitted, no RSA re-run.
+        s.apply_delta(&p, &d(vec![mk(7, &att)]))
+            .expect("held attestation memoized");
+        assert_eq!(s.attested[&key].listing.last_active, 7);
+        // The ed25519 listing signature is still enforced on winners.
+        let mut bad = mk(9, &att);
+        bad.signature = Signature::from_bytes(&[0u8; 64]);
+        assert!(s.apply_delta(&p, &d(vec![bad])).is_err());
+        // An UNSEEN attestation is fully verified (and fails here).
+        let other_att = TestAuthority::new().attest(&sk);
+        assert!(s.apply_delta(&p, &d(vec![mk(11, &other_att)])).is_err());
     }
 
     // ---- merge convergence (issue #50) ----
