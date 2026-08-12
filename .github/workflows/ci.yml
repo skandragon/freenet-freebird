@@ -25,3 +25,15 @@ jobs:
       # rustup installs the toolchain pinned in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: make test
+
+  # Prove the Docker build environment is byte-reproducible: build the four
+  # non-frozen contracts + delegate twice from clean and assert they are
+  # byte-identical run-to-run. Does NOT diff against the committed vendored
+  # bytes (those are the immutable, grandfathered source of truth) — it only
+  # guarantees that a FUTURE legitimate rebuild via `make build-docker` yields
+  # deterministic, host/arch-independent wasm. See docs/reproducible-builds.md.
+  docker-repro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make repro-check
