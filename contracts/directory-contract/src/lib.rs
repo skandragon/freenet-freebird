@@ -19,9 +19,11 @@
 
 use std::collections::BTreeMap;
 
+use cell_contract::SignedCellV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freebird_core::attestation::{AttestationV1, AttestationV2};
 use freebird_core::feed::MAX_FUTURE_MS;
+use freebird_pow::{difficulty_bits, meets_directory, solve_directory, POW_FLOOR_BITS};
 use serde::{Deserialize, Serialize};
 
 /// Version seed baked into the params; rotating it deliberately mints a new
@@ -68,6 +70,12 @@ pub struct AuthorizedListingV3 {
     pub listing: ListingV1,
     pub signature: Signature,
     pub attestation: Option<AttestationV2>,
+    /// Anonymous proof-of-work nonce (issue #51): solved over the author key
+    /// (see `freebird_pow::meets_directory`). Ignored for attested listings —
+    /// the ghost key skips PoW. Not covered by the signature: tampering with
+    /// it only breaks the PoW check, and the author binding still holds.
+    #[serde(default)]
+    pub pow_nonce: u64,
 }
 
 /// The exact bytes the author signs (issue #47): domain tag + canonical
@@ -107,7 +115,16 @@ impl AuthorizedListingV3 {
             signature,
             listing,
             attestation,
+            pow_nonce: 0,
         }
+    }
+
+    /// An anonymous listing carrying a proof-of-work stamp solved to `bits`
+    /// (issue #51). Solving is a pure integer loop; run it off the UI thread.
+    pub fn new_anon(listing: ListingV1, sk: &SigningKey, bits: u8) -> Self {
+        let mut l = Self::new(listing, sk, None);
+        l.pow_nonce = solve_directory(&l.listing.author, bits);
+        l
     }
 
     pub fn is_anon(&self) -> bool {
@@ -185,7 +202,17 @@ pub struct DirectorySummaryV3 {
     pub anon_horizon: TierHorizon,
 }
 
-pub type DirectoryDeltaV3 = Vec<AuthorizedListingV3>;
+/// A directory delta: the listings offered, plus the optional publisher-signed
+/// difficulty record (issue #51) the writer solved against. The record rides
+/// the ORIGINAL client write only; node-to-node gossip (`DirectoryStateV3::
+/// delta`) emits `pow_difficulty: None`, so replicas always re-admit at the
+/// compiled floor and stay convergent.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct DirectoryDeltaV3 {
+    pub listings: Vec<AuthorizedListingV3>,
+    #[serde(default)]
+    pub pow_difficulty: Option<SignedCellV1>,
+}
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct DirectoryStateV3 {
@@ -210,6 +237,14 @@ impl DirectoryStateV3 {
                 return Err("listing stored under wrong author key".into());
             }
             l.check(&parameters.ghostkey_master)?;
+            // Every seated anonymous listing must clear the COMPILED floor
+            // (issue #51). This is the convergent, adversary-facing check: a
+            // fabricated full state cannot seat a free anonymous share. The
+            // control-cell difficulty is enforced at admission only, so
+            // raising it never retroactively bricks listings already seated.
+            if l.is_anon() && !meets_directory(key, l.pow_nonce, POW_FLOOR_BITS) {
+                return Err("anonymous listing below the proof-of-work floor".into());
+            }
         }
         Ok(())
     }
@@ -293,9 +328,11 @@ impl DirectoryStateV3 {
         }
     }
 
-    /// Listings the peer lacks (or holds older), and would retain.
+    /// Listings the peer lacks (or holds older), and would retain. Gossip
+    /// deltas never carry a difficulty record — admission at the receiver
+    /// runs at the compiled floor (issue #51), keeping replicas convergent.
     pub fn delta(&self, theirs: &DirectorySummaryV3) -> Option<DirectoryDeltaV3> {
-        let delta: Vec<AuthorizedListingV3> = self
+        let listings: Vec<AuthorizedListingV3> = self
             .listings
             .values()
             .filter(|l| match theirs.entries.get(&l.listing.author) {
@@ -319,22 +356,36 @@ impl DirectoryStateV3 {
             })
             .cloned()
             .collect();
-        (!delta.is_empty()).then_some(delta)
+        (!listings.is_empty()).then_some(DirectoryDeltaV3 {
+            listings,
+            pow_difficulty: None,
+        })
     }
 
     /// Verify and merge incoming listings: newer per author wins, then cap.
     pub fn apply_delta(
         &mut self,
         parameters: &DirectoryParametersV3,
-        delta: &[AuthorizedListingV3],
+        delta: &DirectoryDeltaV3,
     ) -> Result<(), String> {
         // Bound the work one delta can demand: each attested listing costs
         // an RSA chain verification inside wasm.
-        if delta.len() > MAX_LISTINGS {
+        if delta.listings.len() > MAX_LISTINGS {
             return Err("listing delta too large".into());
         }
-        for l in delta {
+        // Admission difficulty: the floor, raised by a valid publisher-signed
+        // control-cell record if this write carries one (issue #51).
+        let bits = difficulty_bits(delta.pow_difficulty.as_ref());
+        for l in &delta.listings {
             l.check(&parameters.ghostkey_master)?;
+            // Anonymous listings must clear the proof-of-work bar; drop the
+            // ones that don't rather than fail the whole delta (an honest
+            // peer never forwards an under-bar listing, so this only bites
+            // fabricated deltas — same doctrine as a missing credential).
+            // Attested listings skip PoW entirely.
+            if l.is_anon() && !meets_directory(&l.listing.author, l.pow_nonce, bits) {
+                continue;
+            }
             match self.listings.get(&l.listing.author) {
                 Some(held) if held.lww_key() >= l.lww_key() => {}
                 _ => {
@@ -346,14 +397,18 @@ impl DirectoryStateV3 {
         Ok(())
     }
 
-    /// Full-state merge = apply the other side's listings as a delta.
+    /// Full-state merge = apply the other side's listings as a delta. No
+    /// difficulty record: floor admission, as for any gossip.
     pub fn merge(
         &mut self,
         parameters: &DirectoryParametersV3,
         other: &DirectoryStateV3,
     ) -> Result<(), String> {
-        let entries: Vec<AuthorizedListingV3> = other.listings.values().cloned().collect();
-        self.apply_delta(parameters, &entries)
+        let delta = DirectoryDeltaV3 {
+            listings: other.listings.values().cloned().collect(),
+            pow_difficulty: None,
+        };
+        self.apply_delta(parameters, &delta)
     }
 }
 
@@ -428,7 +483,9 @@ mod contract {
     /// Drop far-future listings from an incoming delta before the merge — a
     /// poisoned timestamp must never get the chance to outlive honest ones.
     fn scrub_delta(delta: &mut DirectoryDeltaV3, now: u64) {
-        delta.retain(|l| l.listing.last_active <= now.saturating_add(MAX_FUTURE_MS));
+        delta
+            .listings
+            .retain(|l| l.listing.last_active <= now.saturating_add(MAX_FUTURE_MS));
     }
 
     #[allow(dead_code)]
@@ -618,13 +675,33 @@ mod tests {
         key
     }
 
+    /// Wrap listings in a floor-difficulty delta (no publisher record).
+    fn d(listings: Vec<AuthorizedListingV3>) -> DirectoryDeltaV3 {
+        DirectoryDeltaV3 {
+            listings,
+            pow_difficulty: None,
+        }
+    }
+
+    /// An anonymous listing carrying a valid floor-difficulty PoW stamp.
+    fn anon_listing(sk: &SigningKey, key: [u8; 32], time: u64) -> AuthorizedListingV3 {
+        AuthorizedListingV3::new_anon(
+            ListingV1 {
+                author: key,
+                last_active: time,
+            },
+            sk,
+            POW_FLOOR_BITS,
+        )
+    }
+
     #[test]
     fn attested_listing_accepted_and_state_verifies() {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
         let mut s = DirectoryStateV3::default();
-        s.apply_delta(&p, &[listing(&a, 5)]).expect("apply ok");
+        s.apply_delta(&p, &d(vec![listing(&a, 5)])).expect("apply ok");
         assert_eq!(s.listings.len(), 1);
         s.verify(&p).expect("verifies");
     }
@@ -635,15 +712,8 @@ mod tests {
         let p = params(&authority);
         let (sk, key) = anon_author();
         let mut s = DirectoryStateV3::default();
-        let l = AuthorizedListingV3::new(
-            ListingV1 {
-                author: key,
-                last_active: 5,
-            },
-            &sk,
-            None,
-        );
-        s.apply_delta(&p, &[l]).expect("apply ok");
+        let l = anon_listing(&sk, key, 5);
+        s.apply_delta(&p, &d(vec![l])).expect("apply ok");
         assert_eq!(s.listings.len(), 1);
         assert!(s.listings[&key].is_anon());
         s.verify(&p).expect("verifies");
@@ -656,7 +726,7 @@ mod tests {
         let p = params(&authority);
         let a = author(&rogue); // attested under the wrong master
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &[listing(&a, 5)]).is_err());
+        assert!(s.apply_delta(&p, &d(vec![listing(&a, 5)])).is_err());
     }
 
     #[test]
@@ -675,7 +745,7 @@ mod tests {
             None,
         );
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &[forged]).is_err());
+        assert!(s.apply_delta(&p, &d(vec![forged])).is_err());
     }
 
     #[test]
@@ -684,10 +754,10 @@ mod tests {
         let p = params(&authority);
         let a = author(&authority);
         let mut s = DirectoryStateV3::default();
-        s.apply_delta(&p, &[listing(&a, 5)]).unwrap();
-        s.apply_delta(&p, &[listing(&a, 3)]).unwrap(); // stale: no-op
+        s.apply_delta(&p, &d(vec![listing(&a, 5)])).unwrap();
+        s.apply_delta(&p, &d(vec![listing(&a, 3)])).unwrap(); // stale: no-op
         assert_eq!(s.listings[&a.key].listing.last_active, 5);
-        s.apply_delta(&p, &[listing(&a, 7)]).unwrap(); // newer: wins
+        s.apply_delta(&p, &d(vec![listing(&a, 7)])).unwrap(); // newer: wins
         assert_eq!(s.listings[&a.key].listing.last_active, 7);
         assert_eq!(s.listings.len(), 1);
     }
@@ -822,7 +892,7 @@ mod tests {
             .map(|i| fake_listing(None, key_of(i, 0), i))
             .collect();
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &delta).is_err());
+        assert!(s.apply_delta(&p, &d(delta)).is_err());
     }
 
     #[test]
@@ -854,10 +924,11 @@ mod tests {
             listing: real.listing.clone(),
             signature: real.signature,
             attestation: None,
+            pow_nonce: 0,
         };
         assert!(stripped.check(&authority.master_vk).is_err());
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &[stripped]).is_err());
+        assert!(s.apply_delta(&p, &d(vec![stripped])).is_err());
 
         // Substituted copy: a stranger's attestation swapped in.
         let stranger = author(&authority);
@@ -865,10 +936,11 @@ mod tests {
             listing: real.listing.clone(),
             signature: real.signature,
             attestation: Some(stranger.att.clone()),
+            pow_nonce: 0,
         };
         assert!(substituted.check(&authority.master_vk).is_err());
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &[substituted.clone()]).is_err());
+        assert!(s.apply_delta(&p, &d(vec![substituted.clone()])).is_err());
 
         // Full-state verify parity with the feed/inbox negative tests: a
         // fabricated state carrying the substituted listing must not verify.
@@ -899,7 +971,7 @@ mod tests {
         );
         assert!(l.check(&authority.master_vk).is_err());
         let mut s = DirectoryStateV3::default();
-        assert!(s.apply_delta(&p, &[l]).is_err());
+        assert!(s.apply_delta(&p, &d(vec![l])).is_err());
     }
 
     /// Wire-format KAT (issue #47) for the listing signing payload.
@@ -923,23 +995,125 @@ mod tests {
         let authority = TestAuthority::new();
         let p = params(&authority);
         let a = author(&authority);
-        let anon_l = |t| {
-            AuthorizedListingV3::new(
-                ListingV1 {
-                    author: a.key,
-                    last_active: t,
-                },
-                &a.sk,
-                None,
-            )
-        };
+        let anon_l = |t| anon_listing(&a.sk, a.key, t);
         let mut s = DirectoryStateV3::default();
-        s.apply_delta(&p, &[anon_l(5)]).unwrap();
-        s.apply_delta(&p, &[listing(&a, 5)]).unwrap(); // equal time: attested wins
+        s.apply_delta(&p, &d(vec![anon_l(5)])).unwrap();
+        s.apply_delta(&p, &d(vec![listing(&a, 5)])).unwrap(); // equal time: attested wins
         assert!(s.listings[&a.key].attestation.is_some());
-        s.apply_delta(&p, &[anon_l(7)]).unwrap(); // newer self-publication wins
+        s.apply_delta(&p, &d(vec![anon_l(7)])).unwrap(); // newer self-publication wins
         assert!(s.listings[&a.key].is_anon());
         assert_eq!(s.listings[&a.key].listing.last_active, 7);
+    }
+
+    // ---- proof-of-work (issue #51) ----
+
+    /// An anonymous listing with a missing/invalid stamp is dropped at
+    /// admission and makes a fabricated full state fail verify.
+    #[test]
+    fn anon_without_valid_pow_rejected() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let (sk, key) = anon_author();
+        // nonce 0 clears the 20-bit floor with probability 2^-20 — negligible.
+        let bad = AuthorizedListingV3::new(
+            ListingV1 { author: key, last_active: 5 },
+            &sk,
+            None,
+        );
+        assert_eq!(bad.pow_nonce, 0);
+
+        let mut s = DirectoryStateV3::default();
+        s.apply_delta(&p, &d(vec![bad.clone()])).expect("delta ok, listing dropped");
+        assert!(s.listings.is_empty(), "unstamped anon listing must be dropped");
+
+        let mut fabricated = DirectoryStateV3::default();
+        fabricated.listings.insert(key, bad);
+        assert!(fabricated.verify(&p).is_err(), "under-floor anon fails verify");
+    }
+
+    /// The ghost-key (attested) path skips PoW: an attested listing with no
+    /// stamp is admitted and verifies.
+    #[test]
+    fn attested_skips_pow() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let a = author(&authority);
+        let l = listing(&a, 5);
+        assert_eq!(l.pow_nonce, 0, "attested writes carry no stamp");
+        let mut s = DirectoryStateV3::default();
+        s.apply_delta(&p, &d(vec![l])).expect("attested admitted without PoW");
+        assert_eq!(s.listings.len(), 1);
+        s.verify(&p).expect("verifies");
+    }
+
+    /// A stamp solved for author A is worthless on author B's listing.
+    #[test]
+    fn pow_stamp_not_reusable_across_authors() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let (sk_a, key_a) = anon_author();
+        let a_listing = anon_listing(&sk_a, key_a, 5);
+        let harvested = a_listing.pow_nonce;
+
+        let (sk_b, key_b) = anon_author();
+        let mut b_listing = AuthorizedListingV3::new(
+            ListingV1 { author: key_b, last_active: 5 },
+            &sk_b,
+            None,
+        );
+        b_listing.pow_nonce = harvested; // A's solve grafted onto B
+
+        let mut s = DirectoryStateV3::default();
+        s.apply_delta(&p, &d(vec![b_listing])).expect("delta ok");
+        assert!(s.listings.is_empty(), "A's stamp must not admit B");
+    }
+
+    /// Difficulty sourced from the control cell: a publisher-signed record
+    /// raises the admission bar, so a floor-only stamp is rejected while one
+    /// solved to the control difficulty is accepted. (`test-publisher` feature
+    /// makes the compiled publisher key a known test secret.)
+    #[test]
+    fn control_cell_difficulty_raises_bar() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let publisher = SigningKey::from_bytes(&freebird_pow::PUBLISHER_TEST_SECRET);
+        let control = 22u8; // > POW_FLOOR_BITS (20)
+        let record = SignedCellV1::new(
+            &publisher,
+            freebird_pow::POW_PURPOSE,
+            1,
+            freebird_pow::difficulty_body(control),
+        );
+
+        let (sk, key) = anon_author();
+        // Floor-only solve is now under the control-cell bar → dropped.
+        let weak = anon_listing(&sk, key, 5);
+        let mut s = DirectoryStateV3::default();
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 {
+                listings: vec![weak],
+                pow_difficulty: Some(record.clone()),
+            },
+        )
+        .expect("delta ok");
+        assert!(s.listings.is_empty(), "floor stamp rejected under raised difficulty");
+
+        // Solved to the control difficulty → admitted.
+        let strong = AuthorizedListingV3::new_anon(
+            ListingV1 { author: key, last_active: 5 },
+            &sk,
+            control,
+        );
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 {
+                listings: vec![strong],
+                pow_difficulty: Some(record),
+            },
+        )
+        .expect("delta ok");
+        assert_eq!(s.listings.len(), 1, "control-difficulty stamp accepted");
     }
 
     /// Shrunken anon share (900 attested at the 1000 cap ⇒ effective anon

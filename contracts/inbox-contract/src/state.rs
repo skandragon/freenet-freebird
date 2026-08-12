@@ -74,11 +74,17 @@ pub struct InboxStateV3Summary {
     pub pointers: <PointersV3 as ComposableState>::Summary,
 }
 
-/// Same shape the `#[composable]` macro generated.
+/// Same shape the `#[composable]` macro generated, plus the optional
+/// publisher-signed difficulty record (issue #51) the writer solved against.
+/// The record rides the ORIGINAL client write only; node-to-node gossip
+/// (`delta()`) emits `pow_difficulty: None`, so replicas always re-admit at
+/// the compiled floor and stay convergent.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct InboxStateV3Delta {
     pub creds: Option<<CredsV3 as ComposableState>::Delta>,
     pub pointers: Option<<PointersV3 as ComposableState>::Delta>,
+    #[serde(default)]
+    pub pow_difficulty: Option<cell_contract::SignedCellV1>,
 }
 
 impl ComposableState for InboxStateV3 {
@@ -138,7 +144,7 @@ impl ComposableState for InboxStateV3 {
             })
             .filter(|c| !c.is_empty());
         (creds.is_some() || pointers.is_some())
-            .then_some(InboxStateV3Delta { creds, pointers })
+            .then_some(InboxStateV3Delta { creds, pointers, pow_difficulty: None })
     }
 
     fn apply_delta(
@@ -148,6 +154,26 @@ impl ComposableState for InboxStateV3 {
         delta: &Option<Self::Delta>,
     ) -> Result<(), String> {
         let Some(delta) = delta else { return Ok(()) };
+        // PoW admission (issue #51): drop anonymous pointers below the
+        // effective difficulty — the compiled floor, raised by a valid
+        // publisher-signed control-cell record if this write carries one.
+        // Attested pointers skip PoW (ghost key = accelerator). Drop-not-fatal,
+        // same doctrine as a missing credential: an honest peer never forwards
+        // an under-bar stamp. Wrong-inbox pointers are LEFT IN so the staple
+        // loop / check_pointer can fatal on them (issue #46), never silently
+        // dropped by a binding-mismatched PoW check.
+        let owner = parameters.owner.to_bytes();
+        let bits = freebird_pow::difficulty_bits(delta.pow_difficulty.as_ref());
+        let admitted: Option<Vec<AuthorizedReplyPointerV3>> = delta.pointers.as_ref().map(|ps| {
+            ps.iter()
+                .filter(|p| {
+                    !is_anon_fingerprint(&p.ptr.fingerprint)
+                        || p.ptr.owner != owner
+                        || freebird_pow::meets_inbox(&owner, &p.ptr.replier, p.pow_nonce, bits)
+                })
+                .cloned()
+                .collect()
+        });
         // A delta cred no existing or incoming pointer references would be
         // pruned by post_apply_cleanup anyway — skip it BEFORE apply pays
         // its RSA verification (issue #49). An incoming pointer vouches for
@@ -164,7 +190,7 @@ impl ComposableState for InboxStateV3 {
                 // check_pointer), and the verified ones vouch for their
                 // creds — one ed25519 verify gates each RSA check.
                 let mut stapled = std::collections::BTreeSet::new();
-                if let Some(ps) = &delta.pointers {
+                if let Some(ps) = &admitted {
                     for ptr in ps {
                         // Wrong-inbox staples fail here, BEFORE any RSA is
                         // paid (issue #46) — same doctrine as bad signatures.
@@ -192,7 +218,7 @@ impl ComposableState for InboxStateV3 {
         self.creds.apply_delta(&self_clone, parameters, &creds)?;
         let self_clone = self.clone();
         self.pointers
-            .apply_delta(&self_clone, parameters, &delta.pointers)?;
+            .apply_delta(&self_clone, parameters, &admitted)?;
         self.post_apply_cleanup(parameters)?;
         Ok(())
     }
@@ -441,6 +467,12 @@ mod inbox_v3_components {
     pub struct AuthorizedReplyPointerV3 {
         pub ptr: ReplyPointerV3,
         pub signature: Signature,
+        /// Anonymous proof-of-work nonce (issue #51): solved over the inbox
+        /// owner + replier key (see `freebird_pow::meets_inbox`). Ignored for
+        /// attested pointers — the ghost key skips PoW. Not covered by the
+        /// signature: tampering only breaks the PoW check, never the binding.
+        #[serde(default)]
+        pub pow_nonce: u64,
     }
 
     impl AuthorizedReplyPointerV3 {
@@ -449,7 +481,22 @@ mod inbox_v3_components {
             Self {
                 signature: signing_key.sign(&ptr.signing_payload()),
                 ptr,
+                pow_nonce: 0,
             }
+        }
+
+        /// An anonymous pointer carrying a proof-of-work stamp solved to
+        /// `bits` (issue #51). Solving is a pure integer loop; keep it off the
+        /// UI thread.
+        pub fn new_anon(
+            ptr: ReplyPointerV3,
+            signing_key: &ed25519_dalek::SigningKey,
+            bits: u8,
+        ) -> Self {
+            let nonce = freebird_pow::solve_inbox(&ptr.owner, &ptr.replier, bits);
+            let mut p = Self::new(ptr, signing_key);
+            p.pow_nonce = nonce;
+            p
         }
 
         pub fn verify_signature(&self, posting_key: &VerifyingKey) -> Result<(), String> {
@@ -692,6 +739,22 @@ mod inbox_v3_components {
                 if !check_pointer(p, &parent.creds.creds, parameters)? {
                     return Err("pointer without matching credential".into());
                 }
+                // Every seated anonymous pointer must clear the COMPILED PoW
+                // floor (issue #51): the convergent, adversary-facing check
+                // that a fabricated full state cannot seat a free anonymous
+                // share. check_pointer already bound `owner` to this inbox.
+                // The control-cell difficulty is enforced at admission only,
+                // so raising it never retroactively bricks seated pointers.
+                if p.is_anon()
+                    && !freebird_pow::meets_inbox(
+                        &parameters.owner.to_bytes(),
+                        &p.ptr.replier,
+                        p.pow_nonce,
+                        freebird_pow::POW_FLOOR_BITS,
+                    )
+                {
+                    return Err("anonymous pointer below the proof-of-work floor".into());
+                }
                 if !seen.insert(p.ptr.reply_post) {
                     return Err("duplicate reply pointer".into());
                 }
@@ -828,7 +891,13 @@ mod tests {
             reply_post: PostId::compute(&r.sk.verifying_key(), time, &format!("r{tag}"), &None),
             time,
         };
-        AuthorizedReplyPointerV3::new(ptr, &r.sk)
+        // Anonymous pointers carry a floor-difficulty PoW stamp (issue #51);
+        // attested pointers skip PoW.
+        if r.cred.attestation.is_none() {
+            AuthorizedReplyPointerV3::new_anon(ptr, &r.sk, freebird_pow::POW_FLOOR_BITS)
+        } else {
+            AuthorizedReplyPointerV3::new(ptr, &r.sk)
+        }
     }
 
     fn delta_of(
@@ -842,6 +911,7 @@ mod tests {
         Some(InboxStateV3Delta {
             creds: (!creds_map.is_empty()).then_some(creds_map),
             pointers: (!pointers.is_empty()).then_some(pointers),
+            pow_difficulty: None,
         })
     }
 
@@ -905,15 +975,134 @@ mod tests {
         let r = anon_replier();
         let other = anon_replier();
         let mut s = InboxStateV3::default();
-        // Pointer claims r's identity but is signed by other's key.
+        // Pointer claims r's identity but is signed by other's key. A valid
+        // PoW stamp (over r's key) clears admission so the FORGED SIGNATURE is
+        // what fails — otherwise the under-PoW drop would mask it.
         let mut fake = pointer_for(&other, &p, 5, 0);
         fake.ptr.replier = r.key;
         fake.ptr.fingerprint = r.cred.fingerprint();
-        let fake = AuthorizedReplyPointerV3::new(fake.ptr, &other.sk);
+        let mut fake = AuthorizedReplyPointerV3::new(fake.ptr, &other.sk);
+        fake.pow_nonce =
+            freebird_pow::solve_inbox(&fake.ptr.owner, &fake.ptr.replier, freebird_pow::POW_FLOOR_BITS);
         let clone = s.clone();
         assert!(s
             .apply_delta(&clone, &p, &delta_of(vec![&r], vec![fake]))
             .is_err());
+    }
+
+    // ---- proof-of-work (issue #51) ----
+
+    /// An anonymous pointer with a missing/invalid stamp is dropped at
+    /// admission and makes a fabricated full state fail verify.
+    #[test]
+    fn anon_without_valid_pow_rejected() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = anon_replier();
+        // Build a valid anon pointer, then strip the stamp.
+        let mut ptr = pointer_for(&r, &p, 5, 0);
+        ptr.pow_nonce = 0; // nonce 0 clears 20 bits with prob 2^-20
+
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![ptr.clone()]));
+        assert!(s.pointers.pointers.is_empty(), "unstamped anon pointer dropped");
+
+        // A fabricated full state carrying it must not verify.
+        let mut fabricated = InboxStateV3::default();
+        fabricated.creds.creds.insert(r.key, r.cred.clone());
+        fabricated.pointers.pointers.push(ptr);
+        assert!(fabricated.verify(&fabricated.clone(), &p).is_err());
+    }
+
+    /// The ghost-key (attested) path skips PoW: an attested pointer with no
+    /// stamp is admitted and verifies.
+    #[test]
+    fn attested_skips_pow() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = attested_replier(&authority);
+        let ptr = pointer_for(&r, &p, 5, 0);
+        assert_eq!(ptr.pow_nonce, 0, "attested pointers carry no stamp");
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![ptr]));
+        assert_eq!(s.pointers.pointers.len(), 1);
+        s.verify(&s.clone(), &p).expect("verifies");
+    }
+
+    /// A stamp solved for inbox A is worthless in inbox B (bound to the owner).
+    #[test]
+    fn pow_stamp_not_reusable_across_inboxes() {
+        let authority = TestAuthority::new();
+        let pa = params(&authority);
+        let pb = params(&authority);
+        assert_ne!(pa.owner, pb.owner);
+        let r = anon_replier();
+        // A pointer legitimately signed for inbox B, but stamped for inbox A's
+        // owner. The signature stays valid (owner is unchanged); only the PoW
+        // binding is wrong, so admission drops it.
+        let mut ptr = pointer_for(&r, &pb, 5, 0);
+        ptr.pow_nonce =
+            freebird_pow::solve_inbox(&pa.owner.to_bytes(), &r.key, freebird_pow::POW_FLOOR_BITS);
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &pb, delta_of(vec![&r], vec![ptr]));
+        assert!(s.pointers.pointers.is_empty(), "A's stamp must not admit in B");
+    }
+
+    /// Difficulty sourced from the control cell: a publisher-signed record
+    /// raises the admission bar, so a floor-only stamp is dropped while one
+    /// solved to the control difficulty is admitted.
+    #[test]
+    fn control_cell_difficulty_raises_bar() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let publisher = SigningKey::from_bytes(&freebird_pow::PUBLISHER_TEST_SECRET);
+        let control = 22u8; // > POW_FLOOR_BITS (20)
+        let record = cell_contract::SignedCellV1::new(
+            &publisher,
+            freebird_pow::POW_PURPOSE,
+            1,
+            freebird_pow::difficulty_body(control),
+        );
+        let r = anon_replier();
+
+        // Floor-only stamp, under the raised bar → dropped.
+        let weak = pointer_for(&r, &p, 5, 0); // solved to POW_FLOOR_BITS
+        let mut s = InboxStateV3::default();
+        let clone = s.clone();
+        s.apply_delta(
+            &clone,
+            &p,
+            &Some(InboxStateV3Delta {
+                creds: Some([(r.key, r.cred.clone())].into_iter().collect()),
+                pointers: Some(vec![weak]),
+                pow_difficulty: Some(record.clone()),
+            }),
+        )
+        .expect("delta ok");
+        assert!(s.pointers.pointers.is_empty(), "floor stamp rejected under raised difficulty");
+
+        // Solved to the control difficulty → admitted.
+        let ptr = ReplyPointerV3 {
+            owner: p.owner.to_bytes(),
+            replier: r.key,
+            fingerprint: r.cred.fingerprint(),
+            target_post: PostId([1u8; 16]),
+            reply_post: PostId::compute(&r.sk.verifying_key(), 6, "strong", &None),
+            time: 6,
+        };
+        let strong = AuthorizedReplyPointerV3::new_anon(ptr, &r.sk, control);
+        let clone = s.clone();
+        s.apply_delta(
+            &clone,
+            &p,
+            &Some(InboxStateV3Delta {
+                creds: Some([(r.key, r.cred.clone())].into_iter().collect()),
+                pointers: Some(vec![strong]),
+                pow_difficulty: Some(record),
+            }),
+        )
+        .expect("delta ok");
+        assert_eq!(s.pointers.pointers.len(), 1, "control-difficulty stamp accepted");
     }
 
     /// Issue #46: a pointer signed for inbox A must fail validation in
@@ -941,9 +1130,14 @@ mod tests {
         fabricated.pointers.pointers.push(harvested.clone());
         assert!(fabricated.verify(&fabricated.clone(), &pb).is_err());
 
-        // Rewriting the owner field breaks the signature instead.
+        // Rewriting the owner field breaks the signature instead. Re-stamp
+        // for inbox B so the pointer clears PoW admission and the BROKEN
+        // SIGNATURE is what fails (otherwise the wrong-binding stamp would be
+        // dropped first, masking the signature check).
         let mut rewritten = harvested;
         rewritten.ptr.owner = pb.owner.to_bytes();
+        rewritten.pow_nonce =
+            freebird_pow::solve_inbox(&pb.owner.to_bytes(), &r.key, freebird_pow::POW_FLOOR_BITS);
         let mut b = InboxStateV3::default();
         let clone = b.clone();
         assert!(b
@@ -1031,6 +1225,7 @@ mod tests {
                 &Some(InboxStateV3Delta {
                     creds: Some([(victim.key, forged)].into_iter().collect()),
                     pointers: None,
+                    pow_difficulty: None,
                 }),
             )
             .is_err());
@@ -1215,6 +1410,7 @@ mod tests {
             Some(InboxStateV3Delta {
                 creds: Some(attacker.creds.creds.clone()),
                 pointers: None,
+                pow_difficulty: None,
             }),
         );
         assert_eq!(receiver.summarize(&receiver.clone(), &p), before);
@@ -1306,6 +1502,7 @@ mod tests {
                 &Some(InboxStateV3Delta {
                     creds: Some(creds_map),
                     pointers: None,
+                    pow_difficulty: None,
                 }),
             )
             .is_err());
@@ -1331,6 +1528,7 @@ mod tests {
                 time,
             },
             signature: Signature::from_bytes(&[0u8; 64]),
+            pow_nonce: 0,
         }
     }
 
@@ -1606,7 +1804,7 @@ mod tests {
         let p = params(&authority);
         let r = anon_replier();
         let mk = |time: u64, reply: PostId| {
-            AuthorizedReplyPointerV3::new(
+            AuthorizedReplyPointerV3::new_anon(
                 ReplyPointerV3 {
                     owner: p.owner.to_bytes(),
                     replier: r.key,
@@ -1616,6 +1814,7 @@ mod tests {
                     time,
                 },
                 &r.sk,
+                freebird_pow::POW_FLOOR_BITS,
             )
         };
         let dup = PostId([7u8; 16]);

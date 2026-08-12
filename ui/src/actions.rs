@@ -203,10 +203,21 @@ async fn send_inbox_pointer(
         reply_post,
         time,
     };
-    let authorized = AuthorizedReplyPointerV3::new(ptr, sk);
+    // Anonymous pointers must carry a proof-of-work stamp (issue #51);
+    // attested (ghost-key) pointers skip PoW. The solve is a synchronous
+    // hashcash loop at the compiled floor — a fraction of a second, but it
+    // runs on the UI thread (ponytail: move to a Web Worker if it ever
+    // stutters posting). No control-cell record is attached yet, so admission
+    // uses the floor.
+    let authorized = if cred.attestation.is_none() {
+        AuthorizedReplyPointerV3::new_anon(ptr, sk, freebird_pow::POW_FLOOR_BITS)
+    } else {
+        AuthorizedReplyPointerV3::new(ptr, sk)
+    };
     let delta = InboxStateV3Delta {
         creds: Some([(replier, cred)].into_iter().collect()),
         pointers: Some(vec![authorized]),
+        pow_difficulty: None,
     };
     api::update_inbox(target_author, delta).await
 }
@@ -317,11 +328,23 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
             author: sk.verifying_key().to_bytes(),
             last_active: keys::now_ms(),
         };
-        let authorized = AuthorizedListingV3::new(listing, &sk, att);
+        // Anonymous listings must carry a proof-of-work stamp (issue #51);
+        // attested listings skip it. Floor-difficulty solve, on the UI thread
+        // (see send_inbox_pointer).
+        let authorized = match att {
+            Some(att) => AuthorizedListingV3::new(listing, &sk, Some(att)),
+            None => AuthorizedListingV3::new_anon(listing, &sk, freebird_pow::POW_FLOOR_BITS),
+        };
         api::put_directory_listing(&authorized).await?;
         // Optimistic local apply so Discover shows us immediately.
         if let Some(dir) = DIRECTORY.write().as_mut() {
-            let _ = dir.apply_delta(&keys::directory_params(), std::slice::from_ref(&authorized));
+            let _ = dir.apply_delta(
+                &keys::directory_params(),
+                &directory_contract::DirectoryDeltaV3 {
+                    listings: vec![authorized.clone()],
+                    pow_difficulty: None,
+                },
+            );
         }
     }
     api::kv_request(FreebirdDelegateRequest::Store {
