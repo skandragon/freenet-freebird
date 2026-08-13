@@ -35,7 +35,7 @@ pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
 
 /// LEGACY (pre-#64) feed states by author key — dual-read migration window
 /// (issue #64 rotated the feed contract and changed its format in place).
-/// `None` value = requested, not yet arrived. Never written back to the v1
+/// `None` value = requested, not yet arrived. Never written back to the legacy
 /// contract; our OWN entry is the source for the forward migration (#56,
 /// `actions::migrate_v1`), which re-signs it into the v2 feed. Gated on
 /// `read_v1_feed`.
@@ -66,7 +66,7 @@ pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar
 /// LEGACY avatars by author key — dual-read migration window (issue #81).
 /// Kept SEPARATE from `AVATARS` rather than merged into it: the rendering
 /// fallback needs "we have only a legacy blob" to stay distinguishable, or
-/// `migrate_v1` cannot tell whether it still owes a re-signed upload.
+/// `migrate_avatar` cannot tell whether it still owes a re-signed upload.
 pub static LEGACY_AVATARS: GlobalSignal<
     BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>,
 > = Signal::global(BTreeMap::new);

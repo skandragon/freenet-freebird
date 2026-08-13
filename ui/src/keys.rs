@@ -53,10 +53,16 @@ pub const LEGACY_DELEGATE_WASMS: &[&[u8]] = &[FREEBIRD_DELEGATE_V1_WASM];
 pub const INBOX_GENERATION: u32 = 3;
 pub const FEED_GENERATION: u32 = 3;
 /// Bumped to 2 with issue #81: the avatar contract rotated for #47's
-/// domain-tagged signature but the constant stayed at 1, so anchors written
-/// by the live build label the OLD address "generation 1" — exactly what
-/// this build derives. `anchor_targets` then followed that address and fed
-/// pre-#47 bytes to the current decoder, which rejects every one of them.
+/// domain-tagged signature while the constant stayed at 1, so the counter
+/// was one behind the actual rotation count — the same drift that left
+/// INBOX_GENERATION at 2 across four inbox rotations.
+///
+/// No live anchor is affected: the build in `scripts/live-build.txt`
+/// publishes ONLY `ROLE_INBOX` (avatar and feed roles were first published
+/// later, in #54), so nothing on the network labels an avatar address at
+/// all and `anchor_targets` has never had one to follow. The bump costs
+/// nothing today and puts the counter back in step before the first anchor
+/// that does carry an avatar role is written.
 pub const AVATAR_GENERATION: u32 = 2;
 
 /// This bundle's build number (git commit count; 0 in git-less dev builds).
@@ -359,29 +365,27 @@ mod tests {
         assert_eq!(got, golden, "derived contract addresses ROTATED");
     }
 
-    /// The legacy params mirrors in `crate::legacy` exist only so the UI can
-    /// derive the live addresses without linking the old contract crates.
-    /// If their CBOR ever stopped matching the real params, the dual-read
-    /// would point at an address nobody writes to — issue #81 again, with a
-    /// different cause. Only the wasm bytes may distinguish the two.
+    /// Each generation must derive a DIFFERENT address — otherwise the
+    /// dual-read GETs the same contract twice and the window is a no-op that
+    /// looks like it is working.
+    ///
+    /// The legacy params' correctness is NOT asserted here. It cannot be:
+    /// the live generation's types are gone from the tree, so the current
+    /// types are not a valid oracle for them (v2 and v3 inbox params happen
+    /// to share a shape today, and comparing against v3 would demand
+    /// "fixing" the frozen mirror the day v4 adds a field — precisely the
+    /// bug the mirror exists to prevent). The real oracle is the CBOR golden
+    /// in `legacy::tests::legacy_params_wire_format_kat`.
+    ///
+    /// If a future release rotates only SOME roles, the un-rotated ones'
+    /// `_v1` blob is legitimately identical to the current one and the
+    /// matching assertion below must be dropped along with that role's
+    /// legacy GET — a window onto your own address retains nothing.
     #[test]
-    fn legacy_params_are_cbor_identical_to_current() {
+    fn each_generation_derives_a_distinct_address() {
         let a = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
-        assert_eq!(
-            freebird_core::to_cbor(&inbox_params_v1(&a)).unwrap(),
-            freebird_core::to_cbor(&inbox_params(&a)).unwrap(),
-            "legacy inbox params drifted from the real params shape"
-        );
-        // The directory's seed is the one field that legitimately differs.
-        assert_eq!(
-            crate::legacy::LEGACY_DIRECTORY_SEED, "freebird-directory-v2",
-            "legacy directory seed must name the LIVE directory"
-        );
-        assert_ne!(
-            inbox_key(&a),
-            inbox_key_v1(&a),
-            "only the wasm bytes separate the generations"
-        );
+        assert_ne!(feed_key(&a), feed_key_v1(&a));
+        assert_ne!(inbox_key(&a), inbox_key_v1(&a));
         assert_ne!(avatar_key(&a), avatar_key_v1(&a));
         assert_ne!(directory_key(), directory_key_v1());
     }

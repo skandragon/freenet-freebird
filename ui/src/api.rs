@@ -373,7 +373,14 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
 /// on the previous build lives only there (issue #81).
 pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
-    AVATARS.write().entry(author).or_insert(None);
+    let legacy = flag_bool("read_v1_avatar", true);
+    // Seat the "requested" sentinels only AFTER both sends succeed. Seating
+    // first looks harmless but strands the caller: `send` fails while the
+    // socket is still connecting, the entry is nonetheless present, every
+    // caller that gates on `contains_key` then believes a request is in
+    // flight, and no response will ever arrive to correct it. For the
+    // avatar-migration effect that meant the migration was dead for the
+    // session — and the legacy GET below had never been issued at all.
     track(keys::avatar_key(&vk), TrackedKind::Avatar(author));
     send(ClientRequest::ContractOp(ContractRequest::Get {
         key: keys::avatar_instance_id(&vk),
@@ -382,8 +389,7 @@ pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
         blocking_subscribe: false,
     }))
     .await?;
-    if flag_bool("read_v1_avatar", true) {
-        LEGACY_AVATARS.write().entry(author).or_insert(None);
+    if legacy {
         track(keys::avatar_key_v1(&vk), TrackedKind::LegacyAvatar(author));
         send(ClientRequest::ContractOp(ContractRequest::Get {
             key: keys::avatar_instance_id_v1(&vk),
@@ -392,6 +398,10 @@ pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
             blocking_subscribe: false,
         }))
         .await?;
+    }
+    AVATARS.write().entry(author).or_insert(None);
+    if legacy {
+        LEGACY_AVATARS.write().entry(author).or_insert(None);
     }
     Ok(())
 }
@@ -455,7 +465,9 @@ pub async fn update_inbox(target_author: [u8; 32], delta: InboxStateV3Delta) -> 
 }
 
 /// GET + subscribe the well-known public directory (issue #11), plus the
-/// legacy v1 directory during the dual-read window (`read_v1_directory`).
+/// legacy directory during the dual-read window (`read_v1_directory`).
+/// "v1" in these flag names is the historical NAME of the window, not a
+/// generation number — see ui/src/keys.rs.
 pub async fn fetch_directory() -> Result<(), String> {
     track(keys::directory_key(), TrackedKind::Directory);
     send(ClientRequest::ContractOp(ContractRequest::Get {

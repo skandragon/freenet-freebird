@@ -13,8 +13,10 @@ re-pin them as a routine step. We rebuild + re-pin **only** when a contract's
 inputs actually change: its source, or a dependency/`Cargo.lock` bump that
 alters its bytes.
 
-Frozen forever (never rebuilt): `cell_contract.wasm` (the anchor/control/PoW
-kernel) and every `*_v1.wasm` legacy blob.
+Never rebuilt: `cell_contract.wasm` (the anchor/control/PoW kernel) and
+every `*_v1.wasm` legacy blob. The cell kernel is frozen forever; the `_v1`
+blobs are *copied* from the live build on each publish rather than compiled
+— see `docs/dual-read-window.md` and `make check-legacy-wasm`.
 
 The current `feed`/`avatar`/`inbox`/`directory`/`freebird_delegate` bytes are
 **grandfathered** — they were built on macOS before the reproducible Docker
@@ -53,10 +55,16 @@ host.
 4. Update the golden addresses in `ui/src/keys.rs` for whatever rotated: run
    `cargo test -p freebird-ui golden_addresses_pinned`, take the new address
    from the failure output, and pin it with a comment recording the rotation.
-5. Decide the migration story: add a dual-read window so existing data stays
-   reachable (the `*_v1` precedent in `ui/src/keys.rs`), or follow the
-   no-window precedent (#45/#49/#51/#50) for short-lived data like directory
-   listings, where authors re-seat on their next republish.
+5. Add a dual-read window so existing data stays reachable, and follow
+   `docs/dual-read-window.md` — re-vendor the `_v1` blob from
+   `scripts/live-build.txt`, mirror the outgoing wire types in
+   `ui/src/legacy.rs`, regenerate its CBOR KATs, and run
+   `make check-legacy-wasm`.
+
+   The old "no-window precedent (#45/#49/#50/#51)… authors re-seat on their
+   next republish" is RETRACTED (issue #81). Re-seating needs every listed
+   author to return and every replier to repost, so in practice Discover
+   went empty and threads lost their replies. Do not skip the window.
 
 ## Proving reproducibility (amd64 build-of-record)
 

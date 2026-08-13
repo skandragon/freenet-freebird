@@ -88,28 +88,53 @@ pin-hashes:
 #
 # The live commit is recorded in scripts/live-build.txt and its blobs come
 # straight out of git, so this is an offline, deterministic check.
-LEGACY_ROLES := feed_contract inbox_contract avatar_contract directory_contract freebird_delegate
+#
+# freebird_delegate_v1.wasm is deliberately NOT here. The delegate has no
+# dual-read window: LEGACY_DELEGATE_WASMS (ui/src/keys.rs) is a CUMULATIVE
+# registry of every generation ever shipped, because the startup probe folds
+# each old generation's stored posting-key seed forward (issue #53).
+# Requiring it to equal the live build would overwrite the oldest entry and
+# destroy the seed of anyone still on that generation.
+LEGACY_ROLES := feed_contract inbox_contract avatar_contract directory_contract
 check-legacy-wasm:
 	@live=$$(grep -v '^#' scripts/live-build.txt | tr -d '[:space:]'); \
 	[ -n "$$live" ] || { echo "ERROR: scripts/live-build.txt names no commit"; exit 1; }; \
 	git cat-file -e "$$live^{commit}" 2>/dev/null || { \
 	  echo "ERROR: live build $$live is not in this repo — CI needs full history"; exit 1; }; \
+	git merge-base --is-ancestor "$$live" HEAD || { \
+	  echo "ERROR: live build $$live is not an ancestor of HEAD."; \
+	  echo "A commit that was never merged cannot be what users are running."; \
+	  exit 1; }; \
 	fail=0; \
 	for r in $(LEGACY_ROLES); do \
-	  want=$$(git cat-file blob "$$live:ui/contracts/$$r.wasm" 2>/dev/null | shasum -a 256 | cut -d' ' -f1); \
-	  got=$$(shasum -a 256 "ui/contracts/$${r}_v1.wasm" 2>/dev/null | cut -d' ' -f1); \
-	  [ -n "$$want" ] || { echo "ERROR: $$r.wasm absent from live build $$live"; fail=1; continue; }; \
+	  v1="ui/contracts/$${r}_v1.wasm"; \
+	  git cat-file -e "$$live:ui/contracts/$$r.wasm" 2>/dev/null || { \
+	    echo "ERROR: $$r.wasm absent from live build $$live"; fail=1; continue; }; \
+	  [ -s "$$v1" ] || { echo "ERROR: $$v1 is missing or EMPTY"; fail=1; continue; }; \
+	  want=$$(git cat-file blob "$$live:ui/contracts/$$r.wasm" | shasum -a 256 | cut -d' ' -f1); \
+	  got=$$(shasum -a 256 "$$v1" | cut -d' ' -f1); \
 	  [ "$$want" = "$$got" ] || { \
-	    echo "ERROR: ui/contracts/$${r}_v1.wasm is NOT the live build's bytes"; \
+	    echo "ERROR: $$v1 is NOT the live build's bytes"; \
 	    echo "  live ($$live): $$want"; \
-	    echo "  vendored _v1:  $${got:-<missing>}"; \
+	    echo "  vendored _v1:  $$got"; \
 	    fail=1; }; \
+	done; \
+	for f in ui/contracts/*_v1.wasm; do \
+	  r=$$(basename "$$f" _v1.wasm); \
+	  case " $(LEGACY_ROLES) freebird_delegate " in \
+	    *" $$r "*) ;; \
+	    *) echo "ERROR: $$f is vendored but no rule covers it — add it to"; \
+	       echo "       LEGACY_ROLES, or document why it is exempt."; fail=1;; \
+	  esac; \
 	done; \
 	[ $$fail -eq 0 ] || { \
 	  echo ""; \
 	  echo "The dual-read window would read a contract nobody writes to (issue #81)."; \
-	  echo "Re-vendor from the live build:"; \
-	  echo "  git cat-file blob $$live:ui/contracts/<role>.wasm > ui/contracts/<role>_v1.wasm"; \
+	  echo "Re-vendor from the live build (write to a temp file first — a shell"; \
+	  echo "redirect truncates the target BEFORE git runs, and a 0-byte blob is"; \
+	  echo "how this check used to be fooled):"; \
+	  echo "  git cat-file blob $$live:ui/contracts/<role>.wasm > /tmp/<role>.wasm"; \
+	  echo "  mv /tmp/<role>.wasm ui/contracts/<role>_v1.wasm"; \
 	  echo "then: make pin-hashes, and update the goldens in ui/src/keys.rs."; \
 	  exit 1; }
 	@echo "legacy _v1 wasm matches the live build"

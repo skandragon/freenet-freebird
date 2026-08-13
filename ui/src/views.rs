@@ -655,7 +655,12 @@ pub fn App() -> Element {
         let Some(author) = own_author() else { return };
         if !AVATARS.read().contains_key(&author) {
             spawn(async move {
-                let _ = api::fetch_avatar(author).await;
+                // Not `let _ =`: this is the only trigger for the whole
+                // avatar migration, so a swallowed send failure here is a
+                // silently lost profile picture when the window closes.
+                if let Err(e) = api::fetch_avatar(author).await {
+                    api::log(&format!("avatar fetch for migration failed: {e}"));
+                }
             });
             return;
         }
