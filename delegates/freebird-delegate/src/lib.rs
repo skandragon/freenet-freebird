@@ -238,11 +238,8 @@ mod tests {
     #[test]
     fn list_scoped_to_origin() {
         let mut kv = MemKv::default();
-        for (origin, key) in [
-            (ORIGIN_A, "draft"),
-            (ORIGIN_A, "posting_key"),
-            (ORIGIN_B, "other"),
-        ] {
+        for (origin, key) in [(ORIGIN_A, "draft"), (ORIGIN_A, "posting_key"), (ORIGIN_B, "other")]
+        {
             handle_request(
                 &mut kv,
                 origin,

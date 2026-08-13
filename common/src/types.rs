@@ -71,8 +71,9 @@ pub struct PostV1 {
 impl PostV1 {
     /// The exact bytes the author signs: domain tag + canonical field layout.
     pub fn signing_payload(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(POST_SIGN_DOMAIN.len() + 16 + 8 + 4 + self.content.len() + 1 + 48);
+        let mut out = Vec::with_capacity(
+            POST_SIGN_DOMAIN.len() + 16 + 8 + 4 + self.content.len() + 1 + 48,
+        );
         out.extend_from_slice(POST_SIGN_DOMAIN);
         out.extend_from_slice(&self.id.0);
         out.extend_from_slice(&self.time.to_le_bytes());
@@ -164,7 +165,8 @@ impl FollowsV1 {
     /// The exact bytes the author signs. BTreeSet iterates sorted, so the
     /// layout is canonical for a given set.
     pub fn signing_payload(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(FOLLOWS_SIGN_DOMAIN.len() + 8 + 32 * self.follows.len());
+        let mut out =
+            Vec::with_capacity(FOLLOWS_SIGN_DOMAIN.len() + 8 + 32 * self.follows.len());
         out.extend_from_slice(FOLLOWS_SIGN_DOMAIN);
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&(self.follows.len() as u32).to_le_bytes());
@@ -292,16 +294,8 @@ mod tests {
     /// Length prefixes keep the layout injective on field boundaries.
     #[test]
     fn profile_payload_injective_on_name_bio_boundary() {
-        let a = ProfileV1 {
-            name: "ab".into(),
-            bio: "c".into(),
-            version: 1,
-        };
-        let b = ProfileV1 {
-            name: "a".into(),
-            bio: "bc".into(),
-            version: 1,
-        };
+        let a = ProfileV1 { name: "ab".into(), bio: "c".into(), version: 1 };
+        let b = ProfileV1 { name: "a".into(), bio: "bc".into(), version: 1 };
         assert_ne!(a.signing_payload(), b.signing_payload());
     }
 
@@ -309,14 +303,8 @@ mod tests {
     fn sign_verify_roundtrip() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let vk = sk.verifying_key();
-        assert!(AuthorizedPost::new(fixed_post(), &sk)
-            .verify_signature(&vk)
-            .is_ok());
-        assert!(AuthorizedProfile::new(fixed_profile(), &sk)
-            .verify_signature(&vk)
-            .is_ok());
-        assert!(AuthorizedFollows::new(fixed_follows(), &sk)
-            .verify_signature(&vk)
-            .is_ok());
+        assert!(AuthorizedPost::new(fixed_post(), &sk).verify_signature(&vk).is_ok());
+        assert!(AuthorizedProfile::new(fixed_profile(), &sk).verify_signature(&vk).is_ok());
+        assert!(AuthorizedFollows::new(fixed_follows(), &sk).verify_signature(&vk).is_ok());
     }
 }

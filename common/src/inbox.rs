@@ -29,7 +29,10 @@ pub struct InboxStateV1 {
 
 impl InboxStateV1 {
     /// Idempotent: enforce caps and drop credentials no pointer references.
-    pub fn post_apply_cleanup(&mut self, _parameters: &InboxParametersV1) -> Result<(), String> {
+    pub fn post_apply_cleanup(
+        &mut self,
+        _parameters: &InboxParametersV1,
+    ) -> Result<(), String> {
         self.pointers.canonicalize();
         let referenced: std::collections::BTreeSet<[u8; 32]> = self
             .pointers
@@ -464,8 +467,10 @@ mod tests {
         creds: Vec<&Replier>,
         pointers: Vec<AuthorizedReplyPointer>,
     ) -> Option<InboxStateV1Delta> {
-        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCred> =
-            creds.into_iter().map(|r| (r.key, r.cred.clone())).collect();
+        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCred> = creds
+            .into_iter()
+            .map(|r| (r.key, r.cred.clone()))
+            .collect();
         Some(InboxStateV1Delta {
             creds: (!creds_map.is_empty()).then_some(creds_map),
             pointers: (!pointers.is_empty()).then_some(pointers),
@@ -562,11 +567,7 @@ mod tests {
         let honest = replier(&authority);
 
         let mut s = InboxStateV1::default();
-        apply(
-            &mut s,
-            &p,
-            delta_of(vec![&honest], vec![pointer(&honest, 1, 0)]),
-        );
+        apply(&mut s, &p, delta_of(vec![&honest], vec![pointer(&honest, 1, 0)]));
         let flood: Vec<_> = (0..50).map(|i| pointer(&spammer, 100 + i, i)).collect();
         apply(&mut s, &p, delta_of(vec![&spammer], flood));
 
@@ -610,7 +611,9 @@ mod tests {
         // sender itself caps at MAX_PER_FINGERPRINT — build receiver from it.
         let mut receiver = InboxStateV1::default();
         let clone = receiver.clone();
-        receiver.merge(&clone, &p, &sender).expect("first merge ok");
+        receiver
+            .merge(&clone, &p, &sender)
+            .expect("first merge ok");
 
         // Steady state: sender must now produce NO pointer delta.
         let summary = receiver.summarize(&receiver.clone(), &p);

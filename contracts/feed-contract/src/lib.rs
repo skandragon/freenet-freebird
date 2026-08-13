@@ -124,7 +124,9 @@ impl ContractInterface for Contract {
                     if d.as_ref().is_empty() {
                         continue;
                     }
-                    let feed = feed.as_mut().ok_or(ContractError::InvalidUpdate)?;
+                    let feed = feed
+                        .as_mut()
+                        .ok_or(ContractError::InvalidUpdate)?;
                     let mut delta: FeedStateV1Delta = deser(d.as_ref(), "delta")?;
                     scrub_delta(&mut delta, now);
                     feed.apply_delta(&feed.clone(), &parameters, &Some(delta))

@@ -16,8 +16,8 @@ mod contract {
     use freenet_scaffold::ComposableState;
     use freenet_stdlib::prelude::*;
 
-    use crate::state::{InboxParametersV3, InboxStateV3, InboxStateV3Delta, InboxStateV3Summary};
     use freebird_core::feed::MAX_FUTURE_MS;
+    use crate::state::{InboxParametersV3, InboxStateV3, InboxStateV3Delta, InboxStateV3Summary};
 
     fn now_ms() -> u64 {
         freenet_stdlib::time::now().timestamp_millis().max(0) as u64
@@ -87,8 +87,7 @@ mod contract {
             for update in data {
                 match update {
                     UpdateData::State(new_state) => {
-                        let mut incoming: InboxStateV3 =
-                            deser(new_state.as_ref(), "incoming state")?;
+                        let mut incoming: InboxStateV3 = deser(new_state.as_ref(), "incoming state")?;
                         incoming.scrub_future(now);
                         inbox
                             .merge(&inbox.clone(), &parameters, &incoming)

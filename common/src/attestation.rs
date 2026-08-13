@@ -361,8 +361,9 @@ pub mod fixtures {
         /// The requestor value the real ghostkey runtime attests for the
         /// published Freebird webapp.
         pub fn freebird_requestor() -> ciborium::Value {
-            let bytes = crate::to_cbor(&super::RequestorWire::WebApp(freebird_webapp_id()))
-                .expect("requestor serializes");
+            let bytes =
+                crate::to_cbor(&super::RequestorWire::WebApp(freebird_webapp_id()))
+                    .expect("requestor serializes");
             crate::from_cbor(&bytes).expect("requestor round-trips")
         }
 
@@ -454,9 +455,7 @@ mod tests {
         let (sk, vk) = posting_key();
         let authority = TestAuthority::new();
         let att = authority.attest(&sk);
-        let tier = att
-            .verify(&vk, Some(&authority.master_vk))
-            .expect("verifies");
+        let tier = att.verify(&vk, Some(&authority.master_vk)).expect("verifies");
         assert_eq!(tier, "test-tier");
     }
 
@@ -472,9 +471,7 @@ mod tests {
             &AttestationV2::payload_for(&victim_vk),
             &attacker_sk, // pop by the attacker, not the victim
         );
-        let err = att
-            .verify(&victim_vk, Some(&authority.master_vk))
-            .unwrap_err();
+        let err = att.verify(&victim_vk, Some(&authority.master_vk)).unwrap_err();
         assert!(err.contains("proof-of-possession"), "{err}");
     }
 
@@ -579,7 +576,8 @@ mod tests {
     /// hex changes, the requestor check no longer matches the real vault.
     #[test]
     fn requestor_wire_format_kat() {
-        let bytes = crate::to_cbor(&super::RequestorWire::WebApp(freebird_webapp_id())).unwrap();
+        let bytes =
+            crate::to_cbor(&super::RequestorWire::WebApp(freebird_webapp_id())).unwrap();
         assert_eq!(data_encoding::HEXLOWER.encode(&bytes), "a1665765624170709820187318ab182e184518e9188e18c8188718a418b8187f18a605183018bc187f18a8182b18a017184718d51856184018e5188018a218e518f418a00118bf");
     }
 
