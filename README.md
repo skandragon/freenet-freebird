@@ -38,6 +38,8 @@ Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpower
   node (posting key, drafts)
 - `ui/` — Dioxus web UI (`ui/contracts/` holds the compiled wasm the UI embeds
   for address derivation — refresh with `make contracts delegate`)
+- `docs/` — engineering notes: reproducible/byte-frozen wasm builds,
+  full-state validation cost analysis
 
 ## Build
 
