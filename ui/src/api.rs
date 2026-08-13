@@ -1206,6 +1206,8 @@ fn dispatch_kv(payload: &[u8]) {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
                 *DISMISSED_BUILD.write() = Some(build);
+            } else if key == V1_MIGRATION_KEY {
+                *V1_MIGRATION.write() = Some(V1Migration::decode(value.as_deref()));
             }
         }
         Ok(FreebirdDelegateResponse::Stored { .. })

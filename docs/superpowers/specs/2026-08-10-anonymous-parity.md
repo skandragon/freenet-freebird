@@ -85,8 +85,21 @@ without holding the wasm that derives it.
   merge in the UI (dedup by `(replier, reply_post)` / author). The v1 wasm
   bytes are vendored as `ui/contracts/*_v1.wasm` for address derivation
   only; never instantiated.
+- **Forward migration** (issue #56): the dual-read window is a bridge, not
+  the migration. `actions::migrate_v1` runs once per account (delegate
+  marker `v1_migration`: absent → `<start_ms>` → `done`) and re-signs our
+  own v1-era data into the v2 contracts — legacy feed posts (ids survive;
+  only the signing payload changed in #47), a v3 inbox pointer per v1-era
+  reply, and a follow announcement per current follow. Retries every session
+  until it marks `done`, reusing the stored start stamp so re-sent
+  announcements keep the same PostIds and dedup. Directory listings need no
+  extra step: `App`'s listing-refresh effect already republishes ours under
+  the v2 key once per session.
+  Ceiling: pointers we *received* in v1 are signed by their repliers, so
+  only those repliers can carry them forward — the window is safe to close
+  once enough of the network has come back and run this, not on a date.
 - **Window close**: publisher flips control flags `read_v1_inbox` /
-  `read_v1_directory` to false
+  `read_v1_directory` / `read_v1_feed` to false
   (`freebird-ctl publish-control ... --flag read_v1_inbox=false`), stopping
   the legacy fetches network-wide without a client release. Default is ON.
 - **Writes**: v2 only, from day one. The v1 contracts decay naturally.

@@ -506,6 +506,16 @@ pub fn App() -> Element {
                 {
                     api::log(&format!("dismissed_build get failed: {e}"));
                 }
+                // Whether this account's v1→v2 forward migration already ran.
+                if let Err(e) = api::kv_request(
+                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                        key: V1_MIGRATION_KEY.into(),
+                    },
+                )
+                .await
+                {
+                    api::log(&format!("v1_migration get failed: {e}"));
+                }
                 // The publisher's control cell: newest deployed build + flags.
                 if let Err(e) = api::fetch_control().await {
                     api::log(&format!("control fetch failed: {e}"));
@@ -590,6 +600,34 @@ pub fn App() -> Element {
             spawn(async {
                 if let Err(e) = actions::set_public_listing(true).await {
                     api::log(&format!("directory listing refresh failed: {e}"));
+                }
+            });
+        }
+    });
+
+    // One-time forward migration of our v1-era data into the v2 contracts
+    // (issue #56) — the thing that lets the dual-read window actually close.
+    // Waits for BOTH our feeds: a legacy feed that never arrives just leaves
+    // the marker unset, so the run retries next session rather than marking
+    // a migration complete that never read its source.
+    let mut migration_started = use_signal(|| false);
+    use_effect(move || {
+        let started_ms = match *V1_MIGRATION.read() {
+            Some(V1Migration::Pending) => keys::now_ms(),
+            Some(V1Migration::Running(ms)) => ms,
+            // Done, or the delegate hasn't answered yet.
+            _ => return,
+        };
+        let Some(author) = own_author() else { return };
+        let feeds_loaded = FEEDS.read().get(&author).is_some_and(Option::is_some)
+            && LEGACY_FEEDS.read().get(&author).is_some_and(Option::is_some);
+        if feeds_loaded && !*migration_started.peek() {
+            migration_started.set(true);
+            spawn(async move {
+                if let Err(e) = actions::migrate_v1(started_ms).await {
+                    api::log(&format!(
+                        "v1 migration incomplete, retries next session: {e}"
+                    ));
                 }
             });
         }
