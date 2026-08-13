@@ -43,8 +43,7 @@ pub static LEGACY_FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<LegacyFeedState>
     Signal::global(BTreeMap::new);
 
 /// Inbox (v2) states by owner key.
-pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV3>> =
-    Signal::global(BTreeMap::new);
+pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV3>> = Signal::global(BTreeMap::new);
 
 /// LEGACY inbox states by owner key — dual-read migration window (issues
 /// #23, #81): pointers written against the LIVE build stay visible until the
@@ -60,8 +59,9 @@ pub static ANCHORS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_anchor::Anch
 /// Avatars by author key. `None` value = fetched (or fetching) but absent —
 /// render the identicon. Write-rarely contract: fetch-on-view, no
 /// subscription, cached here for the session.
-pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>> =
-    Signal::global(BTreeMap::new);
+pub static AVATARS: GlobalSignal<
+    BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>,
+> = Signal::global(BTreeMap::new);
 
 /// LEGACY avatars by author key — dual-read migration window (issue #81).
 /// Kept SEPARATE from `AVATARS` rather than merged into it: the rendering
@@ -252,8 +252,16 @@ impl View {
             Some("profile") => View::Profile,
             Some("discover") => View::Discover,
             Some("thread") => (|| {
-                let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
-                let post = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                let author = bs58::decode(parts.next()?)
+                    .into_vec()
+                    .ok()?
+                    .try_into()
+                    .ok()?;
+                let post = bs58::decode(parts.next()?)
+                    .into_vec()
+                    .ok()?
+                    .try_into()
+                    .ok()?;
                 Some(View::Thread(freebird_core::types::PostRef {
                     author,
                     post: freebird_core::types::PostId(post),
@@ -261,7 +269,11 @@ impl View {
             })()
             .unwrap_or(View::Home),
             Some("author") => (|| {
-                let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                let author = bs58::decode(parts.next()?)
+                    .into_vec()
+                    .ok()?
+                    .try_into()
+                    .ok()?;
                 Some(View::Author(author))
             })()
             .unwrap_or(View::Home),
@@ -295,7 +307,10 @@ mod tests {
     fn migration_marker_decode() {
         assert_eq!(V1Migration::decode(None), V1Migration::Pending);
         assert_eq!(V1Migration::decode(Some(b"done")), V1Migration::Done);
-        assert_eq!(V1Migration::decode(Some(b"1700")), V1Migration::Running(1700));
+        assert_eq!(
+            V1Migration::decode(Some(b"1700")),
+            V1Migration::Running(1700)
+        );
         // Garbage re-runs the (idempotent) migration rather than skipping it.
         assert_eq!(V1Migration::decode(Some(b"")), V1Migration::Pending);
         assert_eq!(V1Migration::decode(Some(b"\xff\xfe")), V1Migration::Pending);

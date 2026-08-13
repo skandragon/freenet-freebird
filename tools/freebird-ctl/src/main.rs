@@ -16,7 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cell_contract::SignedCellV1;
 use ed25519_dalek::SigningKey;
 use freebird_control::{ControlV1, CONTROL_PURPOSE};
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi};
+use freenet_stdlib::client_api::{
+    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+};
 use freenet_stdlib::prelude::*;
 
 /// The exact bytes the UI embeds — the address must match the UI's.
@@ -47,8 +49,12 @@ fn cell_key(params: &cell_contract::CellParametersV1) -> ContractKey {
 
 fn load_signing_key() -> Result<SigningKey, String> {
     let path = key_path();
-    let hex = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {}: {e} (run `freebird-ctl keygen` first)", path.display()))?;
+    let hex = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "read {}: {e} (run `freebird-ctl keygen` first)",
+            path.display()
+        )
+    })?;
     let seed: [u8; 32] = data_encoding::HEXLOWER
         .decode(hex.trim().as_bytes())
         .map_err(|e| format!("{} is not hex: {e}", path.display()))?
@@ -185,7 +191,10 @@ async fn publish_difficulty(node: &str, bits: u8) -> Result<(), String> {
             freebird_pow::POW_CEILING_BITS
         );
     }
-    println!("difficulty published: {} bits seq {} → {key}", body[0], cell.seq);
+    println!(
+        "difficulty published: {} bits seq {} → {key}",
+        body[0], cell.seq
+    );
     Ok(())
 }
 
@@ -299,7 +308,11 @@ fn run() -> Result<(), String> {
                 )
             }
             "--bits" => {
-                bits = Some(value("--bits")?.parse().map_err(|e| format!("--bits: {e}"))?)
+                bits = Some(
+                    value("--bits")?
+                        .parse()
+                        .map_err(|e| format!("--bits: {e}"))?,
+                )
             }
             "--label" => label = value("--label")?,
             "--flag" => {
@@ -315,7 +328,9 @@ fn run() -> Result<(), String> {
         "publish-control" => {
             let build = build.ok_or("--build is required")?;
             if build == 0 {
-                return Err("--build 0 means 'no git at compile time'; refusing to publish it".into());
+                return Err(
+                    "--build 0 means 'no git at compile time'; refusing to publish it".into(),
+                );
             }
             runtime(publish_control(&node, build, label, flags))
         }

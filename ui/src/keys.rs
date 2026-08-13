@@ -4,10 +4,10 @@ use directory_contract::{DirectoryParametersV3, DIRECTORY_SEED};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::avatar::AvatarParametersV1;
 use freebird_core::feed::{FeedParametersV1, MAX_FUTURE_MS};
-use inbox_contract::state::InboxParametersV3;
 use freebird_core::types::{AuthorizedPost, PostId, PostV1};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 use ghostkey_lib::armorable::Armorable;
+use inbox_contract::state::InboxParametersV3;
 
 pub const FEED_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/feed_contract.wasm");
 pub const INBOX_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract.wasm");
@@ -227,7 +227,8 @@ pub fn anchor_instance_id(owner: &VerifyingKey) -> ContractInstanceId {
 /// directory, params contain no per-user key, so every client derives the
 /// same address.
 pub fn control_cell_key() -> ContractKey {
-    let params = cell_contract::to_cbor(&freebird_control::control_params()).expect("params serialize");
+    let params =
+        cell_contract::to_cbor(&freebird_control::control_params()).expect("params serialize");
     contract_key(CELL_CONTRACT_WASM, params)
 }
 
@@ -296,7 +297,11 @@ mod tests {
         let b = SigningKey::generate(&mut OsRng).verifying_key();
         assert_eq!(feed_key(&a), feed_key(&a));
         assert_ne!(feed_key(&a), feed_key(&b));
-        assert_ne!(feed_key(&a), inbox_key(&a), "feed and inbox differ per wasm");
+        assert_ne!(
+            feed_key(&a),
+            inbox_key(&a),
+            "feed and inbox differ per wasm"
+        );
     }
 
     #[test]

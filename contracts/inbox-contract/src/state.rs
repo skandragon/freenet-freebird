@@ -146,9 +146,9 @@ impl ComposableState for InboxStateV3 {
         parameters: &Self::Parameters,
         old_state_summary: &Self::Summary,
     ) -> Option<Self::Delta> {
-        let pointers =
-            self.pointers
-                .delta(parent_state, parameters, &old_state_summary.pointers);
+        let pointers = self
+            .pointers
+            .delta(parent_state, parameters, &old_state_summary.pointers);
         let creds = self
             .creds
             .delta(parent_state, parameters, &old_state_summary.creds)
@@ -216,9 +216,7 @@ impl ComposableState for InboxStateV3 {
         // RSA check — the floor for accepting attested creds at all). The
         // size bound stays a hard reject, ahead of the filter's linear scan.
         let creds = match &delta.creds {
-            Some(c) if c.len() > MAX_POINTERS => {
-                return Err("credential delta too large".into())
-            }
+            Some(c) if c.len() > MAX_POINTERS => return Err("credential delta too large".into()),
             Some(c) => {
                 // Bad staple signatures stay FATAL (same doctrine as
                 // check_pointer), and the verified ones vouch for their
@@ -266,10 +264,7 @@ impl InboxStateV3 {
     /// key, new fingerprint) is a NORMAL flow in v2, and replicas that saw
     /// the upgrade and the old pointers in different orders must converge on
     /// "stale pointers gone".
-    pub fn post_apply_cleanup(
-        &mut self,
-        _parameters: &InboxParametersV3,
-    ) -> Result<(), String> {
+    pub fn post_apply_cleanup(&mut self, _parameters: &InboxParametersV3) -> Result<(), String> {
         let creds = &self.creds.creds;
         self.pointers.pointers.retain(|p| {
             creds
@@ -289,9 +284,9 @@ impl InboxStateV3 {
 
     /// Clock-dependent scrub, called by the contract shell only.
     pub fn scrub_future(&mut self, now_ms: u64) {
-        self.pointers.pointers.retain(|p| {
-            p.ptr.time <= now_ms.saturating_add(freebird_core::feed::MAX_FUTURE_MS)
-        });
+        self.pointers
+            .pointers
+            .retain(|p| p.ptr.time <= now_ms.saturating_add(freebird_core::feed::MAX_FUTURE_MS));
     }
 }
 
@@ -304,8 +299,8 @@ mod inbox_v3_components {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        anon_fingerprint, is_anon_fingerprint, InboxStateV3, ANON_POINTER_SLOTS,
-        MAX_PER_ANON_KEY, MAX_PER_FINGERPRINT, MAX_POINTERS,
+        anon_fingerprint, is_anon_fingerprint, InboxStateV3, ANON_POINTER_SLOTS, MAX_PER_ANON_KEY,
+        MAX_PER_FINGERPRINT, MAX_POINTERS,
     };
 
     /// CBOR-identical shape to the v1 params (owner + trust anchor); a
@@ -383,8 +378,12 @@ mod inbox_v3_components {
             // cleanup fixpoint, and its holder re-offers the pruned creds
             // forever (issue #49). Reject BEFORE the RSA check — each
             // attested cred costs a chain verification in wasm.
-            let referenced: BTreeSet<[u8; 32]> =
-                parent.pointers.pointers.iter().map(|p| p.ptr.replier).collect();
+            let referenced: BTreeSet<[u8; 32]> = parent
+                .pointers
+                .pointers
+                .iter()
+                .map(|p| p.ptr.replier)
+                .collect();
             for (key, cred) in &self.creds {
                 if !referenced.contains(key) {
                     return Err("credential referenced by no pointer".into());
@@ -675,11 +674,7 @@ mod inbox_v3_components {
             }
 
             while self.pointers.len() > MAX_POINTERS {
-                let victim = self
-                    .pointers
-                    .iter()
-                    .position(|p| p.is_anon())
-                    .unwrap_or(0); // no anon left: oldest attested
+                let victim = self.pointers.iter().position(|p| p.is_anon()).unwrap_or(0); // no anon left: oldest attested
                 self.pointers.remove(victim);
             }
         }
@@ -752,9 +747,7 @@ mod inbox_v3_components {
             }
             let anon_count = self.pointers.iter().filter(|p| p.is_anon()).count();
             if anon_count > ANON_POINTER_SLOTS {
-                return Err(format!(
-                    "more than {ANON_POINTER_SLOTS} anonymous pointers"
-                ));
+                return Err(format!("more than {ANON_POINTER_SLOTS} anonymous pointers"));
             }
             // The fairness caps are load-bearing in the two-tier design: a
             // fabricated full state must not seat one sybil across the whole
@@ -943,10 +936,8 @@ mod tests {
         creds: Vec<&Replier>,
         pointers: Vec<AuthorizedReplyPointerV3>,
     ) -> Option<InboxStateV3Delta> {
-        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCredV3> = creds
-            .into_iter()
-            .map(|r| (r.key, r.cred.clone()))
-            .collect();
+        let creds_map: std::collections::BTreeMap<[u8; 32], ReplierCredV3> =
+            creds.into_iter().map(|r| (r.key, r.cred.clone())).collect();
         Some(InboxStateV3Delta {
             creds: (!creds_map.is_empty()).then_some(creds_map),
             pointers: (!pointers.is_empty()).then_some(pointers),
@@ -967,7 +958,11 @@ mod tests {
         let p = params(&authority);
         let r = anon_replier();
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]),
+        );
         assert_eq!(s.pointers.pointers.len(), 1);
         assert!(is_anon_fingerprint(&s.pointers.pointers[0].ptr.fingerprint));
         s.verify(&s.clone(), &p).expect("verifies");
@@ -979,7 +974,11 @@ mod tests {
         let p = params(&authority);
         let r = attested_replier(&authority);
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]),
+        );
         assert_eq!(s.pointers.pointers.len(), 1);
         s.verify(&s.clone(), &p).expect("verifies");
     }
@@ -990,7 +989,11 @@ mod tests {
         let p = params(&authority);
         let r = anon_replier();
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]),
+        );
         assert!(s.pointers.pointers.is_empty());
     }
 
@@ -1003,7 +1006,11 @@ mod tests {
         let mut s = InboxStateV3::default();
         let clone = s.clone();
         assert!(s
-            .apply_delta(&clone, &p, &delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]))
+            .apply_delta(
+                &clone,
+                &p,
+                &delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)])
+            )
             .is_err());
     }
 
@@ -1016,7 +1023,11 @@ mod tests {
         let p = params(&authority);
         let r = attested_replier(&authority);
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]),
+        );
         // Anonymous cred under r's map key but the WRONG posting key:
         // check() would be fatal, but it loses the LWW (anon hashes as
         // zero) and must be skipped.
@@ -1047,10 +1058,18 @@ mod tests {
         let r = attested_replier(&rogue); // does NOT verify under p.ghostkey_master
         let mut s = InboxStateV3::default();
         s.creds.creds.insert(r.key, r.cred.clone()); // seated as if verified
-        apply(&mut s, &p, delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![], vec![pointer_for(&r, &p, 5, 0)]),
+        );
         // Guard: a held pointer references r.key, so the replayed cred
         // survives the staple filter and reaches CredsV3::apply_delta.
-        assert!(s.pointers.pointers.iter().any(|ptr| ptr.ptr.replier == r.key));
+        assert!(s
+            .pointers
+            .pointers
+            .iter()
+            .any(|ptr| ptr.ptr.replier == r.key));
         let clone = s.clone();
         s.apply_delta(&clone, &p, &delta_of(vec![&r], vec![]))
             .expect("exact replay skipped, not re-verified");
@@ -1071,8 +1090,11 @@ mod tests {
         fake.ptr.replier = r.key;
         fake.ptr.fingerprint = r.cred.fingerprint();
         let mut fake = AuthorizedReplyPointerV3::new(fake.ptr, &other.sk);
-        fake.pow_nonce =
-            freebird_pow::solve_inbox(&fake.ptr.owner, &fake.ptr.replier, freebird_pow::POW_FLOOR_BITS);
+        fake.pow_nonce = freebird_pow::solve_inbox(
+            &fake.ptr.owner,
+            &fake.ptr.replier,
+            freebird_pow::POW_FLOOR_BITS,
+        );
         let clone = s.clone();
         assert!(s
             .apply_delta(&clone, &p, &delta_of(vec![&r], vec![fake]))
@@ -1094,7 +1116,10 @@ mod tests {
 
         let mut s = InboxStateV3::default();
         apply(&mut s, &p, delta_of(vec![&r], vec![ptr.clone()]));
-        assert!(s.pointers.pointers.is_empty(), "unstamped anon pointer dropped");
+        assert!(
+            s.pointers.pointers.is_empty(),
+            "unstamped anon pointer dropped"
+        );
 
         // A fabricated full state carrying it must not verify.
         let mut fabricated = InboxStateV3::default();
@@ -1134,7 +1159,10 @@ mod tests {
             freebird_pow::solve_inbox(&pa.owner.to_bytes(), &r.key, freebird_pow::POW_FLOOR_BITS);
         let mut s = InboxStateV3::default();
         apply(&mut s, &pb, delta_of(vec![&r], vec![ptr]));
-        assert!(s.pointers.pointers.is_empty(), "A's stamp must not admit in B");
+        assert!(
+            s.pointers.pointers.is_empty(),
+            "A's stamp must not admit in B"
+        );
     }
 
     /// Difficulty sourced from the control cell: a publisher-signed record
@@ -1176,7 +1204,10 @@ mod tests {
             }),
         )
         .expect("delta ok");
-        assert!(s.pointers.pointers.is_empty(), "floor stamp rejected under raised difficulty");
+        assert!(
+            s.pointers.pointers.is_empty(),
+            "floor stamp rejected under raised difficulty"
+        );
 
         // Solved to the control difficulty → admitted.
         let ptr = ReplyPointerV3 {
@@ -1199,7 +1230,11 @@ mod tests {
             }),
         )
         .expect("delta ok");
-        assert_eq!(s.pointers.pointers.len(), 1, "control-difficulty stamp accepted");
+        assert_eq!(
+            s.pointers.pointers.len(),
+            1,
+            "control-difficulty stamp accepted"
+        );
     }
 
     /// Mint a publisher-signed difficulty record at `bits`, sequence `seq`.
@@ -1241,7 +1276,10 @@ mod tests {
 
         let mut s = InboxStateV3::default();
         latch(&mut s, &p, difficulty_record(raised, 1));
-        assert_eq!(freebird_pow::difficulty_bits(s.pow_difficulty.as_ref()), raised);
+        assert_eq!(
+            freebird_pow::difficulty_bits(s.pow_difficulty.as_ref()),
+            raised
+        );
 
         let mut weak = pointer_for(&r, &p, 5, 0);
         weak.pow_nonce = freebird_pow::solve_inbox_band(
@@ -1268,10 +1306,14 @@ mod tests {
         apply(
             &mut s,
             &p,
-            delta_of(vec![&r], vec![AuthorizedReplyPointerV3::new_anon(ptr, &r.sk, raised)]),
+            delta_of(
+                vec![&r],
+                vec![AuthorizedReplyPointerV3::new_anon(ptr, &r.sk, raised)],
+            ),
         );
         assert_eq!(s.pointers.pointers.len(), 1);
-        s.verify(&s.clone(), &p).expect("raised-difficulty state verifies");
+        s.verify(&s.clone(), &p)
+            .expect("raised-difficulty state verifies");
     }
 
     /// An attacker cannot walk the bar back: neither a forged record at a
@@ -1283,7 +1325,11 @@ mod tests {
         let mut s = InboxStateV3::default();
         latch(&mut s, &p, difficulty_record(24, 7));
 
-        latch(&mut s, &p, difficulty_record(freebird_pow::POW_FLOOR_BITS, 1));
+        latch(
+            &mut s,
+            &p,
+            difficulty_record(freebird_pow::POW_FLOOR_BITS, 1),
+        );
         assert_eq!(
             freebird_pow::difficulty_bits(s.pow_difficulty.as_ref()),
             24,
@@ -1305,7 +1351,10 @@ mod tests {
         );
 
         // And a fabricated full state cannot seat the forged record either.
-        let fabricated = InboxStateV3 { pow_difficulty: Some(forged), ..Default::default() };
+        let fabricated = InboxStateV3 {
+            pow_difficulty: Some(forged),
+            ..Default::default()
+        };
         assert!(
             fabricated.verify(&fabricated.clone(), &p).is_err(),
             "unsigned difficulty record fails verify"
@@ -1328,8 +1377,13 @@ mod tests {
             .expect("record alone justifies a delta");
         assert!(delta.pointers.is_none() && delta.creds.is_none());
         let clone = behind.clone();
-        behind.apply_delta(&clone, &p, &Some(delta)).expect("delta ok");
-        assert_eq!(freebird_pow::difficulty_bits(behind.pow_difficulty.as_ref()), 23);
+        behind
+            .apply_delta(&clone, &p, &Some(delta))
+            .expect("delta ok");
+        assert_eq!(
+            freebird_pow::difficulty_bits(behind.pow_difficulty.as_ref()),
+            23
+        );
 
         // Converged: no further delta in either direction.
         let summary = behind.summarize(&behind.clone(), &p);
@@ -1345,12 +1399,21 @@ mod tests {
         let p = params(&authority);
         let r = anon_replier();
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]),
+        );
         assert_eq!(s.pointers.pointers.len(), 1);
 
         latch(&mut s, &p, difficulty_record(26, 2));
-        assert_eq!(s.pointers.pointers.len(), 1, "seated pointer survives the raise");
-        s.verify(&s.clone(), &p).expect("still verifies at the compiled floor");
+        assert_eq!(
+            s.pointers.pointers.len(),
+            1,
+            "seated pointer survives the raise"
+        );
+        s.verify(&s.clone(), &p)
+            .expect("still verifies at the compiled floor");
     }
 
     /// Issue #46: a pointer signed for inbox A must fail validation in
@@ -1450,7 +1513,11 @@ mod tests {
         let attacker_sk = SigningKey::generate(&mut OsRng);
 
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&victim], vec![pointer_for(&victim, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&victim], vec![pointer_for(&victim, &p, 5, 0)]),
+        );
         s.verify(&s.clone(), &p).expect("honest state valid");
 
         // Attacker's forged cred: attestation over the victim's key, pop by
@@ -1459,9 +1526,7 @@ mod tests {
             posting_key: victim.sk.verifying_key(),
             attestation: Some(authority.mint_v2(
                 TestAuthority::freebird_requestor(),
-                &freebird_core::attestation::AttestationV2::payload_for(
-                    &victim.sk.verifying_key(),
-                ),
+                &freebird_core::attestation::AttestationV2::payload_for(&victim.sk.verifying_key()),
                 &attacker_sk,
             )),
         };
@@ -1497,7 +1562,10 @@ mod tests {
         let forged = AuthorizedReplyPointerV3::new(forged.ptr, &r.sk);
         let mut s = InboxStateV3::default();
         apply(&mut s, &p, delta_of(vec![&r], vec![forged.clone()]));
-        assert!(s.pointers.pointers.is_empty(), "forged-tier pointer dropped");
+        assert!(
+            s.pointers.pointers.is_empty(),
+            "forged-tier pointer dropped"
+        );
 
         // A full state holding a mismatched fingerprint must not verify.
         let mut fabricated = InboxStateV3::default();
@@ -1516,11 +1584,19 @@ mod tests {
         let r2 = attested_replier(&authority);
 
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&r1], vec![pointer_for(&r1, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r1], vec![pointer_for(&r1, &p, 5, 0)]),
+        );
         s.verify(&s.clone(), &p).expect("valid after first reply");
 
         apply(&mut s, &p, delta_of(vec![&r2], vec![]));
-        apply(&mut s, &p, delta_of(vec![&r2], vec![pointer_for(&r2, &p, 6, 1)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r2], vec![pointer_for(&r2, &p, 6, 1)]),
+        );
 
         s.verify(&s.clone(), &p)
             .expect("old pointers must still verify after another cred arrives");
@@ -1546,7 +1622,11 @@ mod tests {
         };
 
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]));
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]),
+        );
         apply(
             &mut s,
             &p,
@@ -1569,8 +1649,14 @@ mod tests {
         let honest = anon_replier();
 
         let mut s = InboxStateV3::default();
-        apply(&mut s, &p, delta_of(vec![&honest], vec![pointer_for(&honest, &p, 1, 0)]));
-        let flood: Vec<_> = (0..20).map(|i| pointer_for(&spammer, &p, 100 + i, i)).collect();
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&honest], vec![pointer_for(&honest, &p, 1, 0)]),
+        );
+        let flood: Vec<_> = (0..20)
+            .map(|i| pointer_for(&spammer, &p, 100 + i, i))
+            .collect();
         apply(&mut s, &p, delta_of(vec![&spammer], flood));
 
         let spam_count = s
@@ -1641,9 +1727,15 @@ mod tests {
         let mut receiver = InboxStateV3::default();
         let rs = receiver.summarize(&receiver.clone(), &p);
         let d = attacker.delta(&attacker.clone(), &p, &rs).expect("offers");
-        assert_eq!(d.creds.as_ref().map(|c| c.len()), Some(1), "orphans withheld");
+        assert_eq!(
+            d.creds.as_ref().map(|c| c.len()),
+            Some(1),
+            "orphans withheld"
+        );
         apply(&mut receiver, &p, Some(d));
-        receiver.verify(&receiver.clone(), &p).expect("receiver valid");
+        receiver
+            .verify(&receiver.clone(), &p)
+            .expect("receiver valid");
 
         // Round 2: nothing left to offer — the loop is closed.
         let rs = receiver.summarize(&receiver.clone(), &p);
@@ -1662,7 +1754,9 @@ mod tests {
             }),
         );
         assert_eq!(receiver.summarize(&receiver.clone(), &p), before);
-        receiver.verify(&receiver.clone(), &p).expect("receiver valid");
+        receiver
+            .verify(&receiver.clone(), &p)
+            .expect("receiver valid");
     }
 
     /// Issue #49: a junk-signature stapling pointer must not buy the cred's
@@ -1717,7 +1811,11 @@ mod tests {
         // Sender: one honest cred+pointer, older than everything retained.
         let old = anon_replier();
         let mut sender = InboxStateV3::default();
-        apply(&mut sender, &p, delta_of(vec![&old], vec![pointer_for(&old, &p, 5, 0)]));
+        apply(
+            &mut sender,
+            &p,
+            delta_of(vec![&old], vec![pointer_for(&old, &p, 5, 0)]),
+        );
         sender.verify(&sender.clone(), &p).expect("sender valid");
 
         // The pointer is below the horizon, so the cred must be withheld
@@ -1807,7 +1905,10 @@ mod tests {
         let v: Vec<_> = (0..150).map(|i| fake(&anon_fp(i), i, i)).collect();
         let p = pointers_of(v);
         assert_eq!(count_anon(&p), ANON_POINTER_SLOTS);
-        assert!(p.pointers.iter().all(|x| x.ptr.time >= 50), "oldest dropped");
+        assert!(
+            p.pointers.iter().all(|x| x.ptr.time >= 50),
+            "oldest dropped"
+        );
     }
 
     #[test]
@@ -1838,7 +1939,10 @@ mod tests {
         let v: Vec<_> = (0..310).map(|i| fake(&gk_fp(i / 8), i, i)).collect();
         let p = pointers_of(v);
         assert_eq!(p.pointers.len(), MAX_POINTERS);
-        assert!(p.pointers.iter().all(|x| x.ptr.time >= 10), "oldest attested dropped");
+        assert!(
+            p.pointers.iter().all(|x| x.ptr.time >= 10),
+            "oldest attested dropped"
+        );
     }
 
     fn summarize_pointers(p: &PointersV3) -> PointersV3Summary {
@@ -1854,7 +1958,10 @@ mod tests {
         p.summarize(&parent, &params)
     }
 
-    fn delta_against(p: &PointersV3, summary: &PointersV3Summary) -> Option<Vec<AuthorizedReplyPointerV3>> {
+    fn delta_against(
+        p: &PointersV3,
+        summary: &PointersV3Summary,
+    ) -> Option<Vec<AuthorizedReplyPointerV3>> {
         let parent = InboxStateV3 {
             creds: Default::default(),
             pow_difficulty: None,
@@ -1888,10 +1995,17 @@ mod tests {
     fn anon_share_horizon_prevents_reoffer() {
         let receiver = pointers_of((0..100).map(|i| fake(&anon_fp(i), 1000 + i, i)).collect());
         let summary = summarize_pointers(&receiver);
-        assert!(matches!(summary.anon_horizon, TierHorizon::OldestRetained(_)));
+        assert!(matches!(
+            summary.anon_horizon,
+            TierHorizon::OldestRetained(_)
+        ));
 
         // Sender holds only OLDER anon pointers.
-        let sender = pointers_of((0..5).map(|i| fake(&anon_fp(500 + i), i, 500 + i)).collect());
+        let sender = pointers_of(
+            (0..5)
+                .map(|i| fake(&anon_fp(500 + i), i, 500 + i))
+                .collect(),
+        );
         assert!(delta_against(&sender, &summary).is_none());
 
         // But a NEWER anon pointer is still offered.
@@ -2031,8 +2145,7 @@ mod tests {
             pow_difficulty: None,
             pointers: PointersV3 {
                 pointers: {
-                    let mut v: Vec<_> =
-                        (0..101).map(|i| fake(&anon_fp(i), i, i)).collect();
+                    let mut v: Vec<_> = (0..101).map(|i| fake(&anon_fp(i), i, i)).collect();
                     v.sort_by_key(|p| (p.ptr.time, p.ptr.reply_post));
                     v
                 },
@@ -2181,12 +2294,19 @@ mod tests {
             &p,
             delta_of(
                 vec![&r],
-                vec![pointer_for(&r, &p, boundary, 0), pointer_for(&r, &p, boundary + 1, 1)],
+                vec![
+                    pointer_for(&r, &p, boundary, 0),
+                    pointer_for(&r, &p, boundary + 1, 1),
+                ],
             ),
         );
         assert_eq!(s.pointers.pointers.len(), 2);
         s.scrub_future(now);
-        assert_eq!(s.pointers.pointers.len(), 1, "exactly the boundary survives");
+        assert_eq!(
+            s.pointers.pointers.len(),
+            1,
+            "exactly the boundary survives"
+        );
         assert_eq!(s.pointers.pointers[0].ptr.time, boundary);
     }
 
@@ -2224,7 +2344,11 @@ mod tests {
             freebird_core::to_cbor(&b).unwrap()
         );
         a.verify(&a.clone(), &p).expect("verifies");
-        assert_eq!(a.pointers.pointers.len(), 1, "only the attested pointer survives");
+        assert_eq!(
+            a.pointers.pointers.len(),
+            1,
+            "only the attested pointer survives"
+        );
     }
 
     /// Healing after the upgrade: a sender still holding the pre-upgrade
@@ -2246,7 +2370,11 @@ mod tests {
 
         // Sender: pre-upgrade anon state. Receiver: post-upgrade state.
         let mut sender = InboxStateV3::default();
-        apply(&mut sender, &p, delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]));
+        apply(
+            &mut sender,
+            &p,
+            delta_of(vec![&anon], vec![pointer_for(&anon, &p, 5, 0)]),
+        );
         let mut receiver = InboxStateV3::default();
         apply(
             &mut receiver,

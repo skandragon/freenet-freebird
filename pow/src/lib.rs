@@ -195,7 +195,9 @@ pub fn meets(domain: &[u8], key: &[u8; 32], binding: &[u8], nonce: u64, bits: u8
 /// ponytail: single-threaded scan; the caller (UI) runs it off the render
 /// path. Expected ~2^bits tries.
 pub fn solve(domain: &[u8], key: &[u8; 32], binding: &[u8], bits: u8) -> u64 {
-    (0u64..).find(|&n| meets(domain, key, binding, n, bits)).expect("u64 nonce space exhausted")
+    (0u64..)
+        .find(|&n| meets(domain, key, binding, n, bits))
+        .expect("u64 nonce space exhausted")
 }
 
 // ---- per-contract binders ----
@@ -319,7 +321,10 @@ mod tests {
         let forged = SignedCellV1::new(&sk, POW_PURPOSE, 9, difficulty_body(26));
 
         let mut held = None;
-        assert!(!adopt_difficulty(&mut held, Some(&forged)), "unsigned by publisher");
+        assert!(
+            !adopt_difficulty(&mut held, Some(&forged)),
+            "unsigned by publisher"
+        );
         assert!(held.is_none());
         assert!(!adopt_difficulty(&mut held, None));
 

@@ -32,10 +32,7 @@ impl FeedStateV1 {
     /// Idempotent canonicalization run after every delta application.
     /// Invariant: cleanup(s) == cleanup(cleanup(s)) — Freenet runs this a
     /// variable number of times per peer.
-    pub fn post_apply_cleanup(
-        &mut self,
-        _parameters: &FeedParametersV1,
-    ) -> Result<(), String> {
+    pub fn post_apply_cleanup(&mut self, _parameters: &FeedParametersV1) -> Result<(), String> {
         self.posts.canonicalize();
         Ok(())
     }
@@ -53,15 +50,15 @@ impl FeedStateV1 {
 
 mod components {
     use crate::attestation::AttestationV2;
-    use crate::types::{
-        AuthorizedFollows, AuthorizedPost, AuthorizedProfile, PostId,
-    };
+    use crate::types::{AuthorizedFollows, AuthorizedPost, AuthorizedProfile, PostId};
     use ed25519_dalek::VerifyingKey;
     use freenet_scaffold::ComposableState;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeSet;
 
-    use super::{FeedStateV1, MAX_BIO_BYTES, MAX_FOLLOWS, MAX_NAME_BYTES, MAX_POSTS, MAX_POST_BYTES};
+    use super::{
+        FeedStateV1, MAX_BIO_BYTES, MAX_FOLLOWS, MAX_NAME_BYTES, MAX_POSTS, MAX_POST_BYTES,
+    };
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
     pub struct FeedParametersV1 {
@@ -463,11 +460,7 @@ pub mod legacy {
     }
 
     impl LegacyFeedState {
-        pub fn verify(
-            &self,
-            author: &VerifyingKey,
-            master: &VerifyingKey,
-        ) -> Result<(), String> {
+        pub fn verify(&self, author: &VerifyingKey, master: &VerifyingKey) -> Result<(), String> {
             verify_bare(&self.profile.profile, &self.profile.signature, author)?;
             verify_bare(&self.follows.follows, &self.follows.signature, author)?;
             if let Some(att) = &self.attestation.0 {
@@ -548,7 +541,10 @@ pub mod legacy {
             let bytes = crate::to_cbor(&state).unwrap();
             let decoded: LegacyFeedState = crate::from_cbor(&bytes).unwrap();
             decoded.verify(&sk.verifying_key(), &master).unwrap();
-            assert_eq!(decoded.posts.posts[0].post.content, "hello from the old feed");
+            assert_eq!(
+                decoded.posts.posts[0].post.content,
+                "hello from the old feed"
+            );
         }
 
         /// The CURRENT contract rejects the old bytes two ways — which is why a
@@ -756,11 +752,19 @@ mod tests {
         let mut a = base_state(&sk);
         let mut b = base_state(&sk);
         let pa = AuthorizedProfile::new(
-            ProfileV1 { name: "X".into(), bio: String::new(), version: 2 },
+            ProfileV1 {
+                name: "X".into(),
+                bio: String::new(),
+                version: 2,
+            },
             &sk,
         );
         let pb = AuthorizedProfile::new(
-            ProfileV1 { name: "Y".into(), bio: String::new(), version: 2 },
+            ProfileV1 {
+                name: "Y".into(),
+                bio: String::new(),
+                version: 2,
+            },
             &sk,
         );
         a.profile = pa;

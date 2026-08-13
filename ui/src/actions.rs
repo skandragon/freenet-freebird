@@ -174,13 +174,20 @@ pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Resu
     apply_own_posts(vec![post.clone()]);
 
     if let Some(target) = in_reply_to {
-        send_inbox_pointer(&sk, att, target.author, target.post, post.post.id, post.post.time)
-            .await
-            // The post itself is already out — say so, or the error invites
-            // a duplicate repost.
-            .map_err(|e| {
-                format!("reply posted to your feed, but delivering it to the thread failed: {e}")
-            })?;
+        send_inbox_pointer(
+            &sk,
+            att,
+            target.author,
+            target.post,
+            post.post.id,
+            post.post.time,
+        )
+        .await
+        // The post itself is already out — say so, or the error invites
+        // a duplicate repost.
+        .map_err(|e| {
+            format!("reply posted to your feed, but delivering it to the thread failed: {e}")
+        })?;
     }
     Ok(())
 }
@@ -410,7 +417,9 @@ pub async fn migrate_avatar() -> Result<(), String> {
 /// waiting for the contract's notification back.
 fn apply_own_delta(delta: FeedStateV1Delta) {
     let Some(author) = own_author() else { return };
-    let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+    let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+        return;
+    };
     let params = keys::feed_params(&vk);
     if let Some(Some(state)) = FEEDS.write().get_mut(&author) {
         use freenet_scaffold::ComposableState;
@@ -529,7 +538,10 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
         let mut difficulty = POW_DIFFICULTY.read().clone();
         freebird_pow::adopt_difficulty(
             &mut difficulty,
-            DIRECTORY.read().as_ref().and_then(|d| d.pow_difficulty.as_ref()),
+            DIRECTORY
+                .read()
+                .as_ref()
+                .and_then(|d| d.pow_difficulty.as_ref()),
         );
         let authorized = match att {
             Some(att) => AuthorizedListingV3::new(listing, &sk, Some(att)),
@@ -686,11 +698,18 @@ mod tests {
     }
 
     fn profile(name: &str, version: u32) -> ProfileV1 {
-        ProfileV1 { name: name.into(), bio: format!("{name}'s bio"), version }
+        ProfileV1 {
+            name: name.into(),
+            bio: format!("{name}'s bio"),
+            version,
+        }
     }
 
     fn follow_list(follows: &[[u8; 32]], version: u32) -> FollowsV1 {
-        FollowsV1 { follows: follows.iter().copied().collect(), version }
+        FollowsV1 {
+            follows: follows.iter().copied().collect(),
+            version,
+        }
     }
 
     /// A pre-#64 feed: profile and follows signed over BARE CBOR.

@@ -181,7 +181,8 @@ mod contract {
                         }
                     }
                     UpdateData::StateAndDelta { state, delta } => {
-                        if let Some(cell) = checked_cell(state.as_ref(), &params, "incoming state")? {
+                        if let Some(cell) = checked_cell(state.as_ref(), &params, "incoming state")?
+                        {
                             merge(&mut held, cell);
                         }
                         if let Some(cell) = checked_cell(delta.as_ref(), &params, "delta")? {
@@ -308,10 +309,19 @@ mod tests {
     fn higher_seq_wins_stale_noop() {
         let sk = owner();
         let mut held = None;
-        merge(&mut held, SignedCellV1::new(&sk, "control", 5, b"five".to_vec()));
-        merge(&mut held, SignedCellV1::new(&sk, "control", 3, b"three".to_vec()));
+        merge(
+            &mut held,
+            SignedCellV1::new(&sk, "control", 5, b"five".to_vec()),
+        );
+        merge(
+            &mut held,
+            SignedCellV1::new(&sk, "control", 3, b"three".to_vec()),
+        );
         assert_eq!(held.as_ref().unwrap().body, b"five");
-        merge(&mut held, SignedCellV1::new(&sk, "control", 7, b"seven".to_vec()));
+        merge(
+            &mut held,
+            SignedCellV1::new(&sk, "control", 7, b"seven".to_vec()),
+        );
         assert_eq!(held.as_ref().unwrap().body, b"seven");
     }
 

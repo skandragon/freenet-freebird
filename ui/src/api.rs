@@ -13,14 +13,18 @@ use directory_contract::{AuthorizedListingV3, DirectoryStateV4};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::legacy::LegacyFeedState;
-use freebird_core::feed::{AttestationSlot, FeedParametersV1, FeedStateV1, FeedStateV1Delta, PostsV1};
+use freebird_core::feed::{
+    AttestationSlot, FeedParametersV1, FeedStateV1, FeedStateV1Delta, PostsV1,
+};
 use freebird_core::types::{AuthorizedFollows, AuthorizedProfile, FollowsV1, ProfileV1};
-use inbox_contract::state::{InboxStateV3, InboxStateV3Delta};
 use freenet_scaffold::ComposableState;
-use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse};
 #[cfg(target_arch = "wasm32")]
 use freenet_stdlib::client_api::WebApi;
+use freenet_stdlib::client_api::{
+    ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse,
+};
 use freenet_stdlib::prelude::*;
+use inbox_contract::state::{InboxStateV3, InboxStateV3Delta};
 
 use crate::ghostkey::{GhostkeyRequest, GhostkeyResponse};
 use crate::keys;
@@ -206,11 +210,18 @@ async fn put_own_feed(author: &VerifyingKey, feed: &FeedStateV1) -> Result<(), S
 fn seed_feed(sk: &SigningKey) -> FeedStateV1 {
     FeedStateV1 {
         profile: AuthorizedProfile::new(
-            ProfileV1 { name: String::new(), bio: String::new(), version: 0 },
+            ProfileV1 {
+                name: String::new(),
+                bio: String::new(),
+                version: 0,
+            },
             sk,
         ),
         follows: AuthorizedFollows::new(
-            FollowsV1 { follows: Default::default(), version: 0 },
+            FollowsV1 {
+                follows: Default::default(),
+                version: 0,
+            },
             sk,
         ),
         attestation: AttestationSlot(None),
@@ -235,7 +246,10 @@ pub async fn ensure_own_feed(sk: &SigningKey) -> Result<(), String> {
 /// call on every resume (the owner-republish half of the #23 migration).
 pub async fn ensure_own_inbox(author: &VerifyingKey) -> Result<(), String> {
     let inbox_state = freebird_core::to_cbor(&InboxStateV3::default())?;
-    track(keys::inbox_key(author), TrackedKind::Inbox(author.to_bytes()));
+    track(
+        keys::inbox_key(author),
+        TrackedKind::Inbox(author.to_bytes()),
+    );
     send(ClientRequest::ContractOp(ContractRequest::Put {
         contract: inbox_container(author),
         state: WrappedState::new(inbox_state),
@@ -413,7 +427,10 @@ pub async fn put_own_avatar(
     avatar: &freebird_core::avatar::AuthorizedAvatar,
 ) -> Result<(), String> {
     let state = freebird_core::to_cbor(avatar)?;
-    track(keys::avatar_key(author), TrackedKind::Avatar(author.to_bytes()));
+    track(
+        keys::avatar_key(author),
+        TrackedKind::Avatar(author.to_bytes()),
+    );
     send(ClientRequest::ContractOp(ContractRequest::Put {
         contract: avatar_container(author),
         state: WrappedState::new(state),
@@ -613,11 +630,13 @@ fn delegate_cipher_material() -> ([u8; 32], [u8; 24]) {
 #[cfg(target_arch = "wasm32")]
 pub async fn register_freebird_delegate() -> Result<(), String> {
     let (cipher, nonce) = delegate_cipher_material();
-    send(ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
-        delegate: freebird_delegate_container(),
-        cipher,
-        nonce,
-    }))
+    send(ClientRequest::DelegateOp(
+        DelegateRequest::RegisterDelegate {
+            delegate: freebird_delegate_container(),
+            cipher,
+            nonce,
+        },
+    ))
     .await
 }
 
@@ -632,13 +651,15 @@ pub async fn kv_request_to(
     request: FreebirdDelegateRequest,
 ) -> Result<(), String> {
     let payload = freebird_core::to_cbor(&request)?;
-    send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
-        key,
-        params: Parameters::from(Vec::<u8>::new()),
-        inbound: vec![InboundDelegateMsg::ApplicationMessage(
-            ApplicationMessage::new(payload),
-        )],
-    }))
+    send(ClientRequest::DelegateOp(
+        DelegateRequest::ApplicationMessages {
+            key,
+            params: Parameters::from(Vec::<u8>::new()),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        },
+    ))
     .await
 }
 
@@ -654,15 +675,13 @@ static PROBE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// Delegate answers the probe still owes: one KeyList per generation, then
 /// one Value per listed key. Drives LEGACY_PROBE_PENDING to false the moment
 /// the last answer lands (the run's sleep is only a fallback ceiling).
-static PROBE_OUTSTANDING: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+static PROBE_OUTSTANDING: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Legitimate empty legacy responses left: each RegisterDelegate sent to a
 /// legacy generation is acked with one empty response. Any empty beyond the
 /// budget means the node swallowed a probe error.
 // ponytail: one global budget, not a per-key ledger — the registry will only
 // ever hold a couple of generations; go per-key if that stops being true.
-static LEGACY_ACK_BUDGET: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+static LEGACY_ACK_BUDGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 /// Never probe (again) this page load — called by nuke_account so a
 /// deliberately destroyed seed can't be resurrected from an old generation.
@@ -706,11 +725,13 @@ pub async fn register_legacy(wasm: &[u8]) -> Result<(), String> {
     let params = Parameters::from(Vec::<u8>::new());
     let delegate = Delegate::from((&code, &params));
     LEGACY_ACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    send(ClientRequest::DelegateOp(DelegateRequest::RegisterDelegate {
-        delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate)),
-        cipher,
-        nonce,
-    }))
+    send(ClientRequest::DelegateOp(
+        DelegateRequest::RegisterDelegate {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate)),
+            cipher,
+            nonce,
+        },
+    ))
     .await
 }
 
@@ -766,13 +787,15 @@ pub async fn ghostkey_request(request: GhostkeyRequest) -> Result<(), String> {
         .ok_or("Identity Vault not discovered on this node yet")?;
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&request, &mut payload).map_err(|e| e.to_string())?;
-    send(ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
-        key,
-        params: Parameters::from(Vec::<u8>::new()),
-        inbound: vec![InboundDelegateMsg::ApplicationMessage(
-            ApplicationMessage::new(payload),
-        )],
-    }))
+    send(ClientRequest::DelegateOp(
+        DelegateRequest::ApplicationMessages {
+            key,
+            params: Parameters::from(Vec::<u8>::new()),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        },
+    ))
     .await
 }
 
@@ -784,8 +807,7 @@ fn dispatch(response: HostResponse) {
         HostResponse::ContractResponse(cr) => dispatch_contract(cr),
         HostResponse::DelegateResponse { key, values } => {
             let is_freebird = key == freebird_delegate_key();
-            let is_legacy =
-                !is_freebird && legacy_delegates().iter().any(|(_, k)| *k == key);
+            let is_legacy = !is_freebird && legacy_delegates().iter().any(|(_, k)| *k == key);
             if values.is_empty() {
                 if is_legacy {
                     note_empty_legacy_response();
@@ -928,8 +950,12 @@ fn anchor_targets(
     ];
     let mut targets = Vec::new();
     for (role, generation, derived, kind, subscribe) in roles {
-        let Some(entry) = anchor.role(role) else { continue };
-        let Some(address) = entry.address else { continue };
+        let Some(entry) = anchor.role(role) else {
+            continue;
+        };
+        let Some(address) = entry.address else {
+            continue;
+        };
         let address = ContractInstanceId::new(address);
         if entry.version != generation {
             log(&format!(
@@ -1000,7 +1026,9 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
     let Some(kind) = lookup(key) else { return };
     match kind {
         TrackedKind::Feed(author) => {
-            let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                return;
+            };
             let params = keys::feed_params(&vk);
             let mut feeds = FEEDS.write();
             let entry = feeds.entry(author).or_insert_with(empty_feed_placeholder);
@@ -1024,7 +1052,9 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             }
         }
         TrackedKind::Avatar(author) => {
-            let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                return;
+            };
             // State and delta are both one full signed avatar; the blob is
             // untrusted input — full check before it ever reaches an <img>.
             match freebird_core::from_cbor::<freebird_core::avatar::AuthorizedAvatar>(bytes) {
@@ -1213,7 +1243,9 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             }
         }
         TrackedKind::Inbox(author) => {
-            let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                return;
+            };
             let params = keys::inbox_params(&vk);
             let mut inboxes = INBOXES.write();
             let entry = inboxes.entry(author).or_default();
@@ -1385,13 +1417,19 @@ fn dispatch_legacy_kv(from: &DelegateKey, payload: &[u8]) {
                 }
             });
         }
-        Ok(FreebirdDelegateResponse::Value { key, value: Some(value) }) => {
+        Ok(FreebirdDelegateResponse::Value {
+            key,
+            value: Some(value),
+        }) => {
             probe_note(-1);
             if key == "posting_key" {
                 // Never clobber an existing identity: an account created (or
                 // seed loaded) while this answer was in flight wins.
                 if ACCOUNT.peek().is_some()
-                    || POSTING_KEY_LOADED.peek().as_ref().is_some_and(|v| v.is_some())
+                    || POSTING_KEY_LOADED
+                        .peek()
+                        .as_ref()
+                        .is_some_and(|v| v.is_some())
                 {
                     return;
                 }
@@ -1399,16 +1437,16 @@ fn dispatch_legacy_kv(from: &DelegateKey, payload: &[u8]) {
                 log("posting key carried forward from an old delegate generation");
             }
             spawn_local_task(async move {
-                if let Err(e) =
-                    kv_request(FreebirdDelegateRequest::Store { key, value }).await
-                {
+                if let Err(e) = kv_request(FreebirdDelegateRequest::Store { key, value }).await {
                     log(&format!("carry-forward store failed: {e}"));
                 }
             });
         }
         Ok(FreebirdDelegateResponse::Value { key, value: None }) => {
             probe_note(-1);
-            log(&format!("legacy delegate listed {key} but returned no value"));
+            log(&format!(
+                "legacy delegate listed {key} but returned no value"
+            ));
         }
         Ok(FreebirdDelegateResponse::Error { message }) => {
             probe_note(-1);
@@ -1435,8 +1473,7 @@ fn dispatch_ghostkey(payload: &[u8]) {
             signature,
             certificate_pem,
         }) => {
-            *GHOSTKEY_SIGN_RESULT.write() =
-                Some(Ok((scoped_payload, signature, certificate_pem)));
+            *GHOSTKEY_SIGN_RESULT.write() = Some(Ok((scoped_payload, signature, certificate_pem)));
         }
         Ok(GhostkeyResponse::NoIdentityAvailable) => {
             *GHOSTKEY_SIGN_RESULT.write() = Some(Err(
@@ -1475,8 +1512,7 @@ pub enum TrackedKind {
     Pow,
 }
 
-pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> =
-    Signal::global(BTreeMap::new);
+pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> = Signal::global(BTreeMap::new);
 
 /// Newest anchor-cell order key seen per author (LWW guard for ANCHORS).
 static ANCHOR_ORDER: GlobalSignal<BTreeMap<[u8; 32], (u64, [u8; 32])>> =
@@ -1515,9 +1551,7 @@ mod tests {
     #[test]
     fn seed_feed_bootstraps_a_rotated_feed_without_clobbering_it() {
         use freebird_core::feed::FeedStateV1Delta;
-        use freebird_core::types::{
-            AuthorizedFollows, AuthorizedProfile, FollowsV1, ProfileV1,
-        };
+        use freebird_core::types::{AuthorizedFollows, AuthorizedProfile, FollowsV1, ProfileV1};
         use freenet_scaffold::ComposableState;
 
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -1535,11 +1569,18 @@ mod tests {
             &params,
             &Some(FeedStateV1Delta {
                 profile: Some(AuthorizedProfile::new(
-                    ProfileV1 { name: "gryph".into(), bio: "hi".into(), version: 3 },
+                    ProfileV1 {
+                        name: "gryph".into(),
+                        bio: "hi".into(),
+                        version: 3,
+                    },
                     &sk,
                 )),
                 follows: Some(AuthorizedFollows::new(
-                    FollowsV1 { follows: [[9u8; 32]].into_iter().collect(), version: 2 },
+                    FollowsV1 {
+                        follows: [[9u8; 32]].into_iter().collect(),
+                        version: 2,
+                    },
                     &sk,
                 )),
                 attestation: None,
@@ -1602,7 +1643,10 @@ mod tests {
         let rotated = [9u8; 32];
         let a = anchor(&[(
             ROLE_INBOX,
-            RoleV1 { version: INBOX_GENERATION, address: Some(rotated) },
+            RoleV1 {
+                version: INBOX_GENERATION,
+                address: Some(rotated),
+            },
         )]);
         let got = anchor_targets(author, &vk, &a, &BTreeMap::new());
         assert_eq!(got.len(), 1, "one rotated role to follow");
@@ -1620,13 +1664,42 @@ mod tests {
         let author = vk.to_bytes();
         let derived = id_bytes(keys::inbox_instance_id(&vk));
         let cases = [
-            ("same as derived", RoleV1 { version: INBOX_GENERATION, address: Some(derived) }),
-            ("future generation", RoleV1 { version: INBOX_GENERATION + 1, address: Some([9u8; 32]) }),
-            ("older generation", RoleV1 { version: INBOX_GENERATION - 1, address: Some([9u8; 32]) }),
-            ("no address", RoleV1 { version: INBOX_GENERATION, address: None }),
+            (
+                "same as derived",
+                RoleV1 {
+                    version: INBOX_GENERATION,
+                    address: Some(derived),
+                },
+            ),
+            (
+                "future generation",
+                RoleV1 {
+                    version: INBOX_GENERATION + 1,
+                    address: Some([9u8; 32]),
+                },
+            ),
+            (
+                "older generation",
+                RoleV1 {
+                    version: INBOX_GENERATION - 1,
+                    address: Some([9u8; 32]),
+                },
+            ),
+            (
+                "no address",
+                RoleV1 {
+                    version: INBOX_GENERATION,
+                    address: None,
+                },
+            ),
         ];
         for (why, role) in cases {
-            let got = anchor_targets(author, &vk, &anchor(&[(ROLE_INBOX, role)]), &BTreeMap::new());
+            let got = anchor_targets(
+                author,
+                &vk,
+                &anchor(&[(ROLE_INBOX, role)]),
+                &BTreeMap::new(),
+            );
             assert!(got.is_empty(), "{why} must not be followed");
         }
         let empty = anchor_targets(author, &vk, &anchor(&[]), &BTreeMap::new());
@@ -1640,7 +1713,10 @@ mod tests {
         let author = vk.to_bytes();
         let a = anchor(&[(
             ROLE_AVATAR,
-            RoleV1 { version: AVATAR_GENERATION, address: Some([9u8; 32]) },
+            RoleV1 {
+                version: AVATAR_GENERATION,
+                address: Some([9u8; 32]),
+            },
         )]);
         let got = anchor_targets(author, &vk, &a, &BTreeMap::new());
         assert_eq!(got.len(), 1);
@@ -1660,19 +1736,28 @@ mod tests {
         let claimed = keys::feed_instance_id(&victim);
         let a = anchor(&[(
             ROLE_FEED,
-            RoleV1 { version: FEED_GENERATION, address: Some(id_bytes(claimed)) },
+            RoleV1 {
+                version: FEED_GENERATION,
+                address: Some(id_bytes(claimed)),
+            },
         )]);
         let tracked = [(claimed.to_string(), TrackedKind::Feed(victim.to_bytes()))]
             .into_iter()
             .collect();
         let got = anchor_targets(attacker.to_bytes(), &attacker, &a, &tracked);
-        assert!(got.is_empty(), "an anchor must not re-tag someone else's address");
+        assert!(
+            got.is_empty(),
+            "an anchor must not re-tag someone else's address"
+        );
 
         // Same address, same tag: our own rotation, already followed.
         let rotated = [7u8; 32];
         let mine = anchor(&[(
             ROLE_FEED,
-            RoleV1 { version: FEED_GENERATION, address: Some(rotated) },
+            RoleV1 {
+                version: FEED_GENERATION,
+                address: Some(rotated),
+            },
         )]);
         let author = attacker.to_bytes();
         let tracked = [(
@@ -1682,7 +1767,10 @@ mod tests {
         .into_iter()
         .collect();
         let got = anchor_targets(author, &attacker, &mine, &tracked);
-        assert!(got.is_empty(), "a rotation already followed is not re-fetched");
+        assert!(
+            got.is_empty(),
+            "a rotation already followed is not re-fetched"
+        );
     }
 
     /// Each role must carry its OWN derivation and tag. A mispaired row
@@ -1697,19 +1785,48 @@ mod tests {
         let mine = own_anchor(&vk);
         assert_eq!(mine.roles.len(), 3, "inbox, feed and avatar are published");
         let got = anchor_targets(author, &vk, &mine, &BTreeMap::new());
-        assert!(got.is_empty(), "a peer on this build must not re-fetch from our anchor");
+        assert!(
+            got.is_empty(),
+            "a peer on this build must not re-fetch from our anchor"
+        );
 
         // ...and with all three rotated, all three are followed, each with
         // its own tag.
         let rotated = anchor(&[
-            (ROLE_INBOX, RoleV1 { version: INBOX_GENERATION, address: Some([1u8; 32]) }),
-            (ROLE_FEED, RoleV1 { version: FEED_GENERATION, address: Some([2u8; 32]) }),
-            (ROLE_AVATAR, RoleV1 { version: AVATAR_GENERATION, address: Some([3u8; 32]) }),
+            (
+                ROLE_INBOX,
+                RoleV1 {
+                    version: INBOX_GENERATION,
+                    address: Some([1u8; 32]),
+                },
+            ),
+            (
+                ROLE_FEED,
+                RoleV1 {
+                    version: FEED_GENERATION,
+                    address: Some([2u8; 32]),
+                },
+            ),
+            (
+                ROLE_AVATAR,
+                RoleV1 {
+                    version: AVATAR_GENERATION,
+                    address: Some([3u8; 32]),
+                },
+            ),
         ]);
         let got = anchor_targets(author, &vk, &rotated, &BTreeMap::new());
         assert_eq!(got.len(), 3);
-        let feed = (ROLE_FEED, ContractInstanceId::new([2u8; 32]), TrackedKind::Feed(author), true);
-        assert!(got.contains(&feed), "feed row pairs its own derivation and tag");
+        let feed = (
+            ROLE_FEED,
+            ContractInstanceId::new([2u8; 32]),
+            TrackedKind::Feed(author),
+            true,
+        );
+        assert!(
+            got.contains(&feed),
+            "feed row pairs its own derivation and tag"
+        );
     }
 
     /// The probe list keeps rotated generations and filters the CURRENT one

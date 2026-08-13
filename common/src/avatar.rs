@@ -30,9 +30,8 @@ impl AvatarV1 {
     /// The exact bytes the author signs (issue #47): domain tag + canonical
     /// layout; the blob is hashed so the signed message stays small.
     pub fn signing_payload(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            AVATAR_SIGN_DOMAIN.len() + 8 + 4 + self.content_type.len() + 32,
-        );
+        let mut out =
+            Vec::with_capacity(AVATAR_SIGN_DOMAIN.len() + 8 + 4 + self.content_type.len() + 32);
         out.extend_from_slice(AVATAR_SIGN_DOMAIN);
         out.extend_from_slice(&self.time.to_le_bytes());
         crate::types::put_bytes(&mut out, self.content_type.as_bytes());

@@ -392,7 +392,8 @@ impl DirectoryStateV4 {
     /// lives there, never inside the pure merge).
     pub fn scrub_future(&mut self, now_ms: u64) {
         let horizon = now_ms.saturating_add(MAX_FUTURE_MS);
-        self.attested.retain(|_, l| l.listing.last_active <= horizon);
+        self.attested
+            .retain(|_, l| l.listing.last_active <= horizon);
         self.anon.retain(|_, l| l.listing.last_active <= horizon);
     }
 
@@ -409,7 +410,11 @@ impl DirectoryStateV4 {
             TierHorizon::Closed
         } else if self.anon.len() >= share {
             TierHorizon::OldestRetained(
-                self.anon.values().map(order_key).min().expect("non-empty tier"),
+                self.anon
+                    .values()
+                    .map(order_key)
+                    .min()
+                    .expect("non-empty tier"),
             )
         } else {
             TierHorizon::Open
@@ -489,7 +494,11 @@ impl DirectoryStateV4 {
             // malformed loser is silently skipped where an empty slot would
             // have failed the delta — the resulting state converges either
             // way; only misbehaving-peer signal is lost.)
-            let tier = if l.is_anon() { &self.anon } else { &self.attested };
+            let tier = if l.is_anon() {
+                &self.anon
+            } else {
+                &self.attested
+            };
             let held = tier.get(&l.listing.author);
             if held.is_some_and(|h| h.lww_key() >= l.lww_key()) {
                 continue;
@@ -781,7 +790,11 @@ mod tests {
 
     /// Structurally valid, never verified — for cap/horizon tests where
     /// minting one real attestation per author would take minutes.
-    fn fake_listing(att: Option<&AttestationV2>, author: [u8; 32], time: u64) -> AuthorizedListingV3 {
+    fn fake_listing(
+        att: Option<&AttestationV2>,
+        author: [u8; 32],
+        time: u64,
+    ) -> AuthorizedListingV3 {
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         AuthorizedListingV3::new(
             ListingV1 {
@@ -825,7 +838,8 @@ mod tests {
         let p = params(&authority);
         let a = author(&authority);
         let mut s = DirectoryStateV4::default();
-        s.apply_delta(&p, &d(vec![listing(&a, 5)])).expect("apply ok");
+        s.apply_delta(&p, &d(vec![listing(&a, 5)]))
+            .expect("apply ok");
         assert_eq!(s.attested.len(), 1);
         s.verify(&p).expect("verifies");
     }
@@ -896,7 +910,12 @@ mod tests {
         s.canonicalize();
         assert_eq!(s.anon.len(), ANON_LISTINGS);
         // The oldest were evicted.
-        let min = s.anon.values().map(|l| l.listing.last_active).min().unwrap();
+        let min = s
+            .anon
+            .values()
+            .map(|l| l.listing.last_active)
+            .min()
+            .unwrap();
         assert_eq!(min, 20);
     }
 
@@ -936,11 +955,16 @@ mod tests {
         }
         for i in 0..MAX_LISTINGS as u64 {
             let key = key_of(i, 1);
-            s.attested.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
+            s.attested
+                .insert(key, fake_listing(Some(&a.att), key, 1000 + i));
         }
         s.canonicalize();
         assert_eq!(s.attested.len(), MAX_LISTINGS);
-        assert_eq!(s.anon.len(), 0, "attested at the cap closes the anonymous share");
+        assert_eq!(
+            s.anon.len(),
+            0,
+            "attested at the cap closes the anonymous share"
+        );
     }
 
     #[test]
@@ -954,7 +978,12 @@ mod tests {
         }
         s.canonicalize();
         assert_eq!(s.attested.len(), MAX_LISTINGS);
-        let min = s.attested.values().map(|l| l.listing.last_active).min().unwrap();
+        let min = s
+            .attested
+            .values()
+            .map(|l| l.listing.last_active)
+            .min()
+            .unwrap();
         assert_eq!(min, 5);
     }
 
@@ -966,7 +995,9 @@ mod tests {
         let mut receiver = DirectoryStateV4::default();
         for i in 0..MAX_LISTINGS as u64 {
             let key = key_of(i, 1);
-            receiver.attested.insert(key, fake_listing(Some(&a.att), key, 1000 + i));
+            receiver
+                .attested
+                .insert(key, fake_listing(Some(&a.att), key, 1000 + i));
         }
         let summary = receiver.summarize();
         assert_eq!(summary.anon_horizon, TierHorizon::Closed);
@@ -987,7 +1018,10 @@ mod tests {
             receiver.anon.insert(key, fake_listing(None, key, 1000 + i));
         }
         let summary = receiver.summarize();
-        assert!(matches!(summary.anon_horizon, TierHorizon::OldestRetained(_)));
+        assert!(matches!(
+            summary.anon_horizon,
+            TierHorizon::OldestRetained(_)
+        ));
 
         // Sender holds one OLD anon listing the receiver would prune.
         let mut sender = DirectoryStateV4::default();
@@ -1003,7 +1037,9 @@ mod tests {
         let a = author(&authority);
         let mut attested_sender = DirectoryStateV4::default();
         let akey = key_of(1, 4);
-        attested_sender.attested.insert(akey, fake_listing(Some(&a.att), akey, 1));
+        attested_sender
+            .attested
+            .insert(akey, fake_listing(Some(&a.att), akey, 1));
         assert!(attested_sender.delta(&summary).is_some());
     }
 
@@ -1024,8 +1060,10 @@ mod tests {
         let ok_key = [3u8; 32];
         let bad_key = [4u8; 32];
         s.anon.insert(ok_key, fake_listing(None, ok_key, 1_000));
-        s.anon
-            .insert(bad_key, fake_listing(None, bad_key, 1_000 + MAX_FUTURE_MS + 1));
+        s.anon.insert(
+            bad_key,
+            fake_listing(None, bad_key, 1_000 + MAX_FUTURE_MS + 1),
+        );
         s.scrub_future(1_000);
         assert_eq!(s.anon.len(), 1);
         assert!(s.anon.contains_key(&ok_key));
@@ -1088,7 +1126,10 @@ mod tests {
         // Even if the AUTHOR's own key wraps it (the attacker can't, but be
         // strict): the attestation itself must fail verification.
         let l = AuthorizedListingV3::new(
-            ListingV1 { author: key, last_active: 5 },
+            ListingV1 {
+                author: key,
+                last_active: 5,
+            },
             &sk,
             Some(forced),
         );
@@ -1141,19 +1182,26 @@ mod tests {
         let (sk, key) = anon_author();
         // nonce 0 clears the 20-bit floor with probability 2^-20 — negligible.
         let bad = AuthorizedListingV3::new(
-            ListingV1 { author: key, last_active: 5 },
+            ListingV1 {
+                author: key,
+                last_active: 5,
+            },
             &sk,
             None,
         );
         assert_eq!(bad.pow_nonce, 0);
 
         let mut s = DirectoryStateV4::default();
-        s.apply_delta(&p, &d(vec![bad.clone()])).expect("delta ok, listing dropped");
+        s.apply_delta(&p, &d(vec![bad.clone()]))
+            .expect("delta ok, listing dropped");
         assert!(s.anon.is_empty(), "unstamped anon listing must be dropped");
 
         let mut fabricated = DirectoryStateV4::default();
         fabricated.anon.insert(key, bad);
-        assert!(fabricated.verify(&p).is_err(), "under-floor anon fails verify");
+        assert!(
+            fabricated.verify(&p).is_err(),
+            "under-floor anon fails verify"
+        );
     }
 
     /// The ghost-key (attested) path skips PoW: an attested listing with no
@@ -1166,7 +1214,8 @@ mod tests {
         let l = listing(&a, 5);
         assert_eq!(l.pow_nonce, 0, "attested writes carry no stamp");
         let mut s = DirectoryStateV4::default();
-        s.apply_delta(&p, &d(vec![l])).expect("attested admitted without PoW");
+        s.apply_delta(&p, &d(vec![l]))
+            .expect("attested admitted without PoW");
         assert_eq!(s.attested.len(), 1);
         s.verify(&p).expect("verifies");
     }
@@ -1182,7 +1231,10 @@ mod tests {
 
         let (sk_b, key_b) = anon_author();
         let mut b_listing = AuthorizedListingV3::new(
-            ListingV1 { author: key_b, last_active: 5 },
+            ListingV1 {
+                author: key_b,
+                last_active: 5,
+            },
             &sk_b,
             None,
         );
@@ -1225,11 +1277,17 @@ mod tests {
             },
         )
         .expect("delta ok");
-        assert!(s.anon.is_empty(), "floor stamp rejected under raised difficulty");
+        assert!(
+            s.anon.is_empty(),
+            "floor stamp rejected under raised difficulty"
+        );
 
         // Solved to the control difficulty → admitted.
         let strong = AuthorizedListingV3::new_anon(
-            ListingV1 { author: key, last_active: 5 },
+            ListingV1 {
+                author: key,
+                last_active: 5,
+            },
             &sk,
             control,
         );
@@ -1268,7 +1326,10 @@ mod tests {
         let mut s = DirectoryStateV4::default();
         s.apply_delta(
             &p,
-            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(raised, 1)) },
+            &DirectoryDeltaV3 {
+                listings: vec![],
+                pow_difficulty: Some(difficulty_record(raised, 1)),
+            },
         )
         .expect("record latches on its own");
         assert_eq!(s.admission_bits(), raised);
@@ -1277,11 +1338,20 @@ mod tests {
         let mut weak = anon_listing(&sk, key, 5);
         weak.pow_nonce = freebird_pow::solve_directory_band(&key, POW_FLOOR_BITS, raised);
         s.apply_delta(&p, &d(vec![weak])).expect("delta ok");
-        assert!(s.anon.is_empty(), "floor stamp rejected with no record in the delta");
+        assert!(
+            s.anon.is_empty(),
+            "floor stamp rejected with no record in the delta"
+        );
 
         // The honest client that solved to the latched bar still gets in.
-        let strong =
-            AuthorizedListingV3::new_anon(ListingV1 { author: key, last_active: 5 }, &sk, raised);
+        let strong = AuthorizedListingV3::new_anon(
+            ListingV1 {
+                author: key,
+                last_active: 5,
+            },
+            &sk,
+            raised,
+        );
         s.apply_delta(&p, &d(vec![strong])).expect("delta ok");
         assert_eq!(s.anon.len(), 1);
         s.verify(&p).expect("raised-difficulty state verifies");
@@ -1297,14 +1367,20 @@ mod tests {
         let floor_record = difficulty_record(POW_FLOOR_BITS, 1);
         s.apply_delta(
             &p,
-            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(24, 7)) },
+            &DirectoryDeltaV3 {
+                listings: vec![],
+                pow_difficulty: Some(difficulty_record(24, 7)),
+            },
         )
         .expect("delta ok");
 
         // Genuine but stale (seq 1 < 7).
         s.apply_delta(
             &p,
-            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(floor_record) },
+            &DirectoryDeltaV3 {
+                listings: vec![],
+                pow_difficulty: Some(floor_record),
+            },
         )
         .expect("delta ok");
         assert_eq!(s.admission_bits(), 24, "stale genuine record ignored");
@@ -1317,13 +1393,25 @@ mod tests {
             99,
             freebird_pow::difficulty_body(POW_FLOOR_BITS),
         );
-        s.apply_delta(&p, &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(forged.clone()) })
-            .expect("delta ok");
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 {
+                listings: vec![],
+                pow_difficulty: Some(forged.clone()),
+            },
+        )
+        .expect("delta ok");
         assert_eq!(s.admission_bits(), 24, "forged record ignored");
 
         // And a fabricated full state cannot seat the forged record either.
-        let fabricated = DirectoryStateV4 { pow_difficulty: Some(forged), ..Default::default() };
-        assert!(fabricated.verify(&p).is_err(), "unsigned difficulty record fails verify");
+        let fabricated = DirectoryStateV4 {
+            pow_difficulty: Some(forged),
+            ..Default::default()
+        };
+        assert!(
+            fabricated.verify(&p).is_err(),
+            "unsigned difficulty record fails verify"
+        );
     }
 
     /// A raise reaches a replica that has nothing else to sync: the summary
@@ -1336,12 +1424,17 @@ mod tests {
         raised
             .apply_delta(
                 &p,
-                &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(23, 4)) },
+                &DirectoryDeltaV3 {
+                    listings: vec![],
+                    pow_difficulty: Some(difficulty_record(23, 4)),
+                },
             )
             .expect("delta ok");
 
         let mut behind = DirectoryStateV4::default();
-        let delta = raised.delta(&behind.summarize()).expect("record alone justifies a delta");
+        let delta = raised
+            .delta(&behind.summarize())
+            .expect("record alone justifies a delta");
         assert!(delta.listings.is_empty());
         behind.apply_delta(&p, &delta).expect("delta ok");
         assert_eq!(behind.admission_bits(), 23);
@@ -1376,12 +1469,16 @@ mod tests {
         let p = params(&authority);
         let (sk, key) = anon_author();
         let mut s = DirectoryStateV4::default();
-        s.apply_delta(&p, &d(vec![anon_listing(&sk, key, 5)])).expect("delta ok");
+        s.apply_delta(&p, &d(vec![anon_listing(&sk, key, 5)]))
+            .expect("delta ok");
         assert_eq!(s.anon.len(), 1);
 
         s.apply_delta(
             &p,
-            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(26, 2)) },
+            &DirectoryDeltaV3 {
+                listings: vec![],
+                pow_difficulty: Some(difficulty_record(26, 2)),
+            },
         )
         .expect("delta ok");
         assert_eq!(s.anon.len(), 1, "seated listing survives the raise");
@@ -1398,7 +1495,9 @@ mod tests {
         let mut receiver = DirectoryStateV4::default();
         for i in 0..900u64 {
             let key = key_of(i, 1);
-            receiver.attested.insert(key, fake_listing(Some(&a.att), key, i));
+            receiver
+                .attested
+                .insert(key, fake_listing(Some(&a.att), key, i));
         }
         for i in 0..100u64 {
             let key = key_of(i, 2);
@@ -1416,14 +1515,18 @@ mod tests {
         // NEW anon author below the horizon: not offered.
         let mut old_sender = DirectoryStateV4::default();
         let new_key = key_of(999, 3);
-        old_sender.anon.insert(new_key, fake_listing(None, new_key, 1));
+        old_sender
+            .anon
+            .insert(new_key, fake_listing(None, new_key, 1));
         assert!(old_sender.delta(&summary).is_none());
 
         // HELD anon author, newer copy whose order key TIES the horizon
         // exception path: offered despite the horizon (in-place LWW).
         let held_key = key_of(0, 2);
         let mut upgrader = DirectoryStateV4::default();
-        upgrader.anon.insert(held_key, fake_listing(None, held_key, 5000));
+        upgrader
+            .anon
+            .insert(held_key, fake_listing(None, held_key, 5000));
         assert!(upgrader.delta(&summary).is_some());
     }
 
@@ -1461,7 +1564,10 @@ mod tests {
         let att = rogue.attest(&sk); // does NOT verify under p.ghostkey_master
         let mk = |time, att: &AttestationV2| {
             AuthorizedListingV3::new(
-                ListingV1 { author: key, last_active: time },
+                ListingV1 {
+                    author: key,
+                    last_active: time,
+                },
                 &sk,
                 Some(att.clone()),
             )
@@ -1470,12 +1576,15 @@ mod tests {
         // seat an unverifiable attestation, so anything held WAS verified.
         let mut fabricated = DirectoryStateV4::default();
         fabricated.attested.insert(key, mk(5, &att));
-        assert!(fabricated.verify(&p).is_err(), "rogue attestation must fail verify()");
+        assert!(
+            fabricated.verify(&p).is_err(),
+            "rogue attestation must fail verify()"
+        );
 
         let mut s = DirectoryStateV4::default();
         s.attested.insert(key, mk(5, &att)); // seated as if verified at admission
-        // Republish with the held attestation — including a second entry in
-        // the same delta riding the just-admitted one: no RSA re-run.
+                                             // Republish with the held attestation — including a second entry in
+                                             // the same delta riding the just-admitted one: no RSA re-run.
         s.apply_delta(&p, &d(vec![mk(7, &att), mk(9, &att)]))
             .expect("held attestation not re-verified");
         assert_eq!(s.attested[&key].listing.last_active, 9);
@@ -1500,7 +1609,8 @@ mod tests {
         bad.signature = Signature::from_bytes(&[0u8; 64]);
         let mut s = DirectoryStateV4::default();
         s.attested.insert(a.key, bad.clone());
-        s.apply_delta(&p, &d(vec![bad])).expect("exact replay skipped");
+        s.apply_delta(&p, &d(vec![bad]))
+            .expect("exact replay skipped");
         assert_eq!(s.attested[&a.key].listing.last_active, 5);
     }
 
@@ -1518,11 +1628,21 @@ mod tests {
         // must still be verified (and fail), not skipped via the anon slot.
         s.anon.insert(
             key,
-            AuthorizedListingV3::new(ListingV1 { author: key, last_active: 100 }, &sk, None),
+            AuthorizedListingV3::new(
+                ListingV1 {
+                    author: key,
+                    last_active: 100,
+                },
+                &sk,
+                None,
+            ),
         );
         let att = rogue.attest(&sk);
         let l = AuthorizedListingV3::new(
-            ListingV1 { author: key, last_active: 5 },
+            ListingV1 {
+                author: key,
+                last_active: 5,
+            },
             &sk,
             Some(att),
         );
@@ -1531,8 +1651,14 @@ mod tests {
         let a = author(&authority);
         let mut s = DirectoryStateV4::default();
         s.apply_delta(&p, &d(vec![listing(&a, 100)])).unwrap();
-        let mut anon_bad =
-            AuthorizedListingV3::new(ListingV1 { author: a.key, last_active: 5 }, &a.sk, None);
+        let mut anon_bad = AuthorizedListingV3::new(
+            ListingV1 {
+                author: a.key,
+                last_active: 5,
+            },
+            &a.sk,
+            None,
+        );
         anon_bad.signature = Signature::from_bytes(&[0u8; 64]);
         assert!(s.apply_delta(&p, &d(vec![anon_bad])).is_err());
     }
@@ -1583,10 +1709,13 @@ mod tests {
         /// and resurrected stale attested entries to 1000 in the other.
         #[test]
         fn downgrade_reproducer_converges() {
-            let attested: Vec<_> = (0..1000).map(|i| raw(false, key_of(i, 1), 100 + i)).collect();
+            let attested: Vec<_> = (0..1000)
+                .map(|i| raw(false, key_of(i, 1), 100 + i))
+                .collect();
             let anon: Vec<_> = (0..200).map(|i| raw(true, key_of(i, 2), 100 + i)).collect();
-            let downgrades: Vec<_> =
-                (0..400).map(|i| raw(true, key_of(i, 1), 10_000 + i)).collect();
+            let downgrades: Vec<_> = (0..400)
+                .map(|i| raw(true, key_of(i, 1), 10_000 + i))
+                .collect();
             let o1 = [attested.clone(), anon.clone(), downgrades.clone()].concat();
             let o2 = [downgrades, anon, attested].concat();
             let s1 = admit_chunked(&o1, 50);
