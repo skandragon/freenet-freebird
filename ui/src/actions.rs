@@ -96,7 +96,8 @@ pub async fn resume_account(seed: Vec<u8>) -> Result<(), String> {
     *ACCOUNT.write() = Some(sk.clone());
     // Owner-republish half of the #23 migration, best-effort and idempotent:
     // make sure our v2 inbox exists (an account created pre-rotation never
-    // PUT it) and (re)publish the anchor cell pointing at it. This runs
+    // PUT it) and (re)publish the anchor cell routing to it, the feed and
+    // the avatar. This runs
     // BEFORE the feed fetch and regardless of its outcome — reachability
     // for replies must not depend on a read succeeding.
     if let Err(e) = api::ensure_own_inbox(&vk).await {

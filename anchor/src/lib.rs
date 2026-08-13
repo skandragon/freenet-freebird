@@ -3,8 +3,10 @@
 //! kernel, `purpose = "anchor"`) whose body maps role → the version and
 //! address of their current contract for that role. The cell wasm never
 //! changes, so the anchor address derived from a posting key is stable
-//! forever — future schema rotations publish a new role entry instead of
-//! stranding readers.
+//! forever — a rotation republishes the role's version and address in place
+//! instead of stranding readers. Role KEYS are the wire contract between
+//! writer and reader and never change; a reader looks up the keys it knows
+//! and ignores the rest.
 //!
 //! This schema is CLIENT-SIDE ONLY, same doctrine as `freebird-control`: the
 //! cell contract treats the body as opaque signed bytes, decoding tolerates
@@ -29,9 +31,11 @@ pub const ROLE_FEED: &str = "feed";
 /// Role key for the author's avatar.
 pub const ROLE_AVATAR: &str = "avatar";
 
-/// One role's routing entry: which schema version the author currently
-/// publishes, and (optionally) the contract instance address, so readers can
-/// GET it even without the wasm that derives it.
+/// One role's routing entry: which GENERATION of that contract the author
+/// currently publishes — counting address rotations, not the state schema's
+/// own `V*` number — and (optionally) the contract instance address, so
+/// readers can GET it even without the wasm that derives it. Readers match
+/// the generation exactly, so bumping it is how a rotation announces itself.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct RoleV1 {
     pub version: u32,
@@ -110,7 +114,7 @@ mod tests {
     fn role_lookup() {
         let a = anchor();
         assert_eq!(a.role(ROLE_INBOX).map(|r| r.version), Some(2));
-        assert!(a.role("feed").is_none());
+        assert!(a.role("no-such-role").is_none());
     }
 
     #[test]
