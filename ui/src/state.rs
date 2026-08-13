@@ -21,6 +21,12 @@ pub enum SyncStatus {
 pub static WEB_API: GlobalSignal<Option<WebApi>> = Signal::global(|| None);
 pub static SYNC_STATUS: GlobalSignal<SyncStatus> = Signal::global(SyncStatus::default);
 
+/// Last failure the node reported for a write to our OWN feed (issue #79).
+/// Writes are fire-and-forget — `send` returns Ok once the request is on the
+/// socket — so without this a rejected post clears the compose box and looks
+/// like a success.
+pub static FEED_WRITE_ERROR: GlobalSignal<Option<String>> = Signal::global(|| None);
+
 /// The local account's posting key (None until onboarded).
 pub static ACCOUNT: GlobalSignal<Option<SigningKey>> = Signal::global(|| None);
 

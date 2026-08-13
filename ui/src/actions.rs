@@ -95,11 +95,16 @@ pub async fn resume_account(seed: Vec<u8>) -> Result<(), String> {
     let author = vk.to_bytes();
     *ACCOUNT.write() = Some(sk.clone());
     // Owner-republish half of the #23 migration, best-effort and idempotent:
-    // make sure our v2 inbox exists (an account created pre-rotation never
-    // PUT it) and (re)publish the anchor cell routing to it, the feed and
-    // the avatar. This runs
+    // make sure our v2 feed and inbox exist (an account created before the
+    // rotations never PUT either, and an Update against an absent contract
+    // fails asynchronously — issue #79) and (re)publish the anchor cell
+    // routing to them and the avatar. This runs
     // BEFORE the feed fetch and regardless of its outcome — reachability
-    // for replies must not depend on a read succeeding.
+    // for replies must not depend on a read succeeding, and the feed PUT
+    // must precede `migrate_v1`'s first write, which the fetch gates on.
+    if let Err(e) = api::ensure_own_feed(&sk).await {
+        api::log(&format!("feed republish failed: {e}"));
+    }
     if let Err(e) = api::ensure_own_inbox(&vk).await {
         api::log(&format!("v2 inbox republish failed: {e}"));
     }

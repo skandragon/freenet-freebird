@@ -711,6 +711,7 @@ pub fn App() -> Element {
                 }
             }
             UpdateBanner {}
+            FeedWriteErrorBanner {}
             match account_gate(
                 onboarded,
                 awaiting_key,
@@ -768,6 +769,31 @@ pub fn App() -> Element {
                     "freenet-freebird"
                 }
                 {format!(" · build {} ({})", env!("BUILD_HASH"), env!("BUILD_DATE"))}
+            }
+        }
+    }
+}
+
+/// The node rejected a write to our own feed (issue #79). Posting, following
+/// and verifying all report success the moment the request leaves the socket,
+/// so this banner is the only place the failure becomes visible.
+#[component]
+fn FeedWriteErrorBanner() -> Element {
+    let Some(error) = FEED_WRITE_ERROR.read().clone() else {
+        return rsx! {};
+    };
+    rsx! {
+        div { class: "update-banner", role: "alert",
+            span {
+                "Your last change to your feed did not reach the network."
+                span { class: "muted", " ({error})" }
+            }
+            span { class: "update-banner-actions",
+                button {
+                    class: "link muted",
+                    onclick: move |_| *FEED_WRITE_ERROR.write() = None,
+                    "Dismiss"
+                }
             }
         }
     }

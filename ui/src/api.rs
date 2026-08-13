@@ -13,8 +13,9 @@ use directory_contract::{AuthorizedListingV3, DirectoryStateV4};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::legacy::LegacyFeedState;
-use freebird_core::feed::{FeedParametersV1, FeedStateV1, FeedStateV1Delta};
+use freebird_core::feed::{AttestationSlot, FeedParametersV1, FeedStateV1, FeedStateV1Delta, PostsV1};
 use freebird_core::inbox::{InboxStateV1, InboxStateV1Delta};
+use freebird_core::types::{AuthorizedFollows, AuthorizedProfile, FollowsV1, ProfileV1};
 use inbox_contract::state::{InboxStateV3, InboxStateV3Delta};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse};
@@ -93,6 +94,7 @@ pub async fn connect() -> Result<(), String> {
                         // Request-level error (e.g. probing a delegate that
                         // isn't installed) — the connection is fine.
                         log(&format!("request error: {e}"));
+                        note_feed_error(&e);
                     }
                 }
             }
@@ -117,6 +119,26 @@ fn schedule_reload() {
             let _ = win.location().reload();
         }
     });
+}
+
+/// Does this request-level error name our own feed contract?
+///
+/// Errors carry no request id (the protocol has none), so the contract id in
+/// the message is the only correlation available. Scoped to our own feed on
+/// purpose: GETs for absent avatars, anchors and v1 contracts fail routinely
+/// and are not user news, while a failed write to our feed is the one the UI
+/// otherwise reports as a success (issue #79).
+fn names_own_feed(error: &str, vk: &VerifyingKey) -> bool {
+    error.contains(&keys::feed_instance_id(vk).encode())
+}
+
+fn note_feed_error(error: &str) {
+    let Some(vk) = ACCOUNT.peek().as_ref().map(|sk| sk.verifying_key()) else {
+        return;
+    };
+    if names_own_feed(error, &vk) {
+        *FEED_WRITE_ERROR.write() = Some(error.to_string());
+    }
 }
 
 pub async fn send(request: ClientRequest<'static>) -> Result<(), String> {
@@ -161,7 +183,13 @@ fn directory_container() -> ContractContainer {
 
 /// PUT our own feed + inbox (first run), subscribing to both.
 pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Result<(), String> {
+    put_own_feed(author, feed).await?;
+    ensure_own_inbox(author).await
+}
+
+async fn put_own_feed(author: &VerifyingKey, feed: &FeedStateV1) -> Result<(), String> {
     let feed_state = freebird_core::to_cbor(feed)?;
+    track(keys::feed_key(author), TrackedKind::Feed(author.to_bytes()));
     send(ClientRequest::ContractOp(ContractRequest::Put {
         contract: feed_container(author),
         state: WrappedState::new(feed_state),
@@ -169,8 +197,38 @@ pub async fn put_own_contracts(author: &VerifyingKey, feed: &FeedStateV1) -> Res
         subscribe: true,
         blocking_subscribe: false,
     }))
-    .await?;
-    ensure_own_inbox(author).await
+    .await
+}
+
+/// The state a feed is created with when we only know it must exist: signed
+/// (there is no default — every component carries the author's signature) and
+/// versioned BELOW anything real, so merging it over a live feed can never
+/// roll a profile or follow list back to empty.
+fn seed_feed(sk: &SigningKey) -> FeedStateV1 {
+    FeedStateV1 {
+        profile: AuthorizedProfile::new(
+            ProfileV1 { name: String::new(), bio: String::new(), version: 0 },
+            sk,
+        ),
+        follows: AuthorizedFollows::new(
+            FollowsV1 { follows: Default::default(), version: 0 },
+            sk,
+        ),
+        attestation: AttestationSlot(None),
+        posts: PostsV1::default(),
+    }
+}
+
+/// PUT our own feed with the seed state: creates it when the node has never
+/// seen it, and the contract's merge turns a re-Put over a live feed into a
+/// no-op — safe on every resume (issue #79).
+///
+/// Load-bearing after a feed rotation (#64, #67): the address every existing
+/// author's feed lives at changed, so their v2 contract does not exist and
+/// every `update_own_feed` — posting, following, and `migrate_v1`'s first
+/// write — is an Update against nothing.
+pub async fn ensure_own_feed(sk: &SigningKey) -> Result<(), String> {
+    put_own_feed(&sk.verifying_key(), &seed_feed(sk)).await
 }
 
 /// PUT our v2 inbox with an empty state: creates it on first use, and the
@@ -1393,14 +1451,86 @@ fn lookup(key: &ContractKey) -> Option<TrackedKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        anchor_targets, own_anchor, TrackedKind, AVATAR_GENERATION, FEED_GENERATION,
-        INBOX_GENERATION,
+        anchor_targets, names_own_feed, own_anchor, seed_feed, TrackedKind, AVATAR_GENERATION,
+        FEED_GENERATION, INBOX_GENERATION,
     };
     use crate::keys;
     use ed25519_dalek::SigningKey;
     use freebird_anchor::{AnchorV1, RoleV1, ROLE_AVATAR, ROLE_FEED, ROLE_INBOX};
     use freenet_stdlib::prelude::ContractInstanceId;
     use std::collections::BTreeMap;
+
+    /// Issue #79: the feed rotations (#64, #67) moved every existing author's
+    /// feed to an address their node has never seen, so `resume_account` PUTs
+    /// the seed state before anything writes. Two properties make that PUT
+    /// safe to run on EVERY resume, not just the first after a rotation: the
+    /// contract must accept the seed as a first Put, and merging it over a
+    /// feed already in use must change nothing.
+    #[test]
+    fn seed_feed_bootstraps_a_rotated_feed_without_clobbering_it() {
+        use freebird_core::feed::FeedStateV1Delta;
+        use freebird_core::types::{
+            AuthorizedFollows, AuthorizedProfile, FollowsV1, ProfileV1,
+        };
+        use freenet_scaffold::ComposableState;
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let params = keys::feed_params(&sk.verifying_key());
+        let seed = seed_feed(&sk);
+        seed.verify(&seed, &params)
+            .expect("the contract must accept the seed as a first Put");
+
+        // Resume, then everything the account does next — the profile and
+        // follows `migrate_v1` restores, and a post.
+        let mut live = seed.clone();
+        let clone = live.clone();
+        live.apply_delta(
+            &clone,
+            &params,
+            &Some(FeedStateV1Delta {
+                profile: Some(AuthorizedProfile::new(
+                    ProfileV1 { name: "gryph".into(), bio: "hi".into(), version: 3 },
+                    &sk,
+                )),
+                follows: Some(AuthorizedFollows::new(
+                    FollowsV1 { follows: [[9u8; 32]].into_iter().collect(), version: 2 },
+                    &sk,
+                )),
+                attestation: None,
+                posts: Some(vec![keys::make_post(&sk, "hello".into(), None)]),
+            }),
+        )
+        .expect("writes land on the seeded feed");
+
+        // The NEXT resume re-PUTs the same seed; the contract merges it.
+        let before = live.clone();
+        let clone = live.clone();
+        live.merge(&clone, &params, &seed).expect("merge");
+        assert_eq!(live, before, "a re-PUT of the seed must change nothing");
+    }
+
+    /// A rejected write reaches us with no request id, so the contract id in
+    /// the message is the only correlation there is. Our own feed's failures
+    /// are user news; every other contract's fail routinely (absent avatars,
+    /// anchors, v1 reads) and stay in the log.
+    #[test]
+    fn only_our_own_feed_errors_reach_the_user() {
+        let vk = SigningKey::from_bytes(&[8u8; 32]).verifying_key();
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let msg = |id: ContractInstanceId| {
+            format!(
+                "client error: error while executing operation in the network: \
+                 originator missing contract code/params for {id}; auto-fetch triggered"
+            )
+        };
+        assert!(names_own_feed(&msg(keys::feed_instance_id(&vk)), &vk));
+        assert!(!names_own_feed(&msg(keys::feed_instance_id(&other)), &vk));
+        assert!(!names_own_feed(&msg(keys::avatar_instance_id(&vk)), &vk));
+        assert!(!names_own_feed(
+            "client error: error while registering delegate 5Kd3",
+            &vk
+        ));
+    }
 
     fn anchor(roles: &[(&str, RoleV1)]) -> AnchorV1 {
         AnchorV1::new(
