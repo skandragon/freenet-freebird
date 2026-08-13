@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::FeedStateV1;
-use freebird_core::inbox::InboxStateV1;
 use freenet_stdlib::client_api::WebApi;
 use inbox_contract::state::InboxStateV3;
 
@@ -36,7 +35,7 @@ pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
 
 /// LEGACY (pre-#64) feed states by author key — dual-read migration window
 /// (issue #64 rotated the feed contract and changed its format in place).
-/// `None` value = requested, not yet arrived. Never written back to the v1
+/// `None` value = requested, not yet arrived. Never written back to the legacy
 /// contract; our OWN entry is the source for the forward migration (#56,
 /// `actions::migrate_v1`), which re-signs it into the v2 feed. Gated on
 /// `read_v1_feed`.
@@ -47,10 +46,10 @@ pub static LEGACY_FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<LegacyFeedState>
 pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV3>> =
     Signal::global(BTreeMap::new);
 
-/// LEGACY (v1) inbox states by owner key — dual-read migration window
-/// (issue #23): old attested pointers stay visible until the publisher
-/// closes the window via the `read_v1_inbox` control flag.
-pub static LEGACY_INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV1>> =
+/// LEGACY inbox states by owner key — dual-read migration window (issues
+/// #23, #81): pointers written against the LIVE build stay visible until the
+/// publisher closes the window via the `read_v1_inbox` control flag.
+pub static LEGACY_INBOXES: GlobalSignal<BTreeMap<[u8; 32], crate::legacy::LegacyInboxState>> =
     Signal::global(BTreeMap::new);
 
 /// Per-author anchor cells (issue #23): role → current contract version and
@@ -64,12 +63,20 @@ pub static ANCHORS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_anchor::Anch
 pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>> =
     Signal::global(BTreeMap::new);
 
+/// LEGACY avatars by author key — dual-read migration window (issue #81).
+/// Kept SEPARATE from `AVATARS` rather than merged into it: the rendering
+/// fallback needs "we have only a legacy blob" to stay distinguishable, or
+/// `migrate_avatar` cannot tell whether it still owes a re-signed upload.
+pub static LEGACY_AVATARS: GlobalSignal<
+    BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>,
+> = Signal::global(BTreeMap::new);
+
 /// The public author directory, v2 (issue #11). None = not fetched yet.
 pub static DIRECTORY: GlobalSignal<Option<directory_contract::DirectoryStateV4>> =
     Signal::global(|| None);
 
-/// The LEGACY (v1) directory — dual-read migration window (issue #23).
-pub static LEGACY_DIRECTORY: GlobalSignal<Option<directory_contract::legacy::LegacyDirectoryState>> =
+/// The LEGACY directory — dual-read migration window (issues #23, #81).
+pub static LEGACY_DIRECTORY: GlobalSignal<Option<crate::legacy::LegacyDirectoryState>> =
     Signal::global(|| None);
 
 /// Our "list me publicly" preference, delegate-persisted like the theme:
@@ -306,10 +313,12 @@ pub static GHOSTKEY_DELEGATE: GlobalSignal<Option<freenet_stdlib::prelude::Deleg
 pub static PENDING_FOLLOW: GlobalSignal<Option<[u8; 32]>> = Signal::global(|| None);
 
 /// A control-cell feature flag, defaulting when control state is absent or
-/// the flag unset. The v1 dual-read window is gated on `read_v1_inbox` /
-/// `read_v1_directory` / `read_v1_feed` (default ON) so the publisher can
-/// close it network-wide once enough clients have run the forward migration
-/// (issue #56, `actions::migrate_v1`).
+/// the flag unset. The dual-read window is gated per role on `read_v1_feed`
+/// / `read_v1_inbox` / `read_v1_directory` / `read_v1_avatar` (default ON)
+/// so the publisher can close each one network-wide once enough clients have
+/// run the forward migration (issues #56, #81; `actions::migrate_v1`,
+/// `actions::migrate_avatar`). See docs/dual-read-window.md for what
+/// terminates each window.
 pub fn flag_bool(name: &str, default: bool) -> bool {
     CONTROL
         .read()

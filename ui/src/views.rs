@@ -160,7 +160,15 @@ fn Avatar(author: [u8; 32], #[props(default)] lg: bool) -> Element {
             });
         }
     });
-    let src = AVATARS.read().get(&author).cloned().flatten().map(|a| {
+    // Current generation wins; the legacy blob shows through only while the
+    // author has not re-uploaded under the new signature (issue #81).
+    let held = AVATARS
+        .read()
+        .get(&author)
+        .cloned()
+        .flatten()
+        .or_else(|| LEGACY_AVATARS.read().get(&author).cloned().flatten());
+    let src = held.map(|a| {
         use base64::Engine;
         format!(
             "data:{};base64,{}",
@@ -633,6 +641,41 @@ pub fn App() -> Element {
                     api::log(&format!(
                         "v1 migration incomplete, retries next session: {e}"
                     ));
+                }
+            });
+        }
+    });
+
+    // Re-sign our own legacy profile picture into the rotated avatar
+    // contract as soon as the legacy read produces one (issue #81). Fetches
+    // our own avatar pair itself: the Avatar component only fetches what is
+    // on screen, and the migration must not depend on the header rendering.
+    let mut avatar_migration_started = use_signal(|| false);
+    use_effect(move || {
+        let Some(author) = own_author() else { return };
+        if !AVATARS.read().contains_key(&author) {
+            spawn(async move {
+                // Not `let _ =`: this is the only trigger for the whole
+                // avatar migration, so a swallowed send failure here is a
+                // silently lost profile picture when the window closes.
+                if let Err(e) = api::fetch_avatar(author).await {
+                    api::log(&format!("avatar fetch for migration failed: {e}"));
+                }
+            });
+            return;
+        }
+        // Nothing to do once we hold a current-generation avatar, and
+        // nothing to do until the legacy read produces one.
+        if AVATARS.read().get(&author).is_some_and(Option::is_some)
+            || !LEGACY_AVATARS.read().get(&author).is_some_and(Option::is_some)
+        {
+            return;
+        }
+        if !*avatar_migration_started.peek() {
+            avatar_migration_started.set(true);
+            spawn(async move {
+                if let Err(e) = actions::migrate_avatar().await {
+                    api::log(&format!("avatar migration failed, retries next session: {e}"));
                 }
             });
         }

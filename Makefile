@@ -31,7 +31,7 @@ PLATFORM ?= linux/amd64
 PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
 DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
 
-.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
+.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built check-legacy-wasm pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
 
 all: test contracts delegate ui
 
@@ -79,6 +79,65 @@ check-addresses:
 
 pin-hashes:
 	shasum -a 256 ui/contracts/*.wasm > scripts/wasm-hashes.txt
+
+# The dual-read window derives its legacy addresses from the *_v1 blobs, so
+# each one must be the bytes of the build currently serving users — NOT of
+# generation 1 (issue #81: inbox and directory were pinned a generation
+# behind the live build, so the window read contracts nobody had written to,
+# and every returning user lost their Discover listing and their replies).
+#
+# The live commit is recorded in scripts/live-build.txt and its blobs come
+# straight out of git, so this is an offline, deterministic check.
+#
+# freebird_delegate_v1.wasm is deliberately NOT here. The delegate has no
+# dual-read window: LEGACY_DELEGATE_WASMS (ui/src/keys.rs) is a CUMULATIVE
+# registry of every generation ever shipped, because the startup probe folds
+# each old generation's stored posting-key seed forward (issue #53).
+# Requiring it to equal the live build would overwrite the oldest entry and
+# destroy the seed of anyone still on that generation.
+LEGACY_ROLES := feed_contract inbox_contract avatar_contract directory_contract
+check-legacy-wasm:
+	@live=$$(grep -v '^#' scripts/live-build.txt | tr -d '[:space:]'); \
+	[ -n "$$live" ] || { echo "ERROR: scripts/live-build.txt names no commit"; exit 1; }; \
+	git cat-file -e "$$live^{commit}" 2>/dev/null || { \
+	  echo "ERROR: live build $$live is not in this repo — CI needs full history"; exit 1; }; \
+	git merge-base --is-ancestor "$$live" HEAD || { \
+	  echo "ERROR: live build $$live is not an ancestor of HEAD."; \
+	  echo "A commit that was never merged cannot be what users are running."; \
+	  exit 1; }; \
+	fail=0; \
+	for r in $(LEGACY_ROLES); do \
+	  v1="ui/contracts/$${r}_v1.wasm"; \
+	  git cat-file -e "$$live:ui/contracts/$$r.wasm" 2>/dev/null || { \
+	    echo "ERROR: $$r.wasm absent from live build $$live"; fail=1; continue; }; \
+	  [ -s "$$v1" ] || { echo "ERROR: $$v1 is missing or EMPTY"; fail=1; continue; }; \
+	  want=$$(git cat-file blob "$$live:ui/contracts/$$r.wasm" | shasum -a 256 | cut -d' ' -f1); \
+	  got=$$(shasum -a 256 "$$v1" | cut -d' ' -f1); \
+	  [ "$$want" = "$$got" ] || { \
+	    echo "ERROR: $$v1 is NOT the live build's bytes"; \
+	    echo "  live ($$live): $$want"; \
+	    echo "  vendored _v1:  $$got"; \
+	    fail=1; }; \
+	done; \
+	for f in ui/contracts/*_v1.wasm; do \
+	  r=$$(basename "$$f" _v1.wasm); \
+	  case " $(LEGACY_ROLES) freebird_delegate " in \
+	    *" $$r "*) ;; \
+	    *) echo "ERROR: $$f is vendored but no rule covers it — add it to"; \
+	       echo "       LEGACY_ROLES, or document why it is exempt."; fail=1;; \
+	  esac; \
+	done; \
+	[ $$fail -eq 0 ] || { \
+	  echo ""; \
+	  echo "The dual-read window would read a contract nobody writes to (issue #81)."; \
+	  echo "Re-vendor from the live build (write to a temp file first — a shell"; \
+	  echo "redirect truncates the target BEFORE git runs, and a 0-byte blob is"; \
+	  echo "how this check used to be fooled):"; \
+	  echo "  git cat-file blob $$live:ui/contracts/<role>.wasm > /tmp/<role>.wasm"; \
+	  echo "  mv /tmp/<role>.wasm ui/contracts/<role>_v1.wasm"; \
+	  echo "then: make pin-hashes, and update the goldens in ui/src/keys.rs."; \
+	  exit 1; }
+	@echo "legacy _v1 wasm matches the live build"
 
 # Verify freshly built wasm ($(BUILT), basenames in $(WASM_DIR)) against the
 # pinned hashes BEFORE it reaches ui/contracts/ — a failed build must leave
@@ -143,11 +202,19 @@ test:
 
 # Site first, then the control cell: the advertised build must never get
 # ahead of the bundle users can actually load.
-publish:
+publish: check-legacy-wasm
 	scripts/publish-ui.sh
 	$(CARGO) run --locked -p freebird-ctl --release -- publish-control \
 	  --build $$(git rev-list --count HEAD) \
 	  --label $$(git rev-parse --short HEAD)
+	@echo ""
+	@echo "PUBLISHED $$(git rev-parse --short HEAD). This commit is now the live"
+	@echo "build, so the NEXT release's dual-read window must read ITS contracts."
+	@echo "Open a follow-up PR that:"
+	@echo "  1. writes $$(git rev-parse --short HEAD) into scripts/live-build.txt"
+	@echo "  2. re-vendors each ui/contracts/<role>_v1.wasm from it"
+	@echo "  3. runs make pin-hashes and updates the goldens in ui/src/keys.rs"
+	@echo "Skipping this is issue #81."
 
 # --- Reproducible Docker build of the non-frozen contract + delegate wasm ---
 #

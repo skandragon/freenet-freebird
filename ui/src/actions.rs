@@ -348,6 +348,34 @@ pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Re-sign our legacy profile picture into the rotated avatar contract
+/// (issue #81) — the terminator for the avatar dual-read window, and the
+/// only one that exists: nobody but the owner holds the key.
+///
+/// Deliberately NOT part of `migrate_v1`'s one-shot: an absent avatar and an
+/// avatar that has not arrived yet look identical (Get for a contract that
+/// does not exist gets no negative answer), so a one-shot gated on it would
+/// either hang the whole migration or mark it done having read nothing. This
+/// is idempotent and self-terminating instead — once the re-signed blob is
+/// in `AVATARS`, in this session and every later one, it does nothing.
+pub async fn migrate_avatar() -> Result<(), String> {
+    let sk = signing_key()?;
+    let author = sk.verifying_key().to_bytes();
+    if AVATARS.read().get(&author).is_some_and(Option::is_some) {
+        return Ok(());
+    }
+    let Some(legacy) = LEGACY_AVATARS.read().get(&author).cloned().flatten() else {
+        return Ok(());
+    };
+    // Same bytes, same timestamp — only the signature scheme changes, so the
+    // contract's LWW ordering cannot flip a later upload back to this one.
+    let authorized = freebird_core::avatar::AuthorizedAvatar::new(legacy.avatar, &sk);
+    freebird_core::avatar::check_avatar(&authorized, &sk.verifying_key())?;
+    api::put_own_avatar(&sk.verifying_key(), &authorized).await?;
+    AVATARS.write().insert(author, Some(authorized));
+    Ok(())
+}
+
 fn apply_own_posts(posts: Vec<freebird_core::types::AuthorizedPost>) {
     let Some(author) = own_author() else { return };
     let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };

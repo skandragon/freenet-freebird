@@ -4,7 +4,6 @@ use directory_contract::{DirectoryParametersV3, DIRECTORY_SEED};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::avatar::AvatarParametersV1;
 use freebird_core::feed::{FeedParametersV1, MAX_FUTURE_MS};
-use freebird_core::inbox::InboxParametersV1;
 use inbox_contract::state::InboxParametersV3;
 use freebird_core::types::{AuthorizedPost, PostId, PostV1};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
@@ -17,11 +16,19 @@ pub const DIRECTORY_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/director
 pub const CELL_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/cell_contract.wasm");
 pub const FREEBIRD_DELEGATE_WASM: &[u8] = include_bytes!("../contracts/freebird_delegate.wasm");
 
-// Frozen v1 bytes, kept ONLY to derive the legacy inbox/directory addresses
-// for the dual-read migration window (issue #23). Reads use the instance id;
-// these wasm modules are never instantiated by this build.
+// Frozen bytes of the PREVIOUS LIVE generation, kept ONLY to derive the
+// legacy addresses the dual-read window reads (issues #23, #81). Reads use
+// the instance id; these wasm modules are never instantiated by this build.
+//
+// `_v1` is a NAME, not a generation number: each of these must be the bytes
+// of the build currently serving users (`scripts/live-build.txt`), whatever
+// generation that build shipped. Pinning them to the literal first
+// generation is what issue #81 was filed about — the window was open and
+// pointed at contracts nobody had written to in two rotations. `make
+// check-legacy-wasm` (CI) fails when one of these drifts off the live build.
 pub const FEED_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/feed_contract_v1.wasm");
 pub const INBOX_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/inbox_contract_v1.wasm");
+pub const AVATAR_V1_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/avatar_contract_v1.wasm");
 pub const DIRECTORY_V1_CONTRACT_WASM: &[u8] =
     include_bytes!("../contracts/directory_contract_v1.wasm");
 
@@ -45,7 +52,18 @@ pub const LEGACY_DELEGATE_WASMS: &[&[u8]] = &[FREEBIRD_DELEGATE_V1_WASM];
 /// (issue #80).
 pub const INBOX_GENERATION: u32 = 3;
 pub const FEED_GENERATION: u32 = 3;
-pub const AVATAR_GENERATION: u32 = 1;
+/// Bumped to 2 with issue #81: the avatar contract rotated for #47's
+/// domain-tagged signature while the constant stayed at 1, so the counter
+/// was one behind the actual rotation count — the same drift that left
+/// INBOX_GENERATION at 2 across four inbox rotations.
+///
+/// No live anchor is affected: the build in `scripts/live-build.txt`
+/// publishes ONLY `ROLE_INBOX` (avatar and feed roles were first published
+/// later, in #54), so nothing on the network labels an avatar address at
+/// all and `anchor_targets` has never had one to follow. The bump costs
+/// nothing today and puts the counter back in step before the first anchor
+/// that does carry an avatar role is written.
+pub const AVATAR_GENERATION: u32 = 2;
 
 /// This bundle's build number (git commit count; 0 in git-less dev builds).
 pub fn own_build() -> u64 {
@@ -73,9 +91,11 @@ pub fn inbox_params(owner: &VerifyingKey) -> InboxParametersV3 {
     }
 }
 
-/// Params of the author's LEGACY (v1) inbox — dual-read window only.
-pub fn inbox_params_v1(owner: &VerifyingKey) -> InboxParametersV1 {
-    InboxParametersV1 {
+/// Params of the author's LEGACY inbox — dual-read window only. Mirrors the
+/// LIVE build's params (v2), not the first generation's: same CBOR shape,
+/// but the address also depends on the wasm bytes above.
+pub fn inbox_params_v1(owner: &VerifyingKey) -> crate::legacy::LegacyInboxParameters {
+    crate::legacy::LegacyInboxParameters {
         owner: *owner,
         ghostkey_master: master_key(),
     }
@@ -94,10 +114,12 @@ pub fn directory_params() -> DirectoryParametersV3 {
     }
 }
 
-/// Params of the LEGACY (v1) directory — dual-read window only.
-pub fn directory_params_v1() -> directory_contract::legacy::LegacyDirectoryParameters {
-    directory_contract::legacy::LegacyDirectoryParameters {
-        seed: directory_contract::legacy::DIRECTORY_SEED_V1.into(),
+/// Params of the LEGACY directory — dual-read window only. The seed is the
+/// LIVE directory's (`freebird-directory-v2`); `DIRECTORY_SEED_V1` names a
+/// directory nobody has written to since two rotations ago (issue #81).
+pub fn directory_params_v1() -> crate::legacy::LegacyDirectoryParameters {
+    crate::legacy::LegacyDirectoryParameters {
+        seed: crate::legacy::LEGACY_DIRECTORY_SEED.into(),
         ghostkey_master: master_key(),
     }
 }
@@ -141,6 +163,13 @@ pub fn avatar_key(author: &VerifyingKey) -> ContractKey {
     contract_key(AVATAR_CONTRACT_WASM, params)
 }
 
+/// The author's LEGACY avatar address — dual-read window only (issue #81).
+/// Params are unchanged across the rotation; only the frozen wasm differs.
+pub fn avatar_key_v1(author: &VerifyingKey) -> ContractKey {
+    let params = freebird_core::to_cbor(&avatar_params(author)).expect("params serialize");
+    contract_key(AVATAR_V1_CONTRACT_WASM, params)
+}
+
 pub fn feed_instance_id(author: &VerifyingKey) -> ContractInstanceId {
     *feed_key(author).id()
 }
@@ -155,6 +184,10 @@ pub fn inbox_instance_id_v1(owner: &VerifyingKey) -> ContractInstanceId {
 
 pub fn avatar_instance_id(author: &VerifyingKey) -> ContractInstanceId {
     *avatar_key(author).id()
+}
+
+pub fn avatar_instance_id_v1(author: &VerifyingKey) -> ContractInstanceId {
+    *avatar_key_v1(author).id()
 }
 
 pub fn directory_key() -> ContractKey {
@@ -295,18 +328,24 @@ mod tests {
             format!("{INBOX_GENERATION}@{}", inbox_instance_id(&author)),
             inbox_instance_id_v1(&author).to_string(),
             format!("{AVATAR_GENERATION}@{}", avatar_instance_id(&author)),
+            avatar_instance_id_v1(&author).to_string(),
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
             // Directory + inbox rotated 2026-08-13 (issue #66): the
             // anonymous-PoW difficulty record moved into the state so a
             // publisher raise binds attackers, not only honest writers.
-            // (Previous rotation 2026-08-12 for #52.) Following the
-            // #52/#51/#50/#49/#45 precedent, neither prior address gets a
-            // dual-read window: listings re-seat on republish, and inbox
-            // creds/pointers re-staple as repliers repost.
+            // (Previous rotation 2026-08-12 for #52.)
+            //
+            // Every `_v1` row below is the address of the LIVE build
+            // (`scripts/live-build.txt`), NOT of generation 1. The earlier
+            // "listings re-seat on republish, creds re-staple as repliers
+            // repost" reasoning was wrong in practice (issue #81): re-seating
+            // needs every listed author to return and every replier to
+            // repost, so Discover went empty and threads lost their replies.
+            // The window now reads what the network actually holds.
             "9fGcxYMNAdMET8h9mBsBobCHqHKV2YzxCfAN68rB8JBQ",
-            "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
+            "Lci4MiN15tQ41PKqkzbj2mi9qXMuphQG8vU4tqt5CJG",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             // The PoW difficulty cell (#66) is deliberately NOT pinned here:
             // freebird-pow's `test-publisher` feature swaps the compiled
@@ -318,10 +357,36 @@ mod tests {
             "3@8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
             "3@6rqG9SwSeXdG7BagLgoEFLZ2A7UVwsMA3yxcYgsVrsv3",
-            "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
-            "1@F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
+            "sCJ9HQJGnHE1NGEWEC73CpWBPymT2ievqDW4iXh7Pgb",
+            "2@F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
+            "577KsAVancBcWwQfbpYrF9DN4FPzBBXrvuEALf2Gf67g",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
         ];
         assert_eq!(got, golden, "derived contract addresses ROTATED");
+    }
+
+    /// Each generation must derive a DIFFERENT address — otherwise the
+    /// dual-read GETs the same contract twice and the window is a no-op that
+    /// looks like it is working.
+    ///
+    /// The legacy params' correctness is NOT asserted here. It cannot be:
+    /// the live generation's types are gone from the tree, so the current
+    /// types are not a valid oracle for them (v2 and v3 inbox params happen
+    /// to share a shape today, and comparing against v3 would demand
+    /// "fixing" the frozen mirror the day v4 adds a field — precisely the
+    /// bug the mirror exists to prevent). The real oracle is the CBOR golden
+    /// in `legacy::tests::legacy_params_wire_format_kat`.
+    ///
+    /// If a future release rotates only SOME roles, the un-rotated ones'
+    /// `_v1` blob is legitimately identical to the current one and the
+    /// matching assertion below must be dropped along with that role's
+    /// legacy GET — a window onto your own address retains nothing.
+    #[test]
+    fn each_generation_derives_a_distinct_address() {
+        let a = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
+        assert_ne!(feed_key(&a), feed_key_v1(&a));
+        assert_ne!(inbox_key(&a), inbox_key_v1(&a));
+        assert_ne!(avatar_key(&a), avatar_key_v1(&a));
+        assert_ne!(directory_key(), directory_key_v1());
     }
 }

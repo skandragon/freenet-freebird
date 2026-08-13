@@ -84,9 +84,12 @@ Contract source changed, so directory and inbox wasm bytes — and their
 addresses — rotated (2026-08-13). Both new state fields are
 `#[serde(default)]`, so the CBOR wire form of an existing state still
 decodes; the rotation is driven by the wasm bytes, not by an incompatible
-encoding. Migration follows the #45/#49/#50/#51/#52 no-window precedent:
-listings re-seat on republish, inbox creds/pointers re-staple as repliers
-repost.
+encoding. Migration originally followed the #45/#49/#50/#51/#52 no-window
+precedent — "listings re-seat on republish, inbox creds/pointers re-staple as
+repliers repost". That reasoning is RETRACTED (issue #81): re-seating needs
+every listed author to return and every replier to repost, so Discover went
+empty and threads lost their replies. This rotation is now covered by the
+dual-read window; see `docs/dual-read-window.md`.
 
 | | before | after |
 | --- | --- | --- |
