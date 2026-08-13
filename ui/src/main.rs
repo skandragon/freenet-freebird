@@ -3,6 +3,7 @@ mod actions;
 mod api;
 mod ghostkey;
 mod keys;
+mod legacy;
 mod state;
 mod views;
 

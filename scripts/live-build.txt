@@ -1,0 +1,14 @@
+# The commit whose bundle is CURRENTLY SERVING USERS — what `make publish`
+# last pushed, and therefore the generation of every contract the network
+# actually holds state in.
+#
+# Every `ui/contracts/*_v1.wasm` must be byte-identical to this commit's
+# corresponding `ui/contracts/*.wasm`; `make check-legacy-wasm` enforces it.
+# That is the invariant issue #81 was filed about: the dual-read window
+# derives its legacy addresses from those blobs, so a blob naming any other
+# generation opens the window onto a contract nobody writes to.
+#
+# UPDATE THIS ONLY AS PART OF A PUBLISH: after `make publish`, set it to the
+# commit that was published and re-vendor the `_v1` blobs from it (they are
+# then, by definition, the previous live generation for the NEXT release).
+d873a2a

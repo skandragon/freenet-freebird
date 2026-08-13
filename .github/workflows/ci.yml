@@ -11,8 +11,13 @@ jobs:
   vendored-wasm:
     runs-on: ubuntu-latest
     steps:
+      # check-legacy-wasm reads the live build's blobs out of git history, so
+      # the default shallow clone is not enough.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: make check-addresses
+      - run: make check-legacy-wasm
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools

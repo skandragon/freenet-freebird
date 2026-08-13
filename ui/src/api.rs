@@ -14,7 +14,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::delegate_api::{FreebirdDelegateRequest, FreebirdDelegateResponse};
 use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::{AttestationSlot, FeedParametersV1, FeedStateV1, FeedStateV1Delta, PostsV1};
-use freebird_core::inbox::{InboxStateV1, InboxStateV1Delta};
 use freebird_core::types::{AuthorizedFollows, AuthorizedProfile, FollowsV1, ProfileV1};
 use inbox_contract::state::{InboxStateV3, InboxStateV3Delta};
 use freenet_scaffold::ComposableState;
@@ -368,7 +367,10 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
 }
 
 /// GET someone's avatar. Write-rarely contract: no subscription, session
-/// cache in AVATARS (issue #10).
+/// cache in AVATARS (issue #10). During the dual-read window
+/// (`read_v1_avatar`) the legacy address is fetched too — the avatar
+/// contract rotated with #47's signature change, so every picture uploaded
+/// on the previous build lives only there (issue #81).
 pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
     AVATARS.write().entry(author).or_insert(None);
@@ -379,7 +381,19 @@ pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
         subscribe: false,
         blocking_subscribe: false,
     }))
-    .await
+    .await?;
+    if flag_bool("read_v1_avatar", true) {
+        LEGACY_AVATARS.write().entry(author).or_insert(None);
+        track(keys::avatar_key_v1(&vk), TrackedKind::LegacyAvatar(author));
+        send(ClientRequest::ContractOp(ContractRequest::Get {
+            key: keys::avatar_instance_id_v1(&vk),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .await?;
+    }
+    Ok(())
 }
 
 /// PUT our own avatar; Put creates the contract on first upload and the
@@ -1020,6 +1034,35 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                 Err(e) => log(&format!("bad avatar state: {e}")),
             }
         }
+        TrackedKind::LegacyAvatar(author) => {
+            // Read-only remnant of the pre-#47 avatar (dual-read window):
+            // same state shape, but the author signed bare CBOR, so it is
+            // checked with the frozen rule. Size cap, content-type
+            // allowlist and magic-byte sniff still run — this blob reaches
+            // an <img> exactly like a current one.
+            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+                log("legacy avatar dispatch: tracked author key is not a valid key");
+                return;
+            };
+            match freebird_core::from_cbor::<freebird_core::avatar::AuthorizedAvatar>(bytes) {
+                Ok(incoming) => {
+                    if let Err(e) = crate::legacy::check_legacy_avatar(&incoming, &vk) {
+                        log(&format!("rejected invalid legacy avatar for {key}: {e}"));
+                        return;
+                    }
+                    let mut avatars = LEGACY_AVATARS.write();
+                    let entry = avatars.entry(author).or_insert(None);
+                    let newer = entry.as_ref().is_none_or(|held| {
+                        freebird_core::avatar::order_key(&incoming)
+                            > freebird_core::avatar::order_key(held)
+                    });
+                    if newer {
+                        *entry = Some(incoming);
+                    }
+                }
+                Err(e) => log(&format!("bad legacy avatar state: {e}")),
+            }
+        }
         TrackedKind::Directory => {
             let params = keys::directory_params();
             let mut dir = DIRECTORY.write();
@@ -1045,41 +1088,33 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             }
         }
         TrackedKind::LegacyDirectory => {
-            // Read-only remnant of the v1 directory: the deployed v1 wasm
-            // still enforces its own invariants network-side, but each
-            // listing is re-checked here (mandatory attestation) before the
-            // Discover tab trusts it. Per-author LWW keeps the newest.
-            use directory_contract::legacy::{LegacyAuthorizedListing, LegacyDirectoryState};
+            // Read-only remnant of the LIVE build's directory: the deployed
+            // wasm still enforces its own invariants network-side, but each
+            // listing is re-checked here before the Discover tab trusts it.
+            // Per-author LWW keeps the newest.
+            use crate::legacy::{LegacyDirectoryDelta, LegacyDirectoryState};
             let master = keys::master_key();
-            let merge_listings = |incoming: Vec<LegacyAuthorizedListing>| {
-                let mut dir = LEGACY_DIRECTORY.write();
-                let entry = dir.get_or_insert_with(LegacyDirectoryState::default);
-                for l in incoming {
-                    if l.check(&master).is_err() {
-                        log("rejected invalid legacy directory listing");
-                        continue;
+            let incoming: Option<LegacyDirectoryDelta> = if is_full_state {
+                match freebird_core::from_cbor::<LegacyDirectoryState>(bytes) {
+                    Ok(s) => Some(s.listings.into_values().collect()),
+                    Err(e) => {
+                        log(&format!("bad legacy directory state: {e}"));
+                        None
                     }
-                    let newer = entry
-                        .listings
-                        .get(&l.listing.author)
-                        .is_none_or(|held| held.listing.last_active < l.listing.last_active);
-                    if newer {
-                        entry.listings.insert(l.listing.author, l);
+                }
+            } else {
+                match freebird_core::from_cbor::<LegacyDirectoryDelta>(bytes) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        log(&format!("bad legacy directory delta: {e}"));
+                        None
                     }
                 }
             };
-            if is_full_state {
-                match freebird_core::from_cbor::<LegacyDirectoryState>(bytes) {
-                    Ok(incoming) => merge_listings(incoming.listings.into_values().collect()),
-                    Err(e) => log(&format!("bad legacy directory state: {e}")),
-                }
-            } else {
-                match freebird_core::from_cbor::<directory_contract::legacy::LegacyDirectoryDelta>(
-                    bytes,
-                ) {
-                    Ok(delta) => merge_listings(delta),
-                    Err(e) => log(&format!("bad legacy directory delta: {e}")),
-                }
+            if let Some(incoming) = incoming {
+                let mut dir = LEGACY_DIRECTORY.write();
+                dir.get_or_insert_with(LegacyDirectoryState::default)
+                    .merge(&master, incoming);
             }
         }
         TrackedKind::Anchor(author) => {
@@ -1193,36 +1228,41 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
             }
         }
         TrackedKind::LegacyInbox(author) => {
-            // Read-only remnant of the v1 inbox (dual-read window): decoded
-            // with the FROZEN freebird-core v1 types, merged with the same
-            // v1 merge logic the deployed contract runs.
-            let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+            // Read-only remnant of the LIVE build's inbox (dual-read window):
+            // decoded with the FROZEN wire types in `crate::legacy` and
+            // re-checked with the same three gates the deployed contract
+            // applies — cred under its own key, pointer signature, pointer
+            // fingerprint equal to the cred's.
+            if VerifyingKey::from_bytes(&author).is_err() {
+                // TRACKED is self-populated, so this "cannot happen" — but a
+                // silent return would make the broken invariant undiagnosable.
                 log("legacy inbox dispatch: tracked author key is not a valid key");
                 return;
-            };
-            let params = keys::inbox_params_v1(&vk);
-            let mut inboxes = LEGACY_INBOXES.write();
-            let entry = inboxes.entry(author).or_default();
-            if is_full_state {
-                match freebird_core::from_cbor::<InboxStateV1>(bytes) {
-                    Ok(incoming) => {
-                        let clone = entry.clone();
-                        if let Err(e) = entry.merge(&clone, &params, &incoming) {
-                            log(&format!("legacy inbox merge rejected: {e}"));
-                        }
+            }
+            use crate::legacy::{LegacyInboxDelta, LegacyInboxState};
+            let incoming: Option<LegacyInboxDelta> = if is_full_state {
+                match freebird_core::from_cbor::<LegacyInboxState>(bytes) {
+                    Ok(s) => Some(s.into()),
+                    Err(e) => {
+                        log(&format!("bad legacy inbox state: {e}"));
+                        None
                     }
-                    Err(e) => log(&format!("bad legacy inbox state: {e}")),
                 }
             } else {
-                match freebird_core::from_cbor::<InboxStateV1Delta>(bytes) {
-                    Ok(delta) => {
-                        let clone = entry.clone();
-                        if let Err(e) = entry.apply_delta(&clone, &params, &Some(delta)) {
-                            log(&format!("legacy inbox delta rejected: {e}"));
-                        }
+                match freebird_core::from_cbor::<LegacyInboxDelta>(bytes) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        log(&format!("bad legacy inbox delta: {e}"));
+                        None
                     }
-                    Err(e) => log(&format!("bad legacy inbox delta: {e}")),
                 }
+            };
+            if let Some(incoming) = incoming {
+                LEGACY_INBOXES
+                    .write()
+                    .entry(author)
+                    .or_default()
+                    .merge(&keys::master_key(), incoming);
             }
         }
         TrackedKind::LegacyFeed(author) => {
@@ -1416,6 +1456,7 @@ pub enum TrackedKind {
     LegacyInbox([u8; 32]),
     Anchor([u8; 32]),
     Avatar([u8; 32]),
+    LegacyAvatar([u8; 32]),
     Directory,
     LegacyDirectory,
     Control,
