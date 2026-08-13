@@ -78,20 +78,46 @@ writes, which is what latches it into the contracts it governs.
 
 Lowering works the same way: publish a lower value at a higher `seq`.
 
-## Rotation this change requires
+## The rotation this change carried out
 
 Contract source changed, so directory and inbox wasm bytes — and their
-addresses — rotate. Per `docs/reproducible-builds.md`, before this ships:
+addresses — rotated (2026-08-13). Both new state fields are
+`#[serde(default)]`, so the CBOR wire form of an existing state still
+decodes; the rotation is driven by the wasm bytes, not by an incompatible
+encoding. Migration follows the #45/#49/#50/#51/#52 no-window precedent:
+listings re-seat on republish, inbox creds/pointers re-staple as repliers
+repost.
 
-1. On an amd64 host, rebuild `directory_contract` + `inbox_contract`, vendor
-   into `ui/contracts/` (leave the other three alone).
-2. `make pin-hashes`; refresh those two lines in
-   `scripts/repro-reference-hashes.txt` (the unchanged crates must still
-   match — that is the proof the environment is canonical).
-3. Update the directory/inbox golden addresses in `ui/src/keys.rs`.
-4. Migration: follow the #45/#49/#50/#51/#52 no-window precedent — listings
-   re-seat on republish, inbox creds/pointers re-staple as repliers repost.
+| | before | after |
+| --- | --- | --- |
+| `directory_contract.wasm` | `20250ae2…` | `60c17f86…` |
+| `inbox_contract.wasm` | `17f3830e…` | `307b9029…` |
+| directory address | `6Jj6CndZ…` | `9fGcxYMN…` |
+| inbox address (test author) | `328eVhTm…` | `6rqG9SwS…` |
 
-Both state types added their field with `#[serde(default)]`, so the CBOR wire
-form of an existing state still decodes; the rotation is driven by the wasm
-bytes, not by an incompatible encoding.
+### Build-of-record without Docker
+
+`docs/reproducible-builds.md` notes that Apple Silicon cannot produce the
+amd64 bytes (rustc segfaults under qemu-user) and points at any native
+x86_64 Linux host with rustup. This rotation used exactly that — the
+`freenet1` explorer node — and it is the cheaper path when a rotation comes
+up again:
+
+```bash
+# on the amd64 host, in a checkout of the branch
+export PATH=$HOME/.cargo/bin:$PATH CARGO_HOME=$HOME/.cargo
+make wasm-repro          # remaps the three path sources, then check-imports
+sha256sum target/repro/*.wasm
+```
+
+`make wasm-repro` is the same target the Docker path runs inside the
+container, so the remapped prefixes (`/src`, `/cargo`, `/rust`) come out
+identical and no Docker daemon is needed. It calls `check-imports`, which
+wants `wasm-tools` at the version `docker/Dockerfile` pins (1.243.0) —
+install that release's binary into `~/.cargo/bin` if it is missing.
+
+**The gate is the unchanged crates.** feed, avatar and delegate must
+reproduce `scripts/repro-reference-hashes.txt` byte for byte; that match is
+what proves the environment is canonical and the changed crates' hashes
+trustworthy. All three did here, which also confirms the plain rustup build
+and the pinned Debian container agree.
