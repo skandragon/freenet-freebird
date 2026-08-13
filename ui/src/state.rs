@@ -74,6 +74,13 @@ pub static PUBLIC_LISTING: GlobalSignal<Option<bool>> = Signal::global(|| None);
 /// None = not arrived / not decodable — behave as if no control exists.
 pub static CONTROL: GlobalSignal<Option<freebird_control::ControlV1>> = Signal::global(|| None);
 
+/// The publisher's anonymous-PoW difficulty record (issue #66). We solve to
+/// its bits AND attach it to our writes, which is how a raise reaches the
+/// state of the contracts it governs. None = never arrived → the compiled
+/// floor, which is what `difficulty_bits(None)` returns.
+pub static POW_DIFFICULTY: GlobalSignal<Option<cell_contract::SignedCellV1>> =
+    Signal::global(|| None);
+
 /// Highest build the user dismissed the update banner for. None until the
 /// delegate answers (the banner waits, so it never flashes pre-dismissal).
 pub static DISMISSED_BUILD: GlobalSignal<Option<u64>> = Signal::global(|| None);

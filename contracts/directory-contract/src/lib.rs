@@ -27,7 +27,10 @@ use cell_contract::SignedCellV1;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use freebird_core::attestation::{AttestationV1, AttestationV2};
 use freebird_core::feed::MAX_FUTURE_MS;
-use freebird_pow::{difficulty_bits, meets_directory, solve_directory, POW_FLOOR_BITS};
+use freebird_pow::{
+    adopt_difficulty, difficulty_bits, difficulty_seq, meets_directory, solve_directory,
+    POW_FLOOR_BITS,
+};
 use serde::{Deserialize, Serialize};
 
 /// Version seed baked into the params; rotating it deliberately mints a new
@@ -220,13 +223,16 @@ pub struct DirectorySummaryV4 {
     pub anon: BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
     pub attested_horizon: TierHorizon,
     pub anon_horizon: TierHorizon,
+    /// `seq` of the latched difficulty record, 0 for none (issue #66) — lets
+    /// a peer offer us a raise we haven't seen even with no listings to send.
+    #[serde(default)]
+    pub pow_seq: u64,
 }
 
 /// A directory delta: the listings offered, plus the optional publisher-signed
-/// difficulty record (issue #51) the writer solved against. The record rides
-/// the ORIGINAL client write only; node-to-node gossip (`DirectoryStateV4::
-/// delta`) emits `pow_difficulty: None`, so replicas always re-admit at the
-/// compiled floor and stay convergent.
+/// difficulty record (issues #51/#66). A client write carries the record it
+/// solved against; gossip carries whatever the sender has latched, so the
+/// raise reaches every replica and binds writers there too.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct DirectoryDeltaV3 {
     pub listings: Vec<AuthorizedListingV3>,
@@ -248,6 +254,13 @@ pub struct DirectoryStateV4 {
     /// One listing per author per tier, keyed by posting key.
     pub attested: BTreeMap<[u8; 32], AuthorizedListingV3>,
     pub anon: BTreeMap<[u8; 32], AuthorizedListingV3>,
+    /// Latched publisher-signed anonymous-PoW difficulty (issue #66). Lives
+    /// in the state because `update_state` — the path every gossiped delta
+    /// takes — receives the state but no `RelatedContracts`, so this is the
+    /// only channel that can put a bar in front of a write the WRITER did not
+    /// choose. Monotone in `seq`; see `freebird_pow::adopt_difficulty`.
+    #[serde(default)]
+    pub pow_difficulty: Option<SignedCellV1>,
 }
 
 impl DirectoryStateV4 {
@@ -282,7 +295,21 @@ impl DirectoryStateV4 {
         out
     }
 
+    /// The bar an anonymous write must clear here and now: the compiled
+    /// floor, raised by whatever difficulty record this state has latched.
+    pub fn admission_bits(&self) -> u8 {
+        difficulty_bits(self.pow_difficulty.as_ref())
+    }
+
     pub fn verify(&self, parameters: &DirectoryParametersV3) -> Result<(), String> {
+        // A latched record must be a genuine publisher record, or a
+        // fabricated state could seat a bogus one and (via gossip) push it
+        // onto honest replicas. Its BITS are not enforced against the seated
+        // listings — see the floor check below.
+        if let Some(cell) = &self.pow_difficulty {
+            cell.check(&freebird_pow::pow_params())
+                .map_err(|e| format!("difficulty record: {e}"))?;
+        }
         if self.attested.len() > MAX_LISTINGS {
             return Err(format!("more than {MAX_LISTINGS} attested listings"));
         }
@@ -309,8 +336,10 @@ impl DirectoryStateV4 {
             // Every seated anonymous listing must clear the COMPILED floor
             // (issue #51). This is the convergent, adversary-facing check: a
             // fabricated full state cannot seat a free anonymous share. The
-            // control-cell difficulty is enforced at admission only, so
-            // raising it never retroactively bricks listings already seated.
+            // latched difficulty is enforced at ADMISSION only (issue #66) —
+            // gating re-validation on a value that changes over time would
+            // make a state's validity depend on when it was checked, and a
+            // raise would retroactively brick every listing already seated.
             if !meets_directory(key, l.pow_nonce, POW_FLOOR_BITS) {
                 return Err("anonymous listing below the proof-of-work floor".into());
             }
@@ -398,12 +427,14 @@ impl DirectoryStateV4 {
             anon: keys(&self.anon),
             attested_horizon,
             anon_horizon,
+            pow_seq: difficulty_seq(self.pow_difficulty.as_ref()),
         }
     }
 
-    /// Listings the peer lacks (or holds older), and would retain. Gossip
-    /// deltas never carry a difficulty record — admission at the receiver
-    /// runs at the compiled floor (issue #51), keeping replicas convergent.
+    /// Listings the peer lacks (or holds older), plus our latched difficulty
+    /// record if theirs is older (issue #66). The record alone is enough to
+    /// emit a delta: a raise must reach quiet replicas too, not only ones
+    /// that happen to have listings flowing.
     pub fn delta(&self, theirs: &DirectorySummaryV4) -> Option<DirectoryDeltaV3> {
         let offer = |ours: &BTreeMap<[u8; 32], AuthorizedListingV3>,
                      held: &BTreeMap<[u8; 32], (u64, bool, [u8; 32])>,
@@ -421,9 +452,12 @@ impl DirectoryStateV4 {
         };
         let mut listings = offer(&self.attested, &theirs.attested, &theirs.attested_horizon);
         listings.extend(offer(&self.anon, &theirs.anon, &theirs.anon_horizon));
-        (!listings.is_empty()).then_some(DirectoryDeltaV3 {
+        let pow_difficulty = (difficulty_seq(self.pow_difficulty.as_ref()) > theirs.pow_seq)
+            .then(|| self.pow_difficulty.clone())
+            .flatten();
+        (!listings.is_empty() || pow_difficulty.is_some()).then_some(DirectoryDeltaV3 {
             listings,
-            pow_difficulty: None,
+            pow_difficulty,
         })
     }
 
@@ -441,9 +475,14 @@ impl DirectoryStateV4 {
         if delta.listings.len() > MAX_LISTINGS + ANON_LISTINGS {
             return Err("listing delta too large".into());
         }
-        // Admission difficulty: the floor, raised by a valid publisher-signed
-        // control-cell record if this write carries one (issue #51).
-        let bits = difficulty_bits(delta.pow_difficulty.as_ref());
+        // Latch first, then read the bar off the STATE (issue #66). A delta
+        // that carries no record — or a stale one — leaves the latched bar
+        // standing, so omitting the record no longer buys floor admission;
+        // a delta that carries a newer genuine one raises the bar for the
+        // listings in that very delta, which is what lets a publisher stop
+        // an in-flight flood.
+        adopt_difficulty(&mut self.pow_difficulty, delta.pow_difficulty.as_ref());
+        let bits = self.admission_bits();
         for l in &delta.listings {
             // LWW first (issue #52): a losing entry is never verified, so a
             // replay of already-held listings costs no crypto at all. (A
@@ -476,8 +515,9 @@ impl DirectoryStateV4 {
         Ok(())
     }
 
-    /// Full-state merge = apply the other side's listings as a delta. No
-    /// difficulty record: floor admission, as for any gossip.
+    /// Full-state merge = apply the other side's listings as a delta,
+    /// carrying whatever difficulty record they had latched (issue #66) so a
+    /// raise propagates over full-state sync as well as over gossip.
     pub fn merge(
         &mut self,
         parameters: &DirectoryParametersV3,
@@ -490,7 +530,7 @@ impl DirectoryStateV4 {
                 .chain(other.anon.values())
                 .cloned()
                 .collect(),
-            pow_difficulty: None,
+            pow_difficulty: other.pow_difficulty.clone(),
         };
         self.apply_delta(parameters, &delta)
     }
@@ -1202,6 +1242,150 @@ mod tests {
         )
         .expect("delta ok");
         assert_eq!(s.anon.len(), 1, "control-difficulty stamp accepted");
+    }
+
+    /// Mint a publisher-signed difficulty record at `bits`, sequence `seq`.
+    fn difficulty_record(bits: u8, seq: u64) -> SignedCellV1 {
+        let publisher = SigningKey::from_bytes(&freebird_pow::PUBLISHER_TEST_SECRET);
+        SignedCellV1::new(
+            &publisher,
+            freebird_pow::POW_PURPOSE,
+            seq,
+            freebird_pow::difficulty_body(bits),
+        )
+    }
+
+    /// Issue #66, the whole point: once a raise is LATCHED into the state, a
+    /// delta that carries no record — exactly what an attacker sends, and
+    /// what node-to-node gossip used to send — is still held to the raised
+    /// bar. Under #65 this listing was admitted at the floor.
+    #[test]
+    fn latched_difficulty_binds_a_delta_that_omits_the_record() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let raised = 22u8;
+
+        let mut s = DirectoryStateV4::default();
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(raised, 1)) },
+        )
+        .expect("record latches on its own");
+        assert_eq!(s.admission_bits(), raised);
+
+        let (sk, key) = anon_author();
+        let mut weak = anon_listing(&sk, key, 5);
+        weak.pow_nonce = freebird_pow::solve_directory_band(&key, POW_FLOOR_BITS, raised);
+        s.apply_delta(&p, &d(vec![weak])).expect("delta ok");
+        assert!(s.anon.is_empty(), "floor stamp rejected with no record in the delta");
+
+        // The honest client that solved to the latched bar still gets in.
+        let strong =
+            AuthorizedListingV3::new_anon(ListingV1 { author: key, last_active: 5 }, &sk, raised);
+        s.apply_delta(&p, &d(vec![strong])).expect("delta ok");
+        assert_eq!(s.anon.len(), 1);
+        s.verify(&p).expect("raised-difficulty state verifies");
+    }
+
+    /// An attacker cannot walk the bar back: neither a forged record at a
+    /// higher seq nor a replay of the genuine older one displaces the latch.
+    #[test]
+    fn latched_difficulty_cannot_be_downgraded() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let mut s = DirectoryStateV4::default();
+        let floor_record = difficulty_record(POW_FLOOR_BITS, 1);
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(24, 7)) },
+        )
+        .expect("delta ok");
+
+        // Genuine but stale (seq 1 < 7).
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(floor_record) },
+        )
+        .expect("delta ok");
+        assert_eq!(s.admission_bits(), 24, "stale genuine record ignored");
+
+        // Newer seq, but signed by a key that is not the publisher's.
+        let attacker = SigningKey::from_bytes(&[3u8; 32]);
+        let forged = SignedCellV1::new(
+            &attacker,
+            freebird_pow::POW_PURPOSE,
+            99,
+            freebird_pow::difficulty_body(POW_FLOOR_BITS),
+        );
+        s.apply_delta(&p, &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(forged.clone()) })
+            .expect("delta ok");
+        assert_eq!(s.admission_bits(), 24, "forged record ignored");
+
+        // And a fabricated full state cannot seat the forged record either.
+        let fabricated = DirectoryStateV4 { pow_difficulty: Some(forged), ..Default::default() };
+        assert!(fabricated.verify(&p).is_err(), "unsigned difficulty record fails verify");
+    }
+
+    /// A raise reaches a replica that has nothing else to sync: the summary
+    /// carries the latched seq, and `delta` emits the record on its own.
+    #[test]
+    fn raise_propagates_over_gossip_with_no_listings() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let mut raised = DirectoryStateV4::default();
+        raised
+            .apply_delta(
+                &p,
+                &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(23, 4)) },
+            )
+            .expect("delta ok");
+
+        let mut behind = DirectoryStateV4::default();
+        let delta = raised.delta(&behind.summarize()).expect("record alone justifies a delta");
+        assert!(delta.listings.is_empty());
+        behind.apply_delta(&p, &delta).expect("delta ok");
+        assert_eq!(behind.admission_bits(), 23);
+
+        // Now converged: no further delta in either direction.
+        assert!(raised.delta(&behind.summarize()).is_none());
+        assert!(behind.delta(&raised.summarize()).is_none());
+    }
+
+    /// Full-state sync carries the raise too — `merge` is the path a node
+    /// takes when it adopts a whole state rather than a delta.
+    #[test]
+    fn raise_propagates_over_full_state_merge() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let raised = DirectoryStateV4 {
+            pow_difficulty: Some(difficulty_record(25, 9)),
+            ..Default::default()
+        };
+
+        let mut behind = DirectoryStateV4::default();
+        behind.merge(&p, &raised).expect("merge ok");
+        assert_eq!(behind.admission_bits(), 25);
+    }
+
+    /// A raise is not retroactive: listings seated at the floor before it
+    /// stay seated and keep verifying, so a raise can never brick the
+    /// directory (and re-validation stays independent of when it runs).
+    #[test]
+    fn raise_does_not_evict_already_seated_listings() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let (sk, key) = anon_author();
+        let mut s = DirectoryStateV4::default();
+        s.apply_delta(&p, &d(vec![anon_listing(&sk, key, 5)])).expect("delta ok");
+        assert_eq!(s.anon.len(), 1);
+
+        s.apply_delta(
+            &p,
+            &DirectoryDeltaV3 { listings: vec![], pow_difficulty: Some(difficulty_record(26, 2)) },
+        )
+        .expect("delta ok");
+        assert_eq!(s.anon.len(), 1, "seated listing survives the raise");
+        s.verify(&p).expect("still verifies at the compiled floor");
     }
 
     /// Shrunken anon share (900 attested at the 1000 cap ⇒ effective anon

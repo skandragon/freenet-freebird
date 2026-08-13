@@ -101,6 +101,14 @@ RUSTFLAGS="$RF" cargo build --locked -p <changed-crate> \
 sha256sum target/wasm32-unknown-unknown/release/*.wasm
 ```
 
+This path is proven end to end: the #66 directory/inbox rotation (2026-08-13)
+was built this way on the `freenet1` explorer node, and all three unchanged
+crates reproduced their pinned reference hashes exactly. `make wasm-repro`
+is the same target the container runs, so running it directly on an amd64
+host is equivalent — it just needs `wasm-tools` at the version
+`docker/Dockerfile` pins. See `docs/anon-pow-difficulty.md` for the worked
+example.
+
 **Always build the unchanged crates too and check their sha256 against
 `scripts/repro-reference-hashes.txt` first** — a full match on the untouched
 crates proves the environment is canonical; only then vendor the changed

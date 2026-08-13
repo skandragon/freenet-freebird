@@ -9,6 +9,7 @@ description = "Freebird publisher CLI: mint the publisher key, publish/show the 
 [dependencies]
 cell-contract = { path = "../../contracts/cell-contract", default-features = false }
 freebird-control = { path = "../../control" }
+freebird-pow.workspace = true
 freenet-stdlib = { workspace = true, features = ["net"] }
 ciborium.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }

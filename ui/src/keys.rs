@@ -192,6 +192,19 @@ pub fn control_cell_instance_id() -> ContractInstanceId {
     *control_cell_key().id()
 }
 
+/// The publisher's anonymous-PoW difficulty cell (issue #66): same frozen
+/// cell wasm, purpose "pow" — a separate address from control so a build
+/// record can never be read as a difficulty record. Clients read it to solve
+/// at the current bar and to relay the record into the contracts it governs.
+pub fn pow_cell_key() -> ContractKey {
+    let params = cell_contract::to_cbor(&freebird_pow::pow_params()).expect("params serialize");
+    contract_key(CELL_CONTRACT_WASM, params)
+}
+
+pub fn pow_cell_instance_id() -> ContractInstanceId {
+    *pow_cell_key().id()
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn now_ms() -> u64 {
     js_sys::Date::now() as u64
@@ -268,18 +281,26 @@ mod tests {
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
-            // Directory + inbox rotated 2026-08-12 (issue #52): LWW before
-            // verification and a held-attestation skip on the delta paths.
-            // Following the #51/#50/#49/#45 rotation precedent, neither
-            // prior address gets a dual-read window (#51 rotated the same
-            // pair without one): listings re-seat on republish, and inbox
+            // Directory + inbox rotated 2026-08-13 (issue #66): the
+            // anonymous-PoW difficulty record moved into the state so a
+            // publisher raise binds attackers, not only honest writers.
+            // (Previous rotation 2026-08-12 for #52.) Following the
+            // #52/#51/#50/#49/#45 precedent, neither prior address gets a
+            // dual-read window: listings re-seat on republish, and inbox
             // creds/pointers re-staple as repliers repost.
-            "6Jj6CndZ2DzkxRyhiriFoj7Bq6ewMDBCMJ4uiofdXyUn",
+            "9fGcxYMNAdMET8h9mBsBobCHqHKV2YzxCfAN68rB8JBQ",
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
+            // The PoW difficulty cell (#66) is deliberately NOT pinned here:
+            // freebird-pow's `test-publisher` feature swaps the compiled
+            // publisher key, and workspace feature unification turns it on
+            // for some targets, so its derived address is build-dependent.
+            // The properties a pin would protect are already covered — cell
+            // wasm bytes + derivation by the control-cell entry above, and
+            // the publisher key by freebird-pow's publisher_key_matches_control.
             "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
-            "328eVhTm35uvJBnw35kXkNpCAvafvVpH5UoyPg7jGyxm",
+            "6rqG9SwSeXdG7BagLgoEFLZ2A7UVwsMA3yxcYgsVrsv3",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
             "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",

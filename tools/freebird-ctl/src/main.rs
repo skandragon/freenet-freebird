@@ -1,8 +1,9 @@
-//! Publisher CLI for the Freebird control cell.
+//! Publisher CLI for the Freebird publisher cells.
 //!
-//! `keygen`          — mint the publisher keypair (~/.freebird/publisher.key)
-//! `publish-control` — sign and Put the control record (build + flags)
-//! `show`            — fetch and print the current control record
+//! `keygen`             — mint the publisher keypair (~/.freebird/publisher.key)
+//! `publish-control`    — sign and Put the control record (build + flags)
+//! `publish-difficulty` — sign and Put the anonymous-PoW difficulty (issue #66)
+//! `show`               — fetch and print both records
 //!
 //! Talks to a Freenet node on localhost (same ssh tunnel as fdev, see
 //! scripts/publish-ui.sh). `make publish` chains publish-control after the
@@ -28,19 +29,19 @@ fn key_path() -> PathBuf {
     PathBuf::from(home).join(".freebird").join("publisher.key")
 }
 
-fn control_container() -> ContractContainer {
-    let params = cell_contract::to_cbor(&freebird_control::control_params()).expect("params");
+fn cell_container(params: &cell_contract::CellParametersV1) -> ContractContainer {
+    let params = cell_contract::to_cbor(params).expect("params");
     ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
         std::sync::Arc::new(ContractCode::from(CELL_CONTRACT_WASM.to_vec())),
         Parameters::from(params),
     )))
 }
 
-fn control_key() -> ContractKey {
-    let params = cell_contract::to_cbor(&freebird_control::control_params()).expect("params");
+fn cell_key(params: &cell_contract::CellParametersV1) -> ContractKey {
+    let params = cell_contract::to_cbor(params).expect("params");
     ContractKey::from_params_and_code(
         Parameters::from(params),
-        &ContractCode::from(CELL_CONTRACT_WASM.to_vec()),
+        ContractCode::from(CELL_CONTRACT_WASM.to_vec()),
     )
 }
 
@@ -155,24 +156,7 @@ async fn publish_control(
     let mut control = ControlV1::new(build, label);
     control.flags = flags;
     let cell = SignedCellV1::new(&sk, CONTROL_PURPOSE, now_ms(), control.encode());
-    let state = cell_contract::to_cbor(&cell)?;
-
-    let mut api = connect(node).await?;
-    api.send(ClientRequest::ContractOp(ContractRequest::Put {
-        contract: control_container(),
-        state: WrappedState::new(state),
-        related_contracts: RelatedContracts::default(),
-        subscribe: false,
-        blocking_subscribe: false,
-    }))
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let key = wait_for(&mut api, "PutResponse", |r| match r {
-        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => Some(key),
-        _ => None,
-    })
-    .await?;
+    let key = put_cell(node, &freebird_control::control_params(), &cell).await?;
     println!(
         "control published: build {} ({}) seq {} → {key}",
         control.build, control.build_label, cell.seq
@@ -180,11 +164,62 @@ async fn publish_control(
     Ok(())
 }
 
-async fn show(node: &str) -> Result<(), String> {
+/// Raise (or lower) the anonymous proof-of-work bar (issue #66). Clients read
+/// this cell, solve to it, and attach it to their writes; the inbox/directory
+/// contracts then LATCH it into their state, which is what makes the raise
+/// bind an attacker — who would otherwise just omit it — and not only the
+/// honest writers who opt in.
+///
+/// Takes effect as replicas latch it, and is not retroactive: entries already
+/// seated stay seated. `difficulty_body` clamps to [floor, ceiling].
+async fn publish_difficulty(node: &str, bits: u8) -> Result<(), String> {
+    let sk = load_signing_key()?;
+    let body = freebird_pow::difficulty_body(bits);
+    let cell = SignedCellV1::new(&sk, freebird_pow::POW_PURPOSE, now_ms(), body.clone());
+    let key = put_cell(node, &freebird_pow::pow_params(), &cell).await?;
+    if body[0] != bits {
+        println!(
+            "note: {bits} clamped to {} (floor {}, ceiling {})",
+            body[0],
+            freebird_pow::POW_FLOOR_BITS,
+            freebird_pow::POW_CEILING_BITS
+        );
+    }
+    println!("difficulty published: {} bits seq {} → {key}", body[0], cell.seq);
+    Ok(())
+}
+
+async fn put_cell(
+    node: &str,
+    params: &cell_contract::CellParametersV1,
+    cell: &SignedCellV1,
+) -> Result<ContractKey, String> {
     let mut api = connect(node).await?;
-    let id = *control_key().id();
+    api.send(ClientRequest::ContractOp(ContractRequest::Put {
+        contract: cell_container(params),
+        state: WrappedState::new(cell_contract::to_cbor(cell)?),
+        related_contracts: RelatedContracts::default(),
+        subscribe: false,
+        blocking_subscribe: false,
+    }))
+    .await
+    .map_err(|e| e.to_string())?;
+
+    wait_for(&mut api, "PutResponse", |r| match r {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => Some(key),
+        _ => None,
+    })
+    .await
+}
+
+/// Fetch one publisher cell; `None` when it has never been published.
+async fn get_cell(
+    node: &str,
+    params: &cell_contract::CellParametersV1,
+) -> Result<Option<SignedCellV1>, String> {
+    let mut api = connect(node).await?;
     api.send(ClientRequest::ContractOp(ContractRequest::Get {
-        key: id,
+        key: *cell_key(params).id(),
         return_contract_code: false,
         subscribe: false,
         blocking_subscribe: false,
@@ -197,25 +232,46 @@ async fn show(node: &str) -> Result<(), String> {
         _ => None,
     })
     .await?;
-
     if state.as_ref().is_empty() {
-        println!("control cell {id}: empty (never published)");
-        return Ok(());
+        return Ok(None);
     }
     let cell: SignedCellV1 = cell_contract::from_cbor(state.as_ref())?;
-    cell.check(&freebird_control::control_params())?;
-    match ControlV1::decode(&cell.body) {
-        Some(c) => println!(
-            "control cell {id}: build {} ({}) seq {} flags {:?}",
-            c.build, c.build_label, cell.seq, c.flags
+    cell.check(params)?;
+    Ok(Some(cell))
+}
+
+async fn show(node: &str) -> Result<(), String> {
+    let control_params = freebird_control::control_params();
+    let id = *cell_key(&control_params).id();
+    match get_cell(node, &control_params).await? {
+        None => println!("control cell {id}: empty (never published)"),
+        Some(cell) => match ControlV1::decode(&cell.body) {
+            Some(c) => println!(
+                "control cell {id}: build {} ({}) seq {} flags {:?}",
+                c.build, c.build_label, cell.seq, c.flags
+            ),
+            None => println!("control cell {id}: seq {} with undecodable body", cell.seq),
+        },
+    }
+
+    let pow_params = freebird_pow::pow_params();
+    let id = *cell_key(&pow_params).id();
+    match get_cell(node, &pow_params).await? {
+        None => println!(
+            "pow cell {id}: empty (never published) — anon writes at the floor, {} bits",
+            freebird_pow::POW_FLOOR_BITS
         ),
-        None => println!("control cell {id}: seq {} with undecodable body", cell.seq),
+        Some(cell) => println!(
+            "pow cell {id}: {} bits seq {}",
+            freebird_pow::difficulty_bits(Some(&cell)),
+            cell.seq
+        ),
     }
     Ok(())
 }
 
 fn usage() -> String {
-    "usage:\n  freebird-ctl keygen\n  freebird-ctl publish-control --build N [--label S] [--flag k=v]... [--node URL]\n  freebird-ctl show [--node URL]"
+    "usage:\n  freebird-ctl keygen\n  freebird-ctl publish-control --build N [--label S] [--flag k=v]... [--node URL]\n  freebird-ctl publish-difficulty --bits N [--node URL]\n  freebird-ctl show [--node URL]"
         .into()
 }
 
@@ -225,6 +281,7 @@ fn run() -> Result<(), String> {
 
     let mut node = DEFAULT_NODE.to_string();
     let mut build: Option<u64> = None;
+    let mut bits: Option<u8> = None;
     let mut label = String::new();
     let mut flags = BTreeMap::new();
     let mut it = args[1..].iter();
@@ -240,6 +297,9 @@ fn run() -> Result<(), String> {
                         .parse()
                         .map_err(|e| format!("--build: {e}"))?,
                 )
+            }
+            "--bits" => {
+                bits = Some(value("--bits")?.parse().map_err(|e| format!("--bits: {e}"))?)
             }
             "--label" => label = value("--label")?,
             "--flag" => {
@@ -258,6 +318,10 @@ fn run() -> Result<(), String> {
                 return Err("--build 0 means 'no git at compile time'; refusing to publish it".into());
             }
             runtime(publish_control(&node, build, label, flags))
+        }
+        "publish-difficulty" => {
+            let bits = bits.ok_or("--bits is required")?;
+            runtime(publish_difficulty(&node, bits))
         }
         "show" => runtime(show(&node)),
         _ => Err(usage()),

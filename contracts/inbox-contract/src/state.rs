@@ -65,20 +65,30 @@ pub fn is_anon_fingerprint(fp: &str) -> bool {
 pub struct InboxStateV3 {
     pub creds: CredsV3,
     pub pointers: PointersV3,
+    /// Latched publisher-signed anonymous-PoW difficulty (issue #66). Lives
+    /// in the state because `update_state` — the path every gossiped delta
+    /// takes — receives the state but no `RelatedContracts`, so this is the
+    /// only channel that can put a bar in front of a write the WRITER did not
+    /// choose. Monotone in `seq`; see `freebird_pow::adopt_difficulty`.
+    #[serde(default)]
+    pub pow_difficulty: Option<cell_contract::SignedCellV1>,
 }
 
-/// Same shape the `#[composable]` macro generated.
+/// Same shape the `#[composable]` macro generated, plus the latched
+/// difficulty's `seq` (0 for none) so a raise propagates on its own.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct InboxStateV3Summary {
     pub creds: <CredsV3 as ComposableState>::Summary,
     pub pointers: <PointersV3 as ComposableState>::Summary,
+    #[serde(default)]
+    pub pow_seq: u64,
 }
 
 /// Same shape the `#[composable]` macro generated, plus the optional
-/// publisher-signed difficulty record (issue #51) the writer solved against.
-/// The record rides the ORIGINAL client write only; node-to-node gossip
-/// (`delta()`) emits `pow_difficulty: None`, so replicas always re-admit at
-/// the compiled floor and stay convergent.
+/// publisher-signed difficulty record (issues #51/#66). A client write
+/// carries the record it solved against; gossip carries whatever the sender
+/// has latched, so the raise reaches every replica and binds writers there
+/// too.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct InboxStateV3Delta {
     pub creds: Option<<CredsV3 as ComposableState>::Delta>,
@@ -98,6 +108,14 @@ impl ComposableState for InboxStateV3 {
         parent_state: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
+        // A latched record must be a genuine publisher record, or a
+        // fabricated state could seat a bogus one and (via gossip) push it
+        // onto honest replicas. Its BITS are not enforced against the seated
+        // pointers — that stays the compiled floor, see `PointersV3::verify`.
+        if let Some(cell) = &self.pow_difficulty {
+            cell.check(&freebird_pow::pow_params())
+                .map_err(|e| format!("difficulty record: {e}"))?;
+        }
         self.creds.verify(parent_state, parameters)?;
         self.pointers.verify(parent_state, parameters)?;
         Ok(())
@@ -111,6 +129,7 @@ impl ComposableState for InboxStateV3 {
         InboxStateV3Summary {
             creds: self.creds.summarize(parent_state, parameters),
             pointers: self.pointers.summarize(parent_state, parameters),
+            pow_seq: freebird_pow::difficulty_seq(self.pow_difficulty.as_ref()),
         }
     }
 
@@ -143,8 +162,20 @@ impl ComposableState for InboxStateV3 {
                 c
             })
             .filter(|c| !c.is_empty());
-        (creds.is_some() || pointers.is_some())
-            .then_some(InboxStateV3Delta { creds, pointers, pow_difficulty: None })
+        // Our latched difficulty, if the peer's is older (issue #66). It
+        // alone justifies a delta: a raise must reach quiet inboxes too, not
+        // only ones that happen to have pointers flowing.
+        let pow_difficulty = (freebird_pow::difficulty_seq(self.pow_difficulty.as_ref())
+            > old_state_summary.pow_seq)
+            .then(|| self.pow_difficulty.clone())
+            .flatten();
+        (creds.is_some() || pointers.is_some() || pow_difficulty.is_some()).then_some(
+            InboxStateV3Delta {
+                creds,
+                pointers,
+                pow_difficulty,
+            },
+        )
     }
 
     fn apply_delta(
@@ -155,15 +186,18 @@ impl ComposableState for InboxStateV3 {
     ) -> Result<(), String> {
         let Some(delta) = delta else { return Ok(()) };
         // PoW admission (issue #51): drop anonymous pointers below the
-        // effective difficulty — the compiled floor, raised by a valid
-        // publisher-signed control-cell record if this write carries one.
+        // effective difficulty. Latch the delta's record first, then read the
+        // bar off the STATE (issue #66) — a delta that carries no record, or
+        // a stale one, leaves the latched bar standing, so omitting the
+        // record no longer buys floor admission.
         // Attested pointers skip PoW (ghost key = accelerator). Drop-not-fatal,
         // same doctrine as a missing credential: an honest peer never forwards
         // an under-bar stamp. Wrong-inbox pointers are LEFT IN so the staple
         // loop / check_pointer can fatal on them (issue #46), never silently
         // dropped by a binding-mismatched PoW check.
         let owner = parameters.owner.to_bytes();
-        let bits = freebird_pow::difficulty_bits(delta.pow_difficulty.as_ref());
+        freebird_pow::adopt_difficulty(&mut self.pow_difficulty, delta.pow_difficulty.as_ref());
+        let bits = freebird_pow::difficulty_bits(self.pow_difficulty.as_ref());
         let admitted: Option<Vec<AuthorizedReplyPointerV3>> = delta.pointers.as_ref().map(|ps| {
             ps.iter()
                 .filter(|p| {
@@ -1168,6 +1202,157 @@ mod tests {
         assert_eq!(s.pointers.pointers.len(), 1, "control-difficulty stamp accepted");
     }
 
+    /// Mint a publisher-signed difficulty record at `bits`, sequence `seq`.
+    fn difficulty_record(bits: u8, seq: u64) -> cell_contract::SignedCellV1 {
+        let publisher = SigningKey::from_bytes(&freebird_pow::PUBLISHER_TEST_SECRET);
+        cell_contract::SignedCellV1::new(
+            &publisher,
+            freebird_pow::POW_PURPOSE,
+            seq,
+            freebird_pow::difficulty_body(bits),
+        )
+    }
+
+    /// Latch a raise into `s` with a pointer-less delta.
+    fn latch(s: &mut InboxStateV3, p: &InboxParametersV3, record: cell_contract::SignedCellV1) {
+        let clone = s.clone();
+        s.apply_delta(
+            &clone,
+            p,
+            &Some(InboxStateV3Delta {
+                creds: None,
+                pointers: None,
+                pow_difficulty: Some(record),
+            }),
+        )
+        .expect("delta ok");
+    }
+
+    /// Issue #66, the whole point: once a raise is LATCHED into the state, a
+    /// delta that carries no record — exactly what an attacker sends, and
+    /// what node-to-node gossip used to send — is still held to the raised
+    /// bar. Under #65 this pointer was admitted at the floor.
+    #[test]
+    fn latched_difficulty_binds_a_delta_that_omits_the_record() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let raised = 22u8;
+        let r = anon_replier();
+
+        let mut s = InboxStateV3::default();
+        latch(&mut s, &p, difficulty_record(raised, 1));
+        assert_eq!(freebird_pow::difficulty_bits(s.pow_difficulty.as_ref()), raised);
+
+        let mut weak = pointer_for(&r, &p, 5, 0);
+        weak.pow_nonce = freebird_pow::solve_inbox_band(
+            &p.owner.to_bytes(),
+            &r.key,
+            freebird_pow::POW_FLOOR_BITS,
+            raised,
+        );
+        apply(&mut s, &p, delta_of(vec![&r], vec![weak]));
+        assert!(
+            s.pointers.pointers.is_empty(),
+            "floor stamp rejected with no record in the delta"
+        );
+
+        // The honest client that solved to the latched bar still gets in.
+        let ptr = ReplyPointerV3 {
+            owner: p.owner.to_bytes(),
+            replier: r.key,
+            fingerprint: r.cred.fingerprint(),
+            target_post: PostId([1u8; 16]),
+            reply_post: PostId::compute(&r.sk.verifying_key(), 6, "strong", &None),
+            time: 6,
+        };
+        apply(
+            &mut s,
+            &p,
+            delta_of(vec![&r], vec![AuthorizedReplyPointerV3::new_anon(ptr, &r.sk, raised)]),
+        );
+        assert_eq!(s.pointers.pointers.len(), 1);
+        s.verify(&s.clone(), &p).expect("raised-difficulty state verifies");
+    }
+
+    /// An attacker cannot walk the bar back: neither a forged record at a
+    /// higher seq nor a replay of the genuine older one displaces the latch.
+    #[test]
+    fn latched_difficulty_cannot_be_downgraded() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let mut s = InboxStateV3::default();
+        latch(&mut s, &p, difficulty_record(24, 7));
+
+        latch(&mut s, &p, difficulty_record(freebird_pow::POW_FLOOR_BITS, 1));
+        assert_eq!(
+            freebird_pow::difficulty_bits(s.pow_difficulty.as_ref()),
+            24,
+            "stale genuine record ignored"
+        );
+
+        let attacker = SigningKey::from_bytes(&[3u8; 32]);
+        let forged = cell_contract::SignedCellV1::new(
+            &attacker,
+            freebird_pow::POW_PURPOSE,
+            99,
+            freebird_pow::difficulty_body(freebird_pow::POW_FLOOR_BITS),
+        );
+        latch(&mut s, &p, forged.clone());
+        assert_eq!(
+            freebird_pow::difficulty_bits(s.pow_difficulty.as_ref()),
+            24,
+            "forged record ignored"
+        );
+
+        // And a fabricated full state cannot seat the forged record either.
+        let fabricated = InboxStateV3 { pow_difficulty: Some(forged), ..Default::default() };
+        assert!(
+            fabricated.verify(&fabricated.clone(), &p).is_err(),
+            "unsigned difficulty record fails verify"
+        );
+    }
+
+    /// A raise reaches a replica that has nothing else to sync: the summary
+    /// carries the latched seq, and `delta` emits the record on its own.
+    #[test]
+    fn raise_propagates_over_gossip_with_no_pointers() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let mut raised = InboxStateV3::default();
+        latch(&mut raised, &p, difficulty_record(23, 4));
+
+        let mut behind = InboxStateV3::default();
+        let summary = behind.summarize(&behind.clone(), &p);
+        let delta = raised
+            .delta(&raised.clone(), &p, &summary)
+            .expect("record alone justifies a delta");
+        assert!(delta.pointers.is_none() && delta.creds.is_none());
+        let clone = behind.clone();
+        behind.apply_delta(&clone, &p, &Some(delta)).expect("delta ok");
+        assert_eq!(freebird_pow::difficulty_bits(behind.pow_difficulty.as_ref()), 23);
+
+        // Converged: no further delta in either direction.
+        let summary = behind.summarize(&behind.clone(), &p);
+        assert!(raised.delta(&raised.clone(), &p, &summary).is_none());
+    }
+
+    /// A raise is not retroactive: pointers seated at the floor before it
+    /// stay seated and keep verifying, so a raise can never brick an inbox
+    /// (and re-validation stays independent of when it runs).
+    #[test]
+    fn raise_does_not_evict_already_seated_pointers() {
+        let authority = TestAuthority::new();
+        let p = params(&authority);
+        let r = anon_replier();
+        let mut s = InboxStateV3::default();
+        apply(&mut s, &p, delta_of(vec![&r], vec![pointer_for(&r, &p, 5, 0)]));
+        assert_eq!(s.pointers.pointers.len(), 1);
+
+        latch(&mut s, &p, difficulty_record(26, 2));
+        assert_eq!(s.pointers.pointers.len(), 1, "seated pointer survives the raise");
+        s.verify(&s.clone(), &p).expect("still verifies at the compiled floor");
+    }
+
     /// Issue #46: a pointer signed for inbox A must fail validation in
     /// inbox B — cross-inbox replay is dead.
     #[test]
@@ -1659,6 +1844,7 @@ mod tests {
     fn summarize_pointers(p: &PointersV3) -> PointersV3Summary {
         let parent = InboxStateV3 {
             creds: Default::default(),
+            pow_difficulty: None,
             pointers: p.clone(),
         };
         let params = InboxParametersV3 {
@@ -1671,6 +1857,7 @@ mod tests {
     fn delta_against(p: &PointersV3, summary: &PointersV3Summary) -> Option<Vec<AuthorizedReplyPointerV3>> {
         let parent = InboxStateV3 {
             creds: Default::default(),
+            pow_difficulty: None,
             pointers: p.clone(),
         };
         let params = InboxParametersV3 {
@@ -1841,6 +2028,7 @@ mod tests {
     fn verify_rejects_over_anon_share() {
         let s = InboxStateV3 {
             creds: Default::default(),
+            pow_difficulty: None,
             pointers: PointersV3 {
                 pointers: {
                     let mut v: Vec<_> =
@@ -1916,6 +2104,7 @@ mod tests {
         };
         let over_anon = InboxStateV3 {
             creds: Default::default(),
+            pow_difficulty: None,
             pointers: PointersV3 {
                 pointers: (0..MAX_PER_ANON_KEY as u64 + 1)
                     .map(|i| fake(&anon_fp(0), i, i))
@@ -1925,6 +2114,7 @@ mod tests {
         assert!(over_anon.pointers.verify(&over_anon, &params).is_err());
         let over_gk = InboxStateV3 {
             creds: Default::default(),
+            pow_difficulty: None,
             pointers: PointersV3 {
                 pointers: (0..MAX_PER_FINGERPRINT as u64 + 1)
                     .map(|i| fake(&gk_fp(0), i, i))
