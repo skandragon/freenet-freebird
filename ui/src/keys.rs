@@ -37,6 +37,16 @@ pub const FREEBIRD_DELEGATE_V1_WASM: &[u8] =
 /// outgoing wasm as `freebird_delegate_vN.wasm`, append it here, re-pin.
 pub const LEGACY_DELEGATE_WASMS: &[&[u8]] = &[FREEBIRD_DELEGATE_V1_WASM];
 
+/// Address generation per anchor role: which generation of that contract
+/// this build derives, publishes (`own_anchor`) and reads (`anchor_targets`).
+/// Bump the constant in the SAME change that rotates the matching wasm —
+/// `golden_addresses_pinned` pins each of these next to the address it
+/// describes, so a rotation that leaves the constant alone fails CI
+/// (issue #80).
+pub const INBOX_GENERATION: u32 = 3;
+pub const FEED_GENERATION: u32 = 3;
+pub const AVATAR_GENERATION: u32 = 1;
+
 /// This bundle's build number (git commit count; 0 in git-less dev builds).
 pub fn own_build() -> u64 {
     env!("BUILD_NUMBER").parse().unwrap_or(0)
@@ -266,6 +276,13 @@ mod tests {
     /// is about to become unreachable. See check-addresses in the Makefile;
     /// only update these goldens as part of a deliberate, reviewed rotation
     /// with a migration plan.
+    ///
+    /// The three anchor roles are pinned as `generation@address` (issue #80):
+    /// a rotation moves the address, so the golden row has to be rewritten
+    /// with the generation right there in it. Leaving the generation alone —
+    /// which is how INBOX_GENERATION stayed at 2 across four inbox rotations,
+    /// pointing every reader at a dead inbox — means editing "3@old" into
+    /// "3@new" by hand, in review, instead of no diff at all.
     #[test]
     fn golden_addresses_pinned() {
         let author = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
@@ -273,11 +290,11 @@ mod tests {
             directory_instance_id().to_string(),
             directory_instance_id_v1().to_string(),
             control_cell_instance_id().to_string(),
-            feed_instance_id(&author).to_string(),
+            format!("{FEED_GENERATION}@{}", feed_instance_id(&author)),
             feed_instance_id_v1(&author).to_string(),
-            inbox_instance_id(&author).to_string(),
+            format!("{INBOX_GENERATION}@{}", inbox_instance_id(&author)),
             inbox_instance_id_v1(&author).to_string(),
-            avatar_instance_id(&author).to_string(),
+            format!("{AVATAR_GENERATION}@{}", avatar_instance_id(&author)),
             anchor_instance_id(&author).to_string(),
         ];
         let golden = [
@@ -298,11 +315,11 @@ mod tests {
             // The properties a pin would protect are already covered — cell
             // wasm bytes + derivation by the control-cell entry above, and
             // the publisher key by freebird-pow's publisher_key_matches_control.
-            "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
+            "3@8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
-            "6rqG9SwSeXdG7BagLgoEFLZ2A7UVwsMA3yxcYgsVrsv3",
+            "3@6rqG9SwSeXdG7BagLgoEFLZ2A7UVwsMA3yxcYgsVrsv3",
             "9ayrE3HuxxGC5RDKhmBLQD8BHBnkqr5dyELJ2WqFGnZr",
-            "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
+            "1@F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
         ];
         assert_eq!(got, golden, "derived contract addresses ROTATED");

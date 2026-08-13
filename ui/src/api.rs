@@ -247,14 +247,7 @@ pub async fn ensure_own_inbox(author: &VerifyingKey) -> Result<(), String> {
     .await
 }
 
-/// Address generation per anchor role: which generation of that contract
-/// this build derives, publishes, and reads. Hand-maintained — nothing ties
-/// them to the vendored wasm, so a rotation must bump the matching constant
-/// in the same change (see `own_anchor_is_not_a_rotation`, and
-/// `golden_addresses_pinned` in keys.rs for the addresses themselves).
-const INBOX_GENERATION: u32 = 2;
-const FEED_GENERATION: u32 = 2;
-const AVATAR_GENERATION: u32 = 1;
+use keys::{AVATAR_GENERATION, FEED_GENERATION, INBOX_GENERATION};
 
 /// The anchor body this build publishes for `vk`: every role at the address
 /// this same build derives. Split out from `publish_anchor` so the read half
