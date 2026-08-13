@@ -189,25 +189,38 @@ pub async fn ensure_own_inbox(author: &VerifyingKey) -> Result<(), String> {
     .await
 }
 
+/// Contract generation per anchor role: the address generation this build
+/// derives from bundled wasm, publishes in its own anchor, and knows how to
+/// decode. Bump one when that contract rotates.
+const INBOX_GENERATION: u32 = 2;
+const FEED_GENERATION: u32 = 2;
+const AVATAR_GENERATION: u32 = 1;
+
 /// Publish (or refresh) our anchor cell: role → current contract version +
 /// address. Rides the FROZEN cell kernel, so this address never rotates —
 /// future readers learn where our current-generation contracts live even
 /// after their derived addresses change again.
 pub async fn publish_anchor(sk: &SigningKey) -> Result<(), String> {
     let vk = sk.verifying_key();
+    let role = |version: u32, id: ContractInstanceId| freebird_anchor::RoleV1 {
+        version,
+        address: Some(id.as_bytes().try_into().expect("instance id is 32 bytes")),
+    };
     let anchor = freebird_anchor::AnchorV1::new(
-        [(
-            freebird_anchor::ROLE_INBOX.to_string(),
-            freebird_anchor::RoleV1 {
-                version: 2,
-                address: Some(
-                    keys::inbox_instance_id(&vk)
-                        .as_bytes()
-                        .try_into()
-                        .expect("instance id is 32 bytes"),
-                ),
-            },
-        )]
+        [
+            (
+                freebird_anchor::ROLE_INBOX.to_string(),
+                role(INBOX_GENERATION, keys::inbox_instance_id(&vk)),
+            ),
+            (
+                freebird_anchor::ROLE_FEED.to_string(),
+                role(FEED_GENERATION, keys::feed_instance_id(&vk)),
+            ),
+            (
+                freebird_anchor::ROLE_AVATAR.to_string(),
+                role(AVATAR_GENERATION, keys::avatar_instance_id(&vk)),
+            ),
+        ]
         .into_iter()
         .collect(),
     );
@@ -761,6 +774,78 @@ fn dispatch_contract(response: ContractResponse) {
     }
 }
 
+/// Where an author's anchor says to read each role, when that differs from
+/// the address we derive from bundled wasm — the read half of the anchor
+/// (issue #54). Returns `(role, address, kind, subscribe)`.
+///
+/// A role is skipped when it names a generation this build has no decoder
+/// for: fetching it would only produce bytes we reject, and the derived
+/// address still holds the data we CAN read.
+fn anchor_targets(
+    author: [u8; 32],
+    vk: &VerifyingKey,
+    anchor: &freebird_anchor::AnchorV1,
+) -> Vec<(&'static str, ContractInstanceId, TrackedKind, bool)> {
+    [
+        (
+            freebird_anchor::ROLE_INBOX,
+            INBOX_GENERATION,
+            keys::inbox_instance_id(vk),
+            TrackedKind::Inbox(author),
+            true,
+        ),
+        (
+            freebird_anchor::ROLE_FEED,
+            FEED_GENERATION,
+            keys::feed_instance_id(vk),
+            TrackedKind::Feed(author),
+            true,
+        ),
+        (
+            freebird_anchor::ROLE_AVATAR,
+            AVATAR_GENERATION,
+            keys::avatar_instance_id(vk),
+            // Write-rarely, same as fetch_avatar: no subscription.
+            TrackedKind::Avatar(author),
+            false,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(role, generation, derived, kind, subscribe)| {
+        let entry = anchor.role(role)?;
+        let address = ContractInstanceId::new(entry.address?);
+        (entry.version == generation && address != derived)
+            .then_some((role, address, kind, subscribe))
+    })
+    .collect()
+}
+
+/// Act on `anchor_targets`: point the tracked registry at the rotated
+/// address (so its state dispatches into this author's existing slot) and
+/// fetch it. Without this a rotation strands every reader on the derived
+/// address, as if the anchor did not exist.
+fn follow_anchor(author: [u8; 32], vk: &VerifyingKey, anchor: &freebird_anchor::AnchorV1) {
+    for (role, address, kind, subscribe) in anchor_targets(author, vk, anchor) {
+        if TRACKED.peek().get(&address.to_string()) == Some(&kind) {
+            continue; // already following this rotation
+        }
+        log(&format!("anchor: following rotated {role} at {address}"));
+        track_id(address, kind);
+        spawn_local_task(async move {
+            if let Err(e) = send(ClientRequest::ContractOp(ContractRequest::Get {
+                key: address,
+                return_contract_code: false,
+                subscribe,
+                blocking_subscribe: false,
+            }))
+            .await
+            {
+                log(&format!("anchor {role} fetch failed: {e}"));
+            }
+        });
+    }
+}
+
 /// Apply full state or delta bytes for a tracked contract.
 fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
     if bytes.is_empty() {
@@ -905,6 +990,7 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                     match freebird_anchor::AnchorV1::decode(&cell.body) {
                         Some(anchor) => {
                             ANCHOR_ORDER.write().insert(author, cell.order_key());
+                            follow_anchor(author, &vk, &anchor);
                             ANCHORS.write().insert(author, Some(anchor));
                         }
                         // A future schema this build can't read: stay quiet.
@@ -1203,7 +1289,11 @@ static ANCHOR_ORDER: GlobalSignal<BTreeMap<[u8; 32], (u64, [u8; 32])>> =
     Signal::global(BTreeMap::new);
 
 fn track(key: ContractKey, kind: TrackedKind) {
-    TRACKED.write().insert(key.id().to_string(), kind);
+    track_id(*key.id(), kind);
+}
+
+fn track_id(id: ContractInstanceId, kind: TrackedKind) {
+    TRACKED.write().insert(id.to_string(), kind);
 }
 
 fn lookup(key: &ContractKey) -> Option<TrackedKind> {
@@ -1212,6 +1302,75 @@ fn lookup(key: &ContractKey) -> Option<TrackedKind> {
 
 #[cfg(test)]
 mod tests {
+    use super::{anchor_targets, TrackedKind, AVATAR_GENERATION, INBOX_GENERATION};
+    use crate::keys;
+    use ed25519_dalek::SigningKey;
+    use freebird_anchor::{AnchorV1, RoleV1, ROLE_AVATAR, ROLE_INBOX};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use std::collections::BTreeMap;
+
+    fn anchor(roles: &[(&str, RoleV1)]) -> AnchorV1 {
+        AnchorV1::new(
+            roles
+                .iter()
+                .map(|(n, r)| (n.to_string(), r.clone()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    }
+
+    /// A simulated inbox rotation: the author's anchor names an address the
+    /// bundled wasm does not derive, and readers follow it into the same
+    /// per-author inbox slot — no UI rebuild.
+    #[test]
+    fn rotated_inbox_is_followed() {
+        let vk = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let author = vk.to_bytes();
+        let rotated = [9u8; 32];
+        let a = anchor(&[(
+            ROLE_INBOX,
+            RoleV1 { version: INBOX_GENERATION, address: Some(rotated) },
+        )]);
+        let got = anchor_targets(author, &vk, &a);
+        assert_eq!(got.len(), 1, "one rotated role to follow");
+        assert_eq!(got[0].1, ContractInstanceId::new(rotated));
+        assert_eq!(got[0].2, TrackedKind::Inbox(author));
+        assert!(got[0].3, "inbox reads subscribe");
+    }
+
+    /// Everything else falls back to the derived address: an unrotated
+    /// anchor, a generation we cannot decode, and a role with no address.
+    #[test]
+    fn non_rotations_yield_no_targets() {
+        let vk = SigningKey::from_bytes(&[4u8; 32]).verifying_key();
+        let author = vk.to_bytes();
+        let derived: [u8; 32] = keys::inbox_instance_id(&vk).as_bytes().try_into().unwrap();
+        let cases = [
+            ("same as derived", RoleV1 { version: INBOX_GENERATION, address: Some(derived) }),
+            ("future generation", RoleV1 { version: INBOX_GENERATION + 1, address: Some([9u8; 32]) }),
+            ("no address", RoleV1 { version: INBOX_GENERATION, address: None }),
+        ];
+        for (why, role) in cases {
+            let got = anchor_targets(author, &vk, &anchor(&[(ROLE_INBOX, role)]));
+            assert!(got.is_empty(), "{why} must not be followed");
+        }
+        assert!(anchor_targets(author, &vk, &anchor(&[])).is_empty(), "empty anchor");
+    }
+
+    /// Avatars rotate too, and are fetched without a subscription.
+    #[test]
+    fn rotated_avatar_is_followed_unsubscribed() {
+        let vk = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let author = vk.to_bytes();
+        let a = anchor(&[(
+            ROLE_AVATAR,
+            RoleV1 { version: AVATAR_GENERATION, address: Some([9u8; 32]) },
+        )]);
+        let got = anchor_targets(author, &vk, &a);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].2, TrackedKind::Avatar(author));
+        assert!(!got[0].3, "avatar reads do not subscribe");
+    }
+
     /// The probe list keeps rotated generations and filters the CURRENT one
     /// (probing yourself would fold secrets onto themselves). Exercised with
     /// a synthetic registry: the current wasm plus a mutated (= rotated)

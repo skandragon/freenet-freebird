@@ -23,6 +23,12 @@ pub const ANCHOR_PURPOSE: &str = "anchor";
 /// Role key for the author's reply inbox.
 pub const ROLE_INBOX: &str = "inbox";
 
+/// Role key for the author's feed.
+pub const ROLE_FEED: &str = "feed";
+
+/// Role key for the author's avatar.
+pub const ROLE_AVATAR: &str = "avatar";
+
 /// One role's routing entry: which schema version the author currently
 /// publishes, and (optionally) the contract instance address, so readers can
 /// GET it even without the wasm that derives it.
