@@ -23,12 +23,21 @@ platform demo.
 
 ## Positioning
 
-The trust rule no centralized competitor can copy: **your own feed is free;
-other people's attention costs a Ghost Key.** Anonymous signup with a locally
-generated key; a Ghost Key (one-time, anonymous, paid credential from
-freenet.org) buys a verified check mark and the right to reply into other
-people's threads. Spam resistance without identity, moderation without a
-moderator.
+The trust rule no centralized competitor can copy: **everyone writes; paying
+buys durability, not permission.** Anonymous signup with a locally generated
+key, and anonymous accounts have the full product — peep, reply into threads,
+get listed in Discover. Shared-write surfaces run a two-tier slot policy:
+anonymous writers share a bounded pool and can be crowded out under load,
+verified writers cannot. A Ghost Key (one-time, anonymous, paid credential
+from freenet.org) buys the check mark and that uncrowdable presence. Spam
+resistance without identity, moderation without a moderator.
+
+Disclosed plainly wherever verification is offered: the check mark costs
+money, the money funds Freenet, and the mint is centrally operated — a
+master-key compromise could issue unlimited check marks, and card rails can
+decline or geo-block. Verification is not centralized (contracts check the
+chain offline), and because attestation is optional, a dead mint costs
+durability, not access.
 
 ## Operating Context
 
@@ -36,7 +45,7 @@ moderator.
   published to the network via `fdev`.
 - Each author's feed is a Freenet contract (profile, follows, signed peeps,
   optional attestation); replies are discovered via a per-author inbox
-  contract with ghostkey-gated writes.
+  contract with open writes under a two-tier (anonymous / attested) slot cap.
 - All aggregation (home feed merge, thread resolution) is client-side; the
   platform forbids contract-to-contract calls.
 - A per-app encrypted delegate on the user's node stores the posting key and
@@ -52,7 +61,8 @@ moderator.
   auto/light/dark theme.
 - Not yet implemented: repeeps, likes, media, mentions/notifications, global
   discovery, private follows.
-- Design spec: `docs/superpowers/specs/2026-08-09-freebird-design.md`.
+- Design spec: `docs/superpowers/specs/2026-08-09-freebird-design.md`, amended
+  by `docs/superpowers/specs/2026-08-10-anonymous-parity.md`.
 - Stack: Rust + Dioxus 0.7 web (`ui/`), contracts and delegate in wasm.
 
 ## Brand Commitments
@@ -75,8 +85,9 @@ moderator.
 1. **Adopters first, normies always welcome** — never require Freenet
    knowledge for the core loop (post, follow, reply), but never hide the
    mechanism from those who want it.
-2. **The trust rule is the product** — every shared-write surface is
-   ghostkey-gated; free self-expression, paid access to others' attention.
+2. **The trust rule is the product** — no shared-write surface is gated by
+   payment; anonymous users get full function on a bounded slot pool, and
+   paying buys durable, uncrowdable presence.
 3. **No server, ever** — no feature may quietly reintroduce a central
    service; client-side aggregation is the architecture, not a limitation.
 4. **Daily-use bar** — judged as a real microblog (speed, clarity, habit),

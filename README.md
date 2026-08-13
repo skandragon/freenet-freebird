@@ -3,13 +3,25 @@
 Microblogging on [Freenet](https://freenet.org). No server: each author's feed
 is a Freenet contract, reply discovery is a per-author inbox contract, and the
 UI is a web app served from the network itself. Signup is anonymous (a locally
-generated key); a [Ghost Key](https://freenet.org/ghostkey) buys a verified
-check mark and the ability to reply into other people's threads.
+generated key) and anonymous accounts can do everything: peep, reply into
+threads, get listed in Discover.
 
-**The trust rule:** your own feed is free; other people's attention costs a
-Ghost Key.
+**The trust rule:** everyone writes; a [Ghost Key](https://freenet.org/ghostkey)
+buys durability. Shared-write surfaces (reply inboxes, the directory) run a
+two-tier slot policy — anonymous writers share a bounded pool and can be
+crowded out under load, verified writers cannot. The check mark means
+"durable, uncrowdable presence", not permission.
 
-Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpowers/specs/2026-08-09-freebird-design.md)
+A Ghost Key is a paid, anonymous credential from freenet.org: the money funds
+Freenet, and the mint is centrally operated (a master-key compromise could
+issue unlimited check marks, and card rails can decline or geo-block).
+Verification itself is not centralized — contracts verify the certificate
+chain offline — and since attestation is optional, a dead mint costs
+durability, not access.
+
+Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpowers/specs/2026-08-09-freebird-design.md),
+amended by [`2026-08-10-anonymous-parity.md`](docs/superpowers/specs/2026-08-10-anonymous-parity.md)
+(the two-tier slot policy that replaced the ghostkey write gate)
 
 ## Vocabulary
 
@@ -17,10 +29,10 @@ Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpower
 |---|---|
 | **Peep** | A post (≤ 2 KB, signed, lives in your feed contract) |
 | **Repeep** | A repost (not yet implemented) |
-| **Reply** | A peep referencing another peep; discoverable via the target's inbox if you're verified |
+| **Reply** | A peep referencing another peep; discoverable via the target's inbox |
 | **Feed** | Your per-author contract: profile, follows, peeps, optional attestation |
 | **Follower / Following** | Public follow list in your feed state |
-| **Check mark** | Ghost Key attestation, verified by the contract itself |
+| **Check mark** | Ghost Key attestation, verified by the contract itself; buys slot durability, not write access |
 
 ## Layout
 
@@ -28,7 +40,8 @@ Design: [`docs/superpowers/specs/2026-08-09-freebird-design.md`](docs/superpower
   attestation verification, property tests
 - `contracts/feed-contract/` — per-author feed (profile, follows, peeps,
   optional attestation)
-- `contracts/inbox-contract/` — per-author reply inbox (ghostkey-gated writes)
+- `contracts/inbox-contract/` — per-author reply inbox (open writes, two-tier
+  slot policy)
 - `contracts/cell-contract/` — FROZEN signed-cell kernel (owner-signed opaque
   state; never rebuild — see its crate docs)
 - `control/` — `freebird-control`: control-channel schema (deployed build
