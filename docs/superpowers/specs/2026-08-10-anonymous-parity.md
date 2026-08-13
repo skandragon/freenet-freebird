@@ -73,8 +73,12 @@ control schema):
 AnchorV1 { v: 1, roles: { "inbox": { version: 2, address: Some(<32 bytes>) } } }
 ```
 
-Owners (re)publish the anchor + an empty v2 inbox Put on every
-create/resume (idempotent). Readers subscribe to the anchor alongside the
+Owners (re)publish the anchor + a seed Put of their v2 inbox AND feed on
+every create/resume (idempotent — both contracts merge a re-Put to a no-op,
+and the feed seed is versioned below any real profile/follows so it cannot
+clobber them). The feed half is issue #79: the feed rotated after this was
+written (#64, #67), and an account that never re-Put it can only Update a
+contract its node does not have. Readers subscribe to the anchor alongside the
 feed; a future v3 rotation publishes a new role entry instead of stranding
 readers — clients that know the anchor can GET by the address it names
 without holding the wasm that derives it.
