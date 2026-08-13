@@ -206,19 +206,26 @@ async fn send_inbox_pointer(
     };
     // Anonymous pointers must carry a proof-of-work stamp (issue #51);
     // attested (ghost-key) pointers skip PoW. The solve is a synchronous
-    // hashcash loop at the compiled floor — a fraction of a second, but it
-    // runs on the UI thread (ponytail: move to a Web Worker if it ever
-    // stutters posting). No control-cell record is attached yet, so admission
-    // uses the floor.
+    // hashcash loop — a fraction of a second at the floor, longer under a
+    // raise — and it runs on the UI thread (ponytail: move to a Web Worker if
+    // it ever stutters posting).
+    //
+    // Attaching the record (issue #66) is what LATCHES the raise into this
+    // inbox's state, so every later write there is held to it too.
+    // ponytail: an inbox no #66-aware client ever writes to keeps the floor
+    // until one does — there is no global push into per-owner instances.
+    // Closing that needs a publisher fan-out or an owner-side push on load.
+    let difficulty = POW_DIFFICULTY.read().clone();
     let authorized = if cred.attestation.is_none() {
-        AuthorizedReplyPointerV3::new_anon(ptr, sk, freebird_pow::POW_FLOOR_BITS)
+        let bits = freebird_pow::difficulty_bits(difficulty.as_ref());
+        AuthorizedReplyPointerV3::new_anon(ptr, sk, bits)
     } else {
         AuthorizedReplyPointerV3::new(ptr, sk)
     };
     let delta = InboxStateV3Delta {
         creds: Some([(replier, cred)].into_iter().collect()),
         pointers: Some(vec![authorized]),
-        pow_difficulty: None,
+        pow_difficulty: difficulty,
     };
     api::update_inbox(target_author, delta).await
 }
@@ -443,20 +450,33 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
             last_active: keys::now_ms(),
         };
         // Anonymous listings must carry a proof-of-work stamp (issue #51);
-        // attested listings skip it. Floor-difficulty solve, on the UI thread
-        // (see send_inbox_pointer).
+        // attested listings skip it. Solve on the UI thread (see
+        // send_inbox_pointer).
+        //
+        // Solve to the NEWER of the difficulty cell we track and the one the
+        // directory state has already latched (issue #66) — gossip can carry
+        // a raise into the directory before our cell subscription sees it,
+        // and solving to the older one would just bounce the listing.
+        let mut difficulty = POW_DIFFICULTY.read().clone();
+        freebird_pow::adopt_difficulty(
+            &mut difficulty,
+            DIRECTORY.read().as_ref().and_then(|d| d.pow_difficulty.as_ref()),
+        );
         let authorized = match att {
             Some(att) => AuthorizedListingV3::new(listing, &sk, Some(att)),
-            None => AuthorizedListingV3::new_anon(listing, &sk, freebird_pow::POW_FLOOR_BITS),
+            None => {
+                let bits = freebird_pow::difficulty_bits(difficulty.as_ref());
+                AuthorizedListingV3::new_anon(listing, &sk, bits)
+            }
         };
-        api::put_directory_listing(&authorized).await?;
+        api::put_directory_listing(&authorized, difficulty.clone()).await?;
         // Optimistic local apply so Discover shows us immediately.
         if let Some(dir) = DIRECTORY.write().as_mut() {
             let _ = dir.apply_delta(
                 &keys::directory_params(),
                 &directory_contract::DirectoryDeltaV3 {
                     listings: vec![authorized.clone()],
-                    pow_difficulty: None,
+                    pow_difficulty: difficulty,
                 },
             );
         }

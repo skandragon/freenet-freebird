@@ -192,6 +192,19 @@ pub fn control_cell_instance_id() -> ContractInstanceId {
     *control_cell_key().id()
 }
 
+/// The publisher's anonymous-PoW difficulty cell (issue #66): same frozen
+/// cell wasm, purpose "pow" — a separate address from control so a build
+/// record can never be read as a difficulty record. Clients read it to solve
+/// at the current bar and to relay the record into the contracts it governs.
+pub fn pow_cell_key() -> ContractKey {
+    let params = cell_contract::to_cbor(&freebird_pow::pow_params()).expect("params serialize");
+    contract_key(CELL_CONTRACT_WASM, params)
+}
+
+pub fn pow_cell_instance_id() -> ContractInstanceId {
+    *pow_cell_key().id()
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn now_ms() -> u64 {
     js_sys::Date::now() as u64
@@ -277,6 +290,13 @@ mod tests {
             "6Jj6CndZ2DzkxRyhiriFoj7Bq6ewMDBCMJ4uiofdXyUn",
             "2Qyn5i8GzxsigkCtR1KWk9i72oRpc5Th5FuHdgZEnNdF",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
+            // The PoW difficulty cell (#66) is deliberately NOT pinned here:
+            // freebird-pow's `test-publisher` feature swaps the compiled
+            // publisher key, and workspace feature unification turns it on
+            // for some targets, so its derived address is build-dependent.
+            // The properties a pin would protect are already covered — cell
+            // wasm bytes + derivation by the control-cell entry above, and
+            // the publisher key by freebird-pow's publisher_key_matches_control.
             "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
             "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
             "328eVhTm35uvJBnw35kXkNpCAvafvVpH5UoyPg7jGyxm",

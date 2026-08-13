@@ -14,21 +14,34 @@
 //!   all peers agree on without coordination, so it is the only one that keeps
 //!   the CRDT convergent, and therefore the only difficulty an ADVERSARY is
 //!   actually held to. Set it to the guaranteed-minimum cost.
-//! - The DIFFICULTY carried in the control cell ([`difficulty_bits`]) is the
-//!   RETUNABLE honest-client bar: a publisher-signed record, verified
-//!   in-contract, that the client attaches to its own write and the contract
-//!   enforces at admission. Raising it raises the cost for every compliant
-//!   client with NO wasm rebuild (the "wasm-baked-constant" objection). It is
-//!   clamped to `[POW_FLOOR_BITS, POW_CEILING_BITS]` so a compromised or
-//!   fat-fingered publisher record can neither drop below the floor nor price
-//!   honest users out.
+//! - The DIFFICULTY is the RETUNABLE bar: a publisher-signed record
+//!   ([`difficulty_bits`]), verified in-contract, that a write carries and
+//!   the contract then LATCHES INTO ITS STATE ([`adopt_difficulty`]). Raising
+//!   it raises the cost with NO wasm rebuild (the "wasm-baked-constant"
+//!   objection). It is clamped to `[POW_FLOOR_BITS, POW_CEILING_BITS]` so a
+//!   compromised or fat-fingered publisher record can neither drop below the
+//!   floor nor price honest users out.
 //!
-//! ponytail: dynamic difficulty in a CRDT bottoms out at the compiled floor —
-//! an adversary omits the (optional) control record and pays only the floor,
-//! and node-to-node gossip re-admits at the floor so replicas converge. The
-//! control cell governs the honest submission path, not the adversary's floor;
-//! raise `POW_FLOOR_BITS` (a deliberate wasm rotation) to move the adversary
-//! floor.
+//! # Why the difficulty lives in the STATE (issue #66)
+//!
+//! #65 carried the difficulty record on the DELTA only. freenet-stdlib's
+//! `update_state` gets no `RelatedContracts`, so the control cell can't be
+//! read live at merge time — and a delta-only record is one an attacker
+//! simply omits, paying the compiled floor while the knob bound honest
+//! writers alone. `update_state` DOES get the state, so the record now
+//! rides there: a delta's record is adopted into state by [`adopt_difficulty`]
+//! (publisher-signed, strictly increasing `seq`), and every subsequent
+//! admission is enforced against the LATCHED bits. An attacker can neither
+//! forge a record (no publisher key) nor downgrade one (seq is monotone) nor
+//! omit their way past it (the bar comes from state, not from their write).
+//!
+//! ponytail: a raise is not retroactive and not instantaneous. Entries seated
+//! before it stay seated (full-state `verify` remains floor-only — that is
+//! the convergent, fabricated-state-facing invariant), and an entry admitted
+//! at a replica that has not yet received the raise is rejected by one that
+//! has, so tier membership can differ for the propagation window. Both tiers
+//! are LWW-evicting sets that authors republish into, so that divergence ages
+//! out; the alternative (a raise nobody is bound by) is worse.
 
 use cell_contract::{CellParametersV1, SignedCellV1};
 use ed25519_dalek::VerifyingKey;
@@ -119,6 +132,31 @@ pub fn difficulty_bits(record: Option<&SignedCellV1>) -> u8 {
             .clamp(POW_FLOOR_BITS, POW_CEILING_BITS),
         _ => POW_FLOOR_BITS,
     }
+}
+
+/// The `seq` of a latched difficulty record; 0 when there is none. Rides the
+/// state summary so a raise propagates on its own, without waiting for a
+/// listing/pointer delta to carry it.
+pub fn difficulty_seq(record: Option<&SignedCellV1>) -> u64 {
+    record.map_or(0, |c| c.seq)
+}
+
+/// Latch `incoming` into `held` if it is a genuine publisher record that
+/// strictly supersedes what is held. Returns whether `held` changed.
+///
+/// This is the whole of #66's fix: monotone in `seq` and gated on the
+/// publisher signature, so the only party who can move the bar — in either
+/// direction — is the publisher. An attacker can replay an old record (no
+/// effect) or omit one (no effect); they cannot lower the latched bar, and
+/// the bar they must clear is the latched one, not the one they chose to
+/// send.
+pub fn adopt_difficulty(held: &mut Option<SignedCellV1>, incoming: Option<&SignedCellV1>) -> bool {
+    let Some(cell) = incoming else { return false };
+    if cell.seq <= difficulty_seq(held.as_ref()) || cell.check(&pow_params()).is_err() {
+        return false;
+    }
+    *held = Some(cell.clone());
+    true
 }
 
 /// blake3 over domain-tag ‖ key ‖ binding ‖ nonce. `key` is the anonymous
@@ -270,5 +308,26 @@ mod tests {
         let rec = SignedCellV1::new(&sk, POW_PURPOSE, 1, difficulty_body(99));
         assert!(rec.check(&params).is_ok());
         assert_eq!(rec.body[0], POW_CEILING_BITS, "body clamps to ceiling");
+    }
+
+    /// Issue #66: nothing an attacker can mint moves the latched bar. (The
+    /// publisher-signed accept path needs the `test-publisher` key, so it is
+    /// exercised in the directory/inbox crates, which enable that feature.)
+    #[test]
+    fn adopt_rejects_forged_and_stale() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let forged = SignedCellV1::new(&sk, POW_PURPOSE, 9, difficulty_body(26));
+
+        let mut held = None;
+        assert!(!adopt_difficulty(&mut held, Some(&forged)), "unsigned by publisher");
+        assert!(held.is_none());
+        assert!(!adopt_difficulty(&mut held, None));
+
+        // A held record is never displaced by an equal-or-lower seq, even a
+        // genuine one — so a replayed old record cannot walk difficulty back.
+        held = Some(SignedCellV1::new(&sk, POW_PURPOSE, 5, difficulty_body(24)));
+        let stale = SignedCellV1::new(&sk, POW_PURPOSE, 5, difficulty_body(20));
+        assert!(!adopt_difficulty(&mut held, Some(&stale)));
+        assert_eq!(difficulty_seq(held.as_ref()), 5);
     }
 }

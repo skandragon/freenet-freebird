@@ -520,6 +520,11 @@ pub fn App() -> Element {
                 if let Err(e) = api::fetch_control().await {
                     api::log(&format!("control fetch failed: {e}"));
                 }
+                // The publisher's anonymous-PoW difficulty (issue #66). A
+                // failure here just leaves us at the compiled floor.
+                if let Err(e) = api::fetch_pow_difficulty().await {
+                    api::log(&format!("pow difficulty fetch failed: {e}"));
+                }
                 // Auto-discover the Identity Vault's current delegate.
                 match crate::ghostkey::discover_vault_delegate().await {
                     Ok(key) => {

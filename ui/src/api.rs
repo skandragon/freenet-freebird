@@ -425,11 +425,32 @@ pub async fn fetch_control() -> Result<(), String> {
     .await
 }
 
+/// GET + subscribe the publisher's PoW difficulty cell (issue #66).
+pub async fn fetch_pow_difficulty() -> Result<(), String> {
+    track(keys::pow_cell_key(), TrackedKind::Pow);
+    send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: keys::pow_cell_instance_id(),
+        return_contract_code: false,
+        subscribe: true,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
 /// PUT our directory listing. Put creates the directory on the very first
 /// listing network-wide and the contract's per-author LWW merge handles
 /// every later one (same pattern as avatars).
-pub async fn put_directory_listing(listing: &AuthorizedListingV3) -> Result<(), String> {
-    let mut state = DirectoryStateV4::default();
+pub async fn put_directory_listing(
+    listing: &AuthorizedListingV3,
+    pow_difficulty: Option<cell_contract::SignedCellV1>,
+) -> Result<(), String> {
+    let mut state = DirectoryStateV4 {
+        // Carry the difficulty record so this PUT latches the raise into the
+        // directory rather than merging in a state that has forgotten it
+        // (issue #66). The merge is monotone, so an older record is a no-op.
+        pow_difficulty,
+        ..DirectoryStateV4::default()
+    };
     let tier = if listing.is_anon() {
         &mut state.anon
     } else {
@@ -1075,6 +1096,24 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8], is_full_state: bool) {
                 Err(e) => log(&format!("bad control cell state: {e}")),
             }
         }
+        TrackedKind::Pow => {
+            // State and delta are both one full signed cell. `adopt_difficulty`
+            // is the SAME rule the contracts apply (publisher signature +
+            // strictly increasing seq), so the client can never end up solving
+            // against a record a contract would refuse to latch.
+            match cell_contract::from_cbor::<cell_contract::SignedCellV1>(bytes) {
+                Ok(cell) => {
+                    if let Err(e) = cell.check(&freebird_pow::pow_params()) {
+                        log(&format!("rejected invalid PoW difficulty cell: {e}"));
+                        return;
+                    }
+                    // A re-delivery of one we already hold is normal (a
+                    // subscription resends on reconnect) — silently a no-op.
+                    freebird_pow::adopt_difficulty(&mut POW_DIFFICULTY.write(), Some(&cell));
+                }
+                Err(e) => log(&format!("bad PoW difficulty cell state: {e}")),
+            }
+        }
         TrackedKind::Inbox(author) => {
             let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
             let params = keys::inbox_params(&vk);
@@ -1329,6 +1368,7 @@ pub enum TrackedKind {
     Directory,
     LegacyDirectory,
     Control,
+    Pow,
 }
 
 pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> =
