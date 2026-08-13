@@ -1722,6 +1722,16 @@ fn VerifyBox() -> Element {
                      presence durable: verified replies and listings are never \
                      crowded out."
                 }
+                p { class: "muted",
+                    "Worth knowing before you buy: a Ghost Key costs money and \
+                     that money funds Freenet. Issuance is centrally operated by \
+                     freenet.org — payment can be declined or geo-blocked, and a \
+                     compromise of the master key could mint unlimited check \
+                     marks. Verification is not centralized: Freebird's contracts \
+                     check the certificate chain themselves. Nothing here needs a \
+                     Ghost Key, so if the mint ever goes away you lose durability, \
+                     not access."
+                }
                 match has_identity {
                     Some(true) => rsx! {
                         p { span { class: "check", "✔" } " Ghost Key detected in your vault." }

@@ -1,18 +1,22 @@
 # Freebird — a microblog on Freenet
 
-2026-08-09. Status: approved design, pre-implementation.
+2026-08-09. Status: implemented, **amended** by
+`2026-08-10-anonymous-parity.md` — that spec replaced the ghostkey write gate
+described here with a two-tier slot policy. Where the two disagree, it wins.
 
 Twitter-like microblogging built entirely on Freenet: no server, per-author
 feed contracts, per-author reply inboxes, client-side aggregation. Signup is
-anonymous; a Ghost Key buys a verified check mark and write access to shared
+anonymous; a Ghost Key buys a verified check mark and durable slots on shared
 surfaces.
 
 ## Trust model (one rule)
 
-**Your own feed is free; other people's attention costs a Ghost Key.**
-Anyone can post to their own feed with a locally generated key. Any
-shared-write surface — reply inboxes now; town square, mentions later —
-requires a valid Ghost Key certificate on writes.
+**Everyone writes; a Ghost Key buys durability.** Anyone can post to their
+own feed with a locally generated key, and anyone can write to the
+shared-write surfaces — reply inboxes and the directory now; town square,
+mentions later. Those surfaces cap anonymous and attested writers in separate
+tiers: under load anonymous writers are evicted first, attested writers are
+never crowded out by them.
 
 ## Goals (MVP)
 
@@ -21,7 +25,7 @@ requires a valid Ghost Key certificate on writes.
 - Post short messages (~1–2 KB) to your own feed.
 - Follow authors by key/address; home feed merges their feeds client-side.
 - Replies: content lives in the replier's feed (`in_reply_to`); discovery
-  via a per-author reply inbox contract (ghostkey-gated writes).
+  via a per-author reply inbox contract (open writes, two-tier slot policy).
 - Check mark: optional Ghost Key attestation on a feed, verified by the
   contract, rendered by the UI.
 - Public follow list.
@@ -76,9 +80,10 @@ Reply *content* is a post in the replier's own feed carrying `in_reply_to`
   fingerprint, target post id, reply id, timestamp). Caps: 300 pointers
   globally, 8 per ghost-key fingerprint (bounds what one purchase can
   occupy); cleanup prunes creds no pointer references.
-- **Writes require a valid Ghost Key cert** chained to the master key.
-  Anonymous replies still exist in the replier's feed but are only seen by
-  their followers.
+- **Writes are open to everyone** (amended: v1 required a valid Ghost Key
+  cert chained to the master key). Anonymous and attested repliers hold
+  separate slot tiers; see `2026-08-10-anonymous-parity.md` for the caps,
+  fingerprints, and eviction order that superseded the caps above.
 - **Open-write hardening** (doorbell lessons): reject far-future timestamps
   in validate, clamp before merge, retention horizon, plus a per-replier cap
   so one ghostkey holder cannot evict everyone else's pointers.
@@ -172,8 +177,9 @@ ui/              Dioxus web app
   freenet host imports; `getrandom` "custom" stub defuses river#241).
 
 - Signup: anonymous, local keygen in delegate. Ghost Key NOT required to post.
-- Ghost Key = check mark (optional feed attestation) + required for
-  shared-write surfaces (reply inbox now, town square/mentions later).
+- Ghost Key = check mark (optional feed attestation) + a durable, uncrowdable
+  slot tier on shared-write surfaces. (Amended: v1 made it *required* for
+  those surfaces; the two-tier policy replaced that gate.)
 - Reply discovery (inbox contract) is in the MVP.
 - UI stack: Dioxus/Rust (shared types with core; River-proven patterns).
 - Follow list: public, in feed contract state.

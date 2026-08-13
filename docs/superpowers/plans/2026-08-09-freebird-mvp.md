@@ -1,5 +1,10 @@
 # Freebird MVP Implementation Plan
 
+> **Historical — completed and superseded.** The ghostkey write gate described
+> here was replaced by the two-tier slot policy in
+> `docs/superpowers/plans/2026-08-10-anonymous-parity.md`. Do not build from
+> this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Twitter-like microblog on Freenet: per-author feed contracts, per-author reply inboxes, anonymous signup, Ghost Key check marks, Dioxus UI. Spec: `docs/superpowers/specs/2026-08-09-freebird-design.md`.
