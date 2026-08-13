@@ -8,7 +8,7 @@ use freebird_core::attestation::AttestationV2;
 use freebird_core::delegate_api::FreebirdDelegateRequest;
 use freebird_core::feed::{AttestationSlot, FeedStateV1, FeedStateV1Delta, PostsV1};
 use freebird_core::types::{
-    AuthorizedFollows, AuthorizedProfile, FollowsV1, PostId, PostRef, ProfileV1,
+    AuthorizedFollows, AuthorizedPost, AuthorizedProfile, FollowsV1, PostId, PostRef, ProfileV1,
 };
 use inbox_contract::state::{
     AuthorizedReplyPointerV3, InboxStateV3Delta, ReplierCredV3, ReplyPointerV3,
@@ -223,6 +223,119 @@ async fn send_inbox_pointer(
     api::update_inbox(target_author, delta).await
 }
 
+/// Legacy posts that still owe a v2 copy: everything in the v1 feed the v2
+/// feed doesn't already hold, re-signed under the #47 canonical payload (v1
+/// signed bare CBOR, so the old signatures don't verify here). `PostId` did
+/// not change across the rotation, so re-signing preserves every id that
+/// inbox pointers and `in_reply_to` links refer to.
+fn posts_to_migrate(
+    legacy: &[AuthorizedPost],
+    current: &PostsV1,
+    sk: &SigningKey,
+) -> Vec<AuthorizedPost> {
+    let held: std::collections::BTreeSet<PostId> =
+        current.posts.iter().map(|p| p.post.id).collect();
+    legacy
+        .iter()
+        .filter(|p| !held.contains(&p.post.id))
+        .map(|p| AuthorizedPost::new(p.post.clone(), sk))
+        .collect()
+}
+
+/// One-time forward migration of this account's v1-era data into the v2
+/// contracts (issue #56), so the `read_v1_*` dual-read flags can actually be
+/// turned off without losing it:
+///
+/// - v1 feed posts → the v2 feed, re-signed (ids preserved).
+/// - v1-era replies → a v3 pointer in each target author's inbox.
+/// - follows → a v3 follow announcement in each followed author's inbox.
+///
+/// The directory needs nothing here: the listing-refresh effect in `App`
+/// already republishes our listing under the v2 key once per session.
+///
+/// Owner-driven by necessity, and that is the ceiling: pointers we RECEIVED
+/// in v1 are signed by their repliers and only those repliers can re-sign
+/// them, so the window closes cleanly only once enough of the network has
+/// run this. Nothing is destroyed either way — the v1 state stays where it is.
+///
+/// `started_ms` is the in-progress marker's stamp, reused across retries so
+/// a resumed run re-derives identical follow announcements.
+pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
+    let sk = signing_key()?;
+    let author = sk.verifying_key().to_bytes();
+    let legacy = LEGACY_FEEDS
+        .read()
+        .get(&author)
+        .cloned()
+        .flatten()
+        .ok_or("legacy feed not loaded")?;
+    let current = own_feed().ok_or("feed not loaded")?;
+
+    // Mark in-progress BEFORE the first write: an interrupted run must resume
+    // with the SAME stamp, or its follow announcements get fresh PostIds and
+    // pile up as duplicate pointers in every followed author's inbox.
+    api::kv_request(FreebirdDelegateRequest::Store {
+        key: V1_MIGRATION_KEY.into(),
+        value: started_ms.to_string().into_bytes(),
+    })
+    .await?;
+    *V1_MIGRATION.write() = Some(V1Migration::Running(started_ms));
+
+    let posts = posts_to_migrate(&legacy.posts.posts, &current.posts, &sk);
+    if !posts.is_empty() {
+        let mut delta = empty_delta();
+        delta.posts = Some(posts.clone());
+        api::update_own_feed(delta).await?;
+        apply_own_posts(posts);
+    }
+
+    // Slot tier from the CURRENT (v2) attestation — a v1 AttestationV1 can't
+    // be lifted to v2 (it lacks the proof of possession), so an unverified
+    // account migrates at the anonymous tier and pays a floor PoW solve per
+    // pointer on the UI thread.
+    // ponytail: same ceiling `send_inbox_pointer` already carries — move
+    // both to a Web Worker if a long reply backlog stutters startup.
+    let att = current.attestation.0.clone();
+    for post in &legacy.posts.posts {
+        let Some(target) = post.post.in_reply_to else {
+            continue;
+        };
+        send_inbox_pointer(
+            &sk,
+            att.clone(),
+            target.author,
+            target.post,
+            post.post.id,
+            post.post.time,
+        )
+        .await?;
+    }
+
+    // Follow announcements only ever existed as inbox pointers, so the whole
+    // follower list dies with the window. Re-announce every current follow,
+    // stamped with the migration's start time (see `started_ms` above).
+    let announce_id = PostId::compute(&sk.verifying_key(), started_ms, "follow", &None);
+    for target in &current.follows.follows.follows {
+        send_inbox_pointer(
+            &sk,
+            att.clone(),
+            *target,
+            FOLLOW_ANNOUNCE_TARGET,
+            announce_id,
+            started_ms,
+        )
+        .await?;
+    }
+
+    api::kv_request(FreebirdDelegateRequest::Store {
+        key: V1_MIGRATION_KEY.into(),
+        value: b"done".to_vec(),
+    })
+    .await?;
+    *V1_MIGRATION.write() = Some(V1Migration::Done);
+    Ok(())
+}
+
 fn apply_own_posts(posts: Vec<freebird_core::types::AuthorizedPost>) {
     let Some(author) = own_author() else { return };
     let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
@@ -419,4 +532,67 @@ pub async fn complete_verification(
         }
     }
     Ok(tier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+    use freebird_core::types::PostV1;
+
+    /// A post signed the PRE-#47 way (bare CBOR) — what a v1 feed holds.
+    fn legacy_post(sk: &SigningKey, time: u64, content: &str) -> AuthorizedPost {
+        let post = PostV1 {
+            id: PostId::compute(&sk.verifying_key(), time, content, &None),
+            time,
+            content: content.into(),
+            in_reply_to: None,
+        };
+        let signature = sk.sign(&freebird_core::to_cbor(&post).unwrap());
+        AuthorizedPost { post, signature }
+    }
+
+    #[test]
+    fn migrated_posts_keep_their_ids_and_verify_under_v2() {
+        let sk = SigningKey::from_bytes(&[7; 32]);
+        let legacy = vec![legacy_post(&sk, 10, "one"), legacy_post(&sk, 20, "two")];
+        // Precondition: the v1 signatures are exactly what v2 rejects.
+        assert!(legacy[0].verify_signature(&sk.verifying_key()).is_err());
+
+        let out = posts_to_migrate(&legacy, &PostsV1::default(), &sk);
+        assert_eq!(out.len(), 2);
+        for (a, b) in out.iter().zip(&legacy) {
+            assert_eq!(a.post, b.post, "content and id must survive re-signing");
+            a.verify_signature(&sk.verifying_key()).unwrap();
+        }
+    }
+
+    /// Interrupted-migration recovery: a resumed run re-sends only what the
+    /// v2 feed is still missing, and a completed one is a no-op.
+    #[test]
+    fn migration_resumes_without_redoing_landed_posts() {
+        let sk = SigningKey::from_bytes(&[9; 32]);
+        let legacy = vec![
+            legacy_post(&sk, 10, "one"),
+            legacy_post(&sk, 20, "two"),
+            legacy_post(&sk, 30, "three"),
+        ];
+        // First attempt died after the first post landed in the v2 feed.
+        let partial = PostsV1 {
+            posts: vec![AuthorizedPost::new(legacy[0].post.clone(), &sk)],
+        };
+        let out = posts_to_migrate(&legacy, &partial, &sk);
+        assert_eq!(
+            out.iter().map(|p| p.post.time).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+
+        let done = PostsV1 {
+            posts: legacy
+                .iter()
+                .map(|p| AuthorizedPost::new(p.post.clone(), &sk))
+                .collect(),
+        };
+        assert!(posts_to_migrate(&legacy, &done, &sk).is_empty());
+    }
 }

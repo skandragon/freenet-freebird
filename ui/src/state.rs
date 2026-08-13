@@ -30,8 +30,10 @@ pub static FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<FeedStateV1>>> =
 
 /// LEGACY (pre-#64) feed states by author key — dual-read migration window
 /// (issue #64 rotated the feed contract and changed its format in place).
-/// `None` value = requested, not yet arrived. Read-only: posts here are
-/// merged into the display; nothing writes back. Gated on `read_v1_feed`.
+/// `None` value = requested, not yet arrived. Never written back to the v1
+/// contract; our OWN entry is the source for the forward migration (#56,
+/// `actions::migrate_v1`), which re-signs it into the v2 feed. Gated on
+/// `read_v1_feed`.
 pub static LEGACY_FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<LegacyFeedState>>> =
     Signal::global(BTreeMap::new);
 
@@ -75,6 +77,38 @@ pub static CONTROL: GlobalSignal<Option<freebird_control::ControlV1>> = Signal::
 /// Highest build the user dismissed the update banner for. None until the
 /// delegate answers (the banner waits, so it never flashes pre-dismissal).
 pub static DISMISSED_BUILD: GlobalSignal<Option<u64>> = Signal::global(|| None);
+
+/// Delegate key holding the one-time v1→v2 forward-migration marker (#56).
+pub const V1_MIGRATION_KEY: &str = "v1_migration";
+
+/// State of this account's one-time v1→v2 forward migration (issue #56),
+/// persisted in the delegate under [`V1_MIGRATION_KEY`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum V1Migration {
+    /// Never started.
+    Pending,
+    /// Started at this wall-clock ms and not confirmed complete. The stamp
+    /// is REUSED by a retry so re-sent follow announcements keep the same
+    /// PostIds — the inbox dedups them instead of stacking duplicates.
+    Running(u64),
+    /// Every write landed; never runs again.
+    Done,
+}
+
+impl V1Migration {
+    /// Absent or unparseable = never started: the migration is idempotent,
+    /// so re-running is always safer than skipping.
+    pub fn decode(value: Option<&[u8]>) -> Self {
+        match value.and_then(|v| std::str::from_utf8(v).ok()) {
+            None => Self::Pending,
+            Some("done") => Self::Done,
+            Some(s) => s.parse().map(Self::Running).unwrap_or(Self::Pending),
+        }
+    }
+}
+
+/// None until the delegate answers.
+pub static V1_MIGRATION: GlobalSignal<Option<V1Migration>> = Signal::global(|| None);
 
 /// Result of asking the freebird delegate for `posting_key`:
 /// None = not answered yet; Some(None) = no account stored (onboard);
@@ -236,6 +270,16 @@ mod tests {
         assert_eq!(View::from_hash("#/thread/junk"), View::Home);
         assert_eq!(View::from_hash("#/author/junk"), View::Home);
     }
+
+    #[test]
+    fn migration_marker_decode() {
+        assert_eq!(V1Migration::decode(None), V1Migration::Pending);
+        assert_eq!(V1Migration::decode(Some(b"done")), V1Migration::Done);
+        assert_eq!(V1Migration::decode(Some(b"1700")), V1Migration::Running(1700));
+        // Garbage re-runs the (idempotent) migration rather than skipping it.
+        assert_eq!(V1Migration::decode(Some(b"")), V1Migration::Pending);
+        assert_eq!(V1Migration::decode(Some(b"\xff\xfe")), V1Migration::Pending);
+    }
 }
 
 /// The Identity Vault's current delegate key, auto-discovered at startup
@@ -250,8 +294,9 @@ pub static PENDING_FOLLOW: GlobalSignal<Option<[u8; 32]>> = Signal::global(|| No
 
 /// A control-cell feature flag, defaulting when control state is absent or
 /// the flag unset. The v1 dual-read window is gated on `read_v1_inbox` /
-/// `read_v1_directory` (default ON) so the publisher can close it network-
-/// wide once the migration completes.
+/// `read_v1_directory` / `read_v1_feed` (default ON) so the publisher can
+/// close it network-wide once enough clients have run the forward migration
+/// (issue #56, `actions::migrate_v1`).
 pub fn flag_bool(name: &str, default: bool) -> bool {
     CONTROL
         .read()
