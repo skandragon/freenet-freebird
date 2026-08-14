@@ -104,11 +104,8 @@ fn post_key(author: &[u8; 32], id: &freebird_core::types::PostId) -> String {
 }
 
 fn author_name(author: &[u8; 32]) -> String {
-    FEEDS
-        .read()
-        .get(author)
-        .and_then(|f| f.as_ref())
-        .map(|f| f.profile.profile.name.clone())
+    effective_profile(author)
+        .map(|p| p.name)
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| short_key(author))
 }
@@ -700,8 +697,7 @@ pub fn App() -> Element {
     // Subscribe to newly-followed feeds as the follow list changes/arrives.
     use_effect(move || {
         let follows: Vec<[u8; 32]> = own_author()
-            .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-            .map(|f| f.follows.follows.follows.iter().copied().collect())
+            .map(|a| effective_follows(&a).into_iter().collect())
             .unwrap_or_default();
         let known: Vec<[u8; 32]> = FEEDS.read().keys().copied().collect();
         for target in follows {
@@ -1099,14 +1095,13 @@ fn Timeline() -> Element {
     // timeline (thread expansion caches repliers' feeds) — filter to the
     // feeds actually followed.
     let posts: Vec<([u8; 32], AuthorizedPost)> = {
-        let feeds = FEEDS.read();
+        // Built before the FEEDS borrow: `effective_follows` reads it too.
         let mut wanted: std::collections::BTreeSet<[u8; 32]> = Default::default();
         if let Some(own) = own_author() {
             wanted.insert(own);
-            if let Some(Some(own_feed)) = feeds.get(&own) {
-                wanted.extend(own_feed.follows.follows.follows.iter().copied());
-            }
+            wanted.extend(effective_follows(&own));
         }
+        let feeds = FEEDS.read();
         let mut all: Vec<([u8; 32], AuthorizedPost)> = feeds
             .iter()
             .filter(|(author, _)| wanted.contains(*author))
@@ -1400,9 +1395,7 @@ fn AuthorPage(author: [u8; 32]) -> Element {
     }
 
     let own = own_author();
-    let following = own
-        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-        .is_some_and(|f| f.follows.follows.follows.contains(&author));
+    let following = own.is_some_and(|a| effective_follows(&a).contains(&author));
 
     rsx! {
         div { class: "thread-page",
@@ -1597,10 +1590,8 @@ fn Discover() -> Element {
     });
 
     let own = own_author();
-    let own_follows: std::collections::BTreeSet<[u8; 32]> = own
-        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-        .map(|f| f.follows.follows.follows.clone())
-        .unwrap_or_default();
+    let own_follows: std::collections::BTreeSet<[u8; 32]> =
+        own.map(|a| effective_follows(&a)).unwrap_or_default();
 
     rsx! {
         div { class: "profile-page",
@@ -1654,8 +1645,7 @@ fn FollowBox() -> Element {
     let mut input = use_signal(String::new);
     let mut error = use_signal(String::new);
     let follows: Vec<[u8; 32]> = own_author()
-        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-        .map(|f| f.follows.follows.follows.iter().copied().collect())
+        .map(|a| effective_follows(&a).into_iter().collect())
         .unwrap_or_default();
 
     rsx! {
@@ -1742,13 +1732,7 @@ fn FollowersBox() -> Element {
         let feeds = FEEDS.read();
         confirmed_followers(&pointers, &feeds, &author)
     };
-    let own_follows: std::collections::BTreeSet<[u8; 32]> = FEEDS
-        .read()
-        .get(&author)
-        .cloned()
-        .flatten()
-        .map(|f| f.follows.follows.follows.clone())
-        .unwrap_or_default();
+    let own_follows: std::collections::BTreeSet<[u8; 32]> = effective_follows(&author);
 
     // Fetch announcers' feeds we don't have yet, to verify their claims.
     use_effect(move || {
@@ -1987,7 +1971,6 @@ fn ProfilePage() -> Element {
     let Some(author) = own_author() else {
         return rsx! {};
     };
-    let feed: Option<FeedStateV1> = FEEDS.read().get(&author).cloned().flatten();
     let full_key = bs58::encode(&author).into_string();
 
     rsx! {
@@ -2001,9 +1984,9 @@ fn ProfilePage() -> Element {
                     " {author_name(&author)}"
                     if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                 }
-                if let Some(f) = &feed {
-                    if !f.profile.profile.bio.is_empty() {
-                        p { "{f.profile.profile.bio}" }
+                if let Some(bio) = effective_profile(&author).map(|p| p.bio) {
+                    if !bio.is_empty() {
+                        p { "{bio}" }
                     }
                 }
                 p { class: "muted keyline", "Profile picture (shown on your posts; auto-cropped square):" }
@@ -2069,9 +2052,12 @@ fn ProfilePage() -> Element {
                 } else {
                     button { class: "link",
                         onclick: move |_| {
-                            if let Some(f) = FEEDS.read().get(&author).cloned().flatten() {
-                                name.set(f.profile.profile.name.clone());
-                                bio.set(f.profile.profile.bio.clone());
+                            // Prefill from the EFFECTIVE profile: against the
+                            // empty seed the user would otherwise save a blank
+                            // bio over a legacy one they never saw (issue #82).
+                            if let Some(p) = effective_profile(&author) {
+                                name.set(p.name);
+                                bio.set(p.bio);
                             }
                             edit_error.set(String::new());
                             editing.set(true);

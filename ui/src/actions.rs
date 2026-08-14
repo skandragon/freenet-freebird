@@ -264,21 +264,45 @@ fn posts_to_migrate(
 
 /// Legacy identity that still owes a v2 copy: the v1 profile and follow list,
 /// re-signed under the #64 domain tags (the v1 signatures don't verify here).
-/// Each is skipped unless it is strictly newer than what the v2 feed already
-/// holds — a rotated feed starts at `seed_feed`'s version 0, so this normally
-/// carries both across, but an edit made after the upgrade must never be
-/// rolled back. Strictly-newer is also what makes the write land: the
-/// contract's LWW breaks equal-version ties by content hash, so an
-/// equal-version delta can be silently dropped.
+///
+/// The gate is "has the v2 record been written since the rotation?", NOT a
+/// comparison of the two version numbers. Those counters are separate
+/// lineages: the rotation reseeds v2 at `seed_feed`'s 0 while the legacy one
+/// carries the account's entire v1 history, so `legacy > current` measures
+/// which counter ran longer, not which record is fresher. Comparing them
+/// reverts post-rotation profile edits and — because the follows CRDT
+/// replaces the set wholesale rather than merging — silently drops every
+/// follow made since the upgrade.
+///
+/// An untouched v2 record is version 0 exactly (see `written_since_rotation`).
+/// Above 0 the user has written it themselves, over the effective list
+/// `state::effective_follows` already folds the legacy one into, so it
+/// supersedes the legacy record and is left alone. Writing at `current + 1`
+/// is also what makes the delta land: the contract's LWW breaks equal-version
+/// ties by content hash, so an equal-version delta can be silently dropped.
 fn identity_to_migrate(
     legacy: &LegacyFeedState,
     current: &FeedStateV1,
     sk: &SigningKey,
 ) -> (Option<AuthorizedProfile>, Option<AuthorizedFollows>) {
-    let profile = (legacy.profile.profile.version > current.profile.profile.version)
-        .then(|| AuthorizedProfile::new(legacy.profile.profile.clone(), sk));
-    let follows = (legacy.follows.follows.version > current.follows.follows.version)
-        .then(|| AuthorizedFollows::new(legacy.follows.follows.clone(), sk));
+    let profile = (!written_since_rotation(current.profile.profile.version)).then(|| {
+        AuthorizedProfile::new(
+            ProfileV1 {
+                version: current.profile.profile.version + 1,
+                ..legacy.profile.profile.clone()
+            },
+            sk,
+        )
+    });
+    let follows = (!written_since_rotation(current.follows.follows.version)).then(|| {
+        AuthorizedFollows::new(
+            FollowsV1 {
+                follows: legacy.follows.follows.follows.clone(),
+                version: current.follows.follows.version + 1,
+            },
+            sk,
+        )
+    });
     (profile, follows)
 }
 
@@ -478,6 +502,12 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
     let sk = signing_key()?;
     let current = own_feed().ok_or("feed not loaded")?;
     let mut follows = current.follows.follows.clone();
+    // Start from the EFFECTIVE list, not the v2 one: before `migrate_v1` runs
+    // the v2 record is the empty seed, so editing it directly would write a
+    // one-entry list over a legacy list the user can see and believes they
+    // have (issue #82). This is also what lets them unfollow a v1-era account
+    // during the window — against the raw seed that is a no-op.
+    follows.follows = effective_follows(&sk.verifying_key().to_bytes());
     let changed = if follow {
         follows.follows.insert(target)
     } else {
@@ -765,8 +795,13 @@ mod tests {
         let (profile, follows) = identity_to_migrate(&legacy, &current, &sk);
         let profile = profile.expect("display name and bio migrate");
         let follows = follows.expect("follow list migrates");
-        assert_eq!(profile.profile, legacy.profile.profile);
-        assert_eq!(follows.follows, legacy.follows.follows);
+        // Content carries across verbatim; the version is renumbered onto the
+        // v2 counter (legacy 2/3 -> 1), since the two lineages are unrelated.
+        assert_eq!(profile.profile.name, legacy.profile.profile.name);
+        assert_eq!(profile.profile.bio, legacy.profile.profile.bio);
+        assert_eq!(profile.profile.version, 1);
+        assert_eq!(follows.follows.follows, legacy.follows.follows.follows);
+        assert_eq!(follows.follows.version, 1);
         profile.verify_signature(&vk).unwrap();
         follows.verify_signature(&vk).unwrap();
 
@@ -791,13 +826,43 @@ mod tests {
         assert!(live.follows.follows.follows.contains(&target));
     }
 
-    /// An edit made after the upgrade but before the migration ran outranks
-    /// the legacy record and must not be rolled back to it.
+    /// Issue #82 regression. A write made after the upgrade but before the
+    /// migration ran must survive it — and the realistic shape of that state
+    /// is a LOW v2 version, not a high one: the rotation reseeds the v2
+    /// counter at 0, so the user's first rename and first follow both land at
+    /// version 1 while the legacy counter still carries their whole v1
+    /// history. The old `legacy.version > current.version` gate read `2 > 1`
+    /// and `12 > 1` as "legacy is fresher" and sent both through — and since
+    /// the follows CRDT replaces the set wholesale rather than merging,
+    /// `fresh` was silently wiped.
     #[test]
-    fn migration_never_rolls_back_a_newer_v2_record() {
+    fn post_rotation_writes_are_never_replaced_by_the_legacy_record() {
         let sk = SigningKey::from_bytes(&[12; 32]);
-        let legacy = legacy_feed(&sk, "alice", 2, &[[4u8; 32]], 3);
-        let current = v2_feed(&sk, "alice-renamed", 2, &[], 4);
+        let fresh = [2u8; 32];
+        // A long v1 life: two renames, a dozen follow/unfollow toggles.
+        let legacy = legacy_feed(&sk, "alice", 2, &[[1u8; 32]], 12);
+        // Since the rotation: renamed once, followed one person. Both v1.
+        let current = v2_feed(&sk, "alice-renamed", 1, &[fresh], 1);
+        // Pin the shape of the bug: this is a state the old gate got wrong.
+        assert!(legacy.profile.profile.version > current.profile.profile.version);
+        assert!(legacy.follows.follows.version > current.follows.follows.version);
+
         assert_eq!(identity_to_migrate(&legacy, &current, &sk), (None, None));
+    }
+
+    /// The two records are gated independently: a user who renamed themselves
+    /// but has not touched their follows since the rotation keeps the rename
+    /// and still gets their v1 follow list back.
+    #[test]
+    fn a_touched_profile_does_not_hold_back_an_untouched_follow_list() {
+        let sk = SigningKey::from_bytes(&[14; 32]);
+        let target = [4u8; 32];
+        let legacy = legacy_feed(&sk, "alice", 2, &[target], 3);
+        let current = v2_feed(&sk, "alice-renamed", 1, &[], 0);
+
+        let (profile, follows) = identity_to_migrate(&legacy, &current, &sk);
+        assert!(profile.is_none(), "the rename must stand");
+        let follows = follows.expect("an untouched follow list still migrates");
+        assert!(follows.follows.follows.contains(&target));
     }
 }
