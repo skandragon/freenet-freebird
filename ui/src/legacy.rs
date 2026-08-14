@@ -169,12 +169,13 @@ impl LegacyDirectoryState {
                 .map(|l| (l.listing.last_active, l.listing.author))
                 .min()
         };
-        let anon_count =
-            |m: &BTreeMap<[u8; 32], LegacyAuthorizedListing>| {
-                m.values().filter(|l| l.attestation.is_none()).count()
-            };
+        let anon_count = |m: &BTreeMap<[u8; 32], LegacyAuthorizedListing>| {
+            m.values().filter(|l| l.attestation.is_none()).count()
+        };
         while anon_count(&self.listings) > LEGACY_ANON_LISTINGS {
-            let Some((_, victim)) = oldest(&self.listings, true) else { break };
+            let Some((_, victim)) = oldest(&self.listings, true) else {
+                break;
+            };
             self.listings.remove(&victim);
         }
         while self.listings.len() > LEGACY_MAX_LISTINGS {
@@ -383,7 +384,9 @@ impl LegacyInboxState {
             }
         }
         let mut it = keep.iter();
-        self.pointers.pointers.retain(|_| *it.next().unwrap_or(&false));
+        self.pointers
+            .pointers
+            .retain(|_| *it.next().unwrap_or(&false));
 
         // Anonymous share cap: drop the OLDEST anonymous first.
         let anon_count = self.pointers.pointers.iter().filter(|p| is_anon(p)).count();
@@ -401,12 +404,7 @@ impl LegacyInboxState {
         // Global cap: oldest anonymous first, an attested one only when no
         // anonymous remain. Verified is never crowded out by anonymous.
         while self.pointers.pointers.len() > LEGACY_MAX_POINTERS {
-            let victim = self
-                .pointers
-                .pointers
-                .iter()
-                .position(is_anon)
-                .unwrap_or(0);
+            let victim = self.pointers.pointers.iter().position(is_anon).unwrap_or(0);
             self.pointers.pointers.remove(victim);
         }
 
@@ -552,7 +550,9 @@ mod tests {
         d.merge(&master, vec![listing(&k, 300)]);
         d.merge(&master, vec![listing(&k, 200)]);
         assert_eq!(
-            d.listings[&k.verifying_key().to_bytes()].listing.last_active,
+            d.listings[&k.verifying_key().to_bytes()]
+                .listing
+                .last_active,
             300,
             "per-author LWW keeps the newest last_active"
         );
@@ -670,7 +670,10 @@ mod tests {
                 pointers: Some(vec![forged, mismatched]),
             },
         );
-        assert!(s.pointers.pointers.is_empty(), "forged + mismatched dropped");
+        assert!(
+            s.pointers.pointers.is_empty(),
+            "forged + mismatched dropped"
+        );
 
         // A cred stored under the wrong key never seats.
         s.merge(
@@ -681,7 +684,9 @@ mod tests {
             },
         );
         assert!(
-            !s.creds.creds.contains_key(&other.verifying_key().to_bytes()),
+            !s.creds
+                .creds
+                .contains_key(&other.verifying_key().to_bytes()),
             "cred under wrong key rejected"
         );
     }
@@ -800,11 +805,10 @@ mod tests {
                 )]
                 .into(),
             },
-            pointers: LegacyPointers {
-                pointers: vec![ap],
-            },
+            pointers: LegacyPointers { pointers: vec![ap] },
         };
-        let inbox_hex = "a2656372656473a1656372656473a1982018ed1849182818c6182818d118c218c618ea18e9\
+        let inbox_hex =
+            "a2656372656473a1656372656473a1982018ed1849182818c6182818d118c218c618ea18e9\
              0318381890185918951861182918591827183a185c186318f91836183618c118461418ac18\
              87183718d1a26b706f7374696e675f6b65795820ed4928c628d1c2c6eae903389059956129\
              59273a5c63f93636c14614ac8737d16b6174746573746174696f6ef668706f696e74657273\
@@ -817,7 +821,7 @@ mod tests {
              1889189718a20a18b713186118190318ae18bc183418ce188118d3185818ce18ff186118fa\
              189618d418a918e918551869187a184318aa188718381879187b18a3189018ca18b118bb09\
              18811826188118ab18b0184818b1184b04051845185018a418fb18981835170c06"
-            .replace(['\n', ' '], "");
+                .replace(['\n', ' '], "");
         assert_eq!(
             hex(&freebird_core::to_cbor(&inbox).unwrap()),
             inbox_hex,
@@ -855,4 +859,3 @@ mod tests {
         );
     }
 }
-

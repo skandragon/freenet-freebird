@@ -53,7 +53,9 @@ fn app_base_url() -> String {
 fn sync_shell_hash(hash: &str) {
     let Some(win) = web_sys::window() else { return };
     // Top-level (no shell): the address bar is ours already.
-    let Ok(Some(parent)) = win.parent() else { return };
+    let Ok(Some(parent)) = win.parent() else {
+        return;
+    };
     if parent == win {
         return;
     }
@@ -66,7 +68,11 @@ fn sync_shell_hash(hash: &str) {
 
 /// Shareable "this is me, follow me" link.
 pub fn follow_link(author: &[u8; 32]) -> String {
-    format!("{}?follow={}", app_base_url(), bs58::encode(author).into_string())
+    format!(
+        "{}?follow={}",
+        app_base_url(),
+        bs58::encode(author).into_string()
+    )
 }
 
 /// Parse ?follow=<addr> (also accepted in the fragment) from the page URL.
@@ -90,15 +96,16 @@ pub fn short_key(author: &[u8; 32]) -> String {
 /// Stable diff key for a post rendered in a list. Without keys Dioxus diffs
 /// positionally, so open reply/thread state sticks to the slot, not the post.
 fn post_key(author: &[u8; 32], id: &freebird_core::types::PostId) -> String {
-    format!("{}:{}", bs58::encode(author).into_string(), bs58::encode(id.0).into_string())
+    format!(
+        "{}:{}",
+        bs58::encode(author).into_string(),
+        bs58::encode(id.0).into_string()
+    )
 }
 
 fn author_name(author: &[u8; 32]) -> String {
-    FEEDS
-        .read()
-        .get(author)
-        .and_then(|f| f.as_ref())
-        .map(|f| f.profile.profile.name.clone())
+    effective_profile(author)
+        .map(|p| p.name)
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| short_key(author))
 }
@@ -190,8 +197,8 @@ async fn shrink_to_avatar(bytes: Vec<u8>) -> Result<(String, Vec<u8>), String> {
     use base64::Engine;
     use wasm_bindgen::JsCast;
     let b64 = &base64::engine::general_purpose::STANDARD;
-    let mime = freebird_core::avatar::sniff_mime(&bytes)
-        .ok_or("not a png, jpeg, webp, or gif image")?;
+    let mime =
+        freebird_core::avatar::sniff_mime(&bytes).ok_or("not a png, jpeg, webp, or gif image")?;
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or("no document")?;
@@ -238,7 +245,10 @@ async fn shrink_to_avatar(bytes: Vec<u8>) -> Result<(String, Vec<u8>), String> {
     .map_err(|_| "draw failed")?;
     // JPEG: the one canvas encoder every browser honors with a quality knob.
     let url = canvas
-        .to_data_url_with_type_and_encoder_options("image/jpeg", &wasm_bindgen::JsValue::from_f64(0.85))
+        .to_data_url_with_type_and_encoder_options(
+            "image/jpeg",
+            &wasm_bindgen::JsValue::from_f64(0.85),
+        )
         .map_err(|_| "encode failed")?;
     let data = b64
         .decode(
@@ -461,11 +471,9 @@ pub fn App() -> Element {
                     Ok(()) => api::log("sent RegisterDelegate"),
                     Err(e) => api::log(&format!("delegate registration failed: {e}")),
                 }
-                match api::kv_request(
-                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
-                        key: "posting_key".into(),
-                    },
-                )
+                match api::kv_request(freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                    key: "posting_key".into(),
+                })
                 .await
                 {
                     Ok(()) => api::log("sent posting_key Get"),
@@ -485,42 +493,38 @@ pub fn App() -> Element {
                 });
                 // Stored theme lives in the delegate; the sandbox has no
                 // localStorage.
-                if let Err(e) = api::kv_request(
-                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                if let Err(e) =
+                    api::kv_request(freebird_core::delegate_api::FreebirdDelegateRequest::Get {
                         key: "theme".into(),
-                    },
-                )
-                .await
+                    })
+                    .await
                 {
                     api::log(&format!("theme get failed: {e}"));
                 }
                 // Public-directory listing preference (issue #11).
-                if let Err(e) = api::kv_request(
-                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                if let Err(e) =
+                    api::kv_request(freebird_core::delegate_api::FreebirdDelegateRequest::Get {
                         key: "public_listing".into(),
-                    },
-                )
-                .await
+                    })
+                    .await
                 {
                     api::log(&format!("public_listing get failed: {e}"));
                 }
                 // Update-banner dismissal watermark.
-                if let Err(e) = api::kv_request(
-                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                if let Err(e) =
+                    api::kv_request(freebird_core::delegate_api::FreebirdDelegateRequest::Get {
                         key: "dismissed_build".into(),
-                    },
-                )
-                .await
+                    })
+                    .await
                 {
                     api::log(&format!("dismissed_build get failed: {e}"));
                 }
                 // Whether this account's v1→v2 forward migration already ran.
-                if let Err(e) = api::kv_request(
-                    freebird_core::delegate_api::FreebirdDelegateRequest::Get {
+                if let Err(e) =
+                    api::kv_request(freebird_core::delegate_api::FreebirdDelegateRequest::Get {
                         key: V1_MIGRATION_KEY.into(),
-                    },
-                )
-                .await
+                    })
+                    .await
                 {
                     api::log(&format!("v1_migration get failed: {e}"));
                 }
@@ -582,7 +586,8 @@ pub fn App() -> Element {
                     });
                 }
             }
-            Some(None) => {
+            Some(None) =>
+            {
                 #[cfg(target_arch = "wasm32")]
                 if api::begin_legacy_probe() {
                     spawn(async {
@@ -633,7 +638,10 @@ pub fn App() -> Element {
         };
         let Some(author) = own_author() else { return };
         let feeds_loaded = FEEDS.read().get(&author).is_some_and(Option::is_some)
-            && LEGACY_FEEDS.read().get(&author).is_some_and(Option::is_some);
+            && LEGACY_FEEDS
+                .read()
+                .get(&author)
+                .is_some_and(Option::is_some);
         if feeds_loaded && !*migration_started.peek() {
             migration_started.set(true);
             spawn(async move {
@@ -667,7 +675,10 @@ pub fn App() -> Element {
         // Nothing to do once we hold a current-generation avatar, and
         // nothing to do until the legacy read produces one.
         if AVATARS.read().get(&author).is_some_and(Option::is_some)
-            || !LEGACY_AVATARS.read().get(&author).is_some_and(Option::is_some)
+            || !LEGACY_AVATARS
+                .read()
+                .get(&author)
+                .is_some_and(Option::is_some)
         {
             return;
         }
@@ -675,7 +686,9 @@ pub fn App() -> Element {
             avatar_migration_started.set(true);
             spawn(async move {
                 if let Err(e) = actions::migrate_avatar().await {
-                    api::log(&format!("avatar migration failed, retries next session: {e}"));
+                    api::log(&format!(
+                        "avatar migration failed, retries next session: {e}"
+                    ));
                 }
             });
         }
@@ -684,8 +697,7 @@ pub fn App() -> Element {
     // Subscribe to newly-followed feeds as the follow list changes/arrives.
     use_effect(move || {
         let follows: Vec<[u8; 32]> = own_author()
-            .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-            .map(|f| f.follows.follows.follows.iter().copied().collect())
+            .map(|a| effective_follows(&a).into_iter().collect())
             .unwrap_or_default();
         let known: Vec<[u8; 32]> = FEEDS.read().keys().copied().collect();
         for target in follows {
@@ -1083,21 +1095,18 @@ fn Timeline() -> Element {
     // timeline (thread expansion caches repliers' feeds) — filter to the
     // feeds actually followed.
     let posts: Vec<([u8; 32], AuthorizedPost)> = {
-        let feeds = FEEDS.read();
+        // Built before the FEEDS borrow: `effective_follows` reads it too.
         let mut wanted: std::collections::BTreeSet<[u8; 32]> = Default::default();
         if let Some(own) = own_author() {
             wanted.insert(own);
-            if let Some(Some(own_feed)) = feeds.get(&own) {
-                wanted.extend(own_feed.follows.follows.follows.iter().copied());
-            }
+            wanted.extend(effective_follows(&own));
         }
+        let feeds = FEEDS.read();
         let mut all: Vec<([u8; 32], AuthorizedPost)> = feeds
             .iter()
             .filter(|(author, _)| wanted.contains(*author))
             .filter_map(|(author, state)| state.as_ref().map(|s| (author, s)))
-            .flat_map(|(author, s)| {
-                s.posts.posts.iter().map(move |p| (*author, p.clone()))
-            })
+            .flat_map(|(author, s)| s.posts.posts.iter().map(move |p| (*author, p.clone())))
             .collect();
         // Dual-read: fold in legacy-feed posts for followed authors, deduped.
         let have: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
@@ -1136,7 +1145,11 @@ fn Timeline() -> Element {
 }
 
 #[component]
-fn PostCard(author: [u8; 32], post: AuthorizedPost, #[props(default)] expand_thread: bool) -> Element {
+fn PostCard(
+    author: [u8; 32],
+    post: AuthorizedPost,
+    #[props(default)] expand_thread: bool,
+) -> Element {
     let mut show_reply = use_signal(|| false);
     let mut show_thread = use_signal(move || expand_thread);
     let name = author_name(&author);
@@ -1193,7 +1206,11 @@ fn Thread(author: [u8; 32], post_id_bytes: Vec<u8>) -> Element {
 
     // Pointers targeting this post — v2 and legacy inbox merged — resolved
     // into (replier_key, reply_id, post).
-    let replies: Vec<([u8; 32], freebird_core::types::PostId, Option<AuthorizedPost>)> = {
+    let replies: Vec<(
+        [u8; 32],
+        freebird_core::types::PostId,
+        Option<AuthorizedPost>,
+    )> = {
         let feeds = FEEDS.read();
         merged_pointers(&author)
             .into_iter()
@@ -1344,7 +1361,10 @@ fn AuthorPage(author: [u8; 32]) -> Element {
     });
 
     let loaded = FEEDS.read().get(&author).is_some_and(|f| f.is_some())
-        || LEGACY_FEEDS.read().get(&author).is_some_and(|f| f.is_some());
+        || LEGACY_FEEDS
+            .read()
+            .get(&author)
+            .is_some_and(|f| f.is_some());
     let mut posts: Vec<AuthorizedPost> = FEEDS
         .read()
         .get(&author)
@@ -1375,9 +1395,7 @@ fn AuthorPage(author: [u8; 32]) -> Element {
     }
 
     let own = own_author();
-    let following = own
-        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-        .is_some_and(|f| f.follows.follows.follows.contains(&author));
+    let following = own.is_some_and(|a| effective_follows(&a).contains(&author));
 
     rsx! {
         div { class: "thread-page",
@@ -1498,10 +1516,7 @@ fn current_listings() -> Vec<([u8; 32], u64)> {
 /// Newest-first union of the legacy and v2 directory listings as
 /// (author, last_active) pairs — one entry per author, v2 winning
 /// unconditionally (dual-read window, #23).
-fn merged_listings(
-    legacy: &[([u8; 32], u64)],
-    v2: &[([u8; 32], u64)],
-) -> Vec<([u8; 32], u64)> {
+fn merged_listings(legacy: &[([u8; 32], u64)], v2: &[([u8; 32], u64)]) -> Vec<([u8; 32], u64)> {
     let mut by_author: std::collections::BTreeMap<[u8; 32], u64> = Default::default();
     for &(a, t) in legacy.iter().chain(v2) {
         by_author.insert(a, t);
@@ -1575,10 +1590,8 @@ fn Discover() -> Element {
     });
 
     let own = own_author();
-    let own_follows: std::collections::BTreeSet<[u8; 32]> = own
-        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-        .map(|f| f.follows.follows.follows.clone())
-        .unwrap_or_default();
+    let own_follows: std::collections::BTreeSet<[u8; 32]> =
+        own.map(|a| effective_follows(&a)).unwrap_or_default();
 
     rsx! {
         div { class: "profile-page",
@@ -1632,8 +1645,7 @@ fn FollowBox() -> Element {
     let mut input = use_signal(String::new);
     let mut error = use_signal(String::new);
     let follows: Vec<[u8; 32]> = own_author()
-        .and_then(|a| FEEDS.read().get(&a).cloned().flatten())
-        .map(|f| f.follows.follows.follows.iter().copied().collect())
+        .map(|a| effective_follows(&a).into_iter().collect())
         .unwrap_or_default();
 
     rsx! {
@@ -1720,13 +1732,7 @@ fn FollowersBox() -> Element {
         let feeds = FEEDS.read();
         confirmed_followers(&pointers, &feeds, &author)
     };
-    let own_follows: std::collections::BTreeSet<[u8; 32]> = FEEDS
-        .read()
-        .get(&author)
-        .cloned()
-        .flatten()
-        .map(|f| f.follows.follows.follows.clone())
-        .unwrap_or_default();
+    let own_follows: std::collections::BTreeSet<[u8; 32]> = effective_follows(&author);
 
     // Fetch announcers' feeds we don't have yet, to verify their claims.
     use_effect(move || {
@@ -1965,7 +1971,6 @@ fn ProfilePage() -> Element {
     let Some(author) = own_author() else {
         return rsx! {};
     };
-    let feed: Option<FeedStateV1> = FEEDS.read().get(&author).cloned().flatten();
     let full_key = bs58::encode(&author).into_string();
 
     rsx! {
@@ -1979,9 +1984,9 @@ fn ProfilePage() -> Element {
                     " {author_name(&author)}"
                     if is_verified(&author) { span { class: "check", role: "img", title: "Ghost Key verified", aria_label: "Ghost Key verified", "✔" } }
                 }
-                if let Some(f) = &feed {
-                    if !f.profile.profile.bio.is_empty() {
-                        p { "{f.profile.profile.bio}" }
+                if let Some(bio) = effective_profile(&author).map(|p| p.bio) {
+                    if !bio.is_empty() {
+                        p { "{bio}" }
                     }
                 }
                 p { class: "muted keyline", "Profile picture (shown on your posts; auto-cropped square):" }
@@ -2047,9 +2052,12 @@ fn ProfilePage() -> Element {
                 } else {
                     button { class: "link",
                         onclick: move |_| {
-                            if let Some(f) = FEEDS.read().get(&author).cloned().flatten() {
-                                name.set(f.profile.profile.name.clone());
-                                bio.set(f.profile.profile.bio.clone());
+                            // Prefill from the EFFECTIVE profile: against the
+                            // empty seed the user would otherwise save a blank
+                            // bio over a legacy one they never saw (issue #82).
+                            if let Some(p) = effective_profile(&author) {
+                                name.set(p.name);
+                                bio.set(p.bio);
                             }
                             edit_error.set(String::new());
                             editing.set(true);
@@ -2118,18 +2126,33 @@ mod tests {
         let mid = keys::make_post(
             &b,
             "mid".into(),
-            Some(PostRef { author: a.verifying_key().to_bytes(), post: root.post.id }),
+            Some(PostRef {
+                author: a.verifying_key().to_bytes(),
+                post: root.post.id,
+            }),
         );
-        let start = Some(PostRef { author: b.verifying_key().to_bytes(), post: mid.post.id });
+        let start = Some(PostRef {
+            author: b.verifying_key().to_bytes(),
+            post: mid.post.id,
+        });
 
         let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
-        feeds.insert(a.verifying_key().to_bytes(), Some(feed_with_posts(&a, vec![root.clone()])));
-        feeds.insert(b.verifying_key().to_bytes(), Some(feed_with_posts(&b, vec![mid.clone()])));
+        feeds.insert(
+            a.verifying_key().to_bytes(),
+            Some(feed_with_posts(&a, vec![root.clone()])),
+        );
+        feeds.insert(
+            b.verifying_key().to_bytes(),
+            Some(feed_with_posts(&b, vec![mid.clone()])),
+        );
 
         let (chain, unresolved) = ancestor_chain(&feeds, start);
         assert_eq!(unresolved, None);
         assert_eq!(
-            chain.iter().map(|(k, p)| (*k, p.post.id)).collect::<Vec<_>>(),
+            chain
+                .iter()
+                .map(|(k, p)| (*k, p.post.id))
+                .collect::<Vec<_>>(),
             vec![
                 (a.verifying_key().to_bytes(), root.post.id),
                 (b.verifying_key().to_bytes(), mid.post.id),
@@ -2144,17 +2167,29 @@ mod tests {
     fn ancestor_chain_reports_unloaded_parent() {
         let a = SigningKey::generate(&mut OsRng);
         let b = SigningKey::generate(&mut OsRng);
-        let far = PostRef { author: a.verifying_key().to_bytes(), post: PostId([9u8; 16]) };
+        let far = PostRef {
+            author: a.verifying_key().to_bytes(),
+            post: PostId([9u8; 16]),
+        };
         let mid = keys::make_post(&b, "mid".into(), Some(far));
-        let start = Some(PostRef { author: b.verifying_key().to_bytes(), post: mid.post.id });
+        let start = Some(PostRef {
+            author: b.verifying_key().to_bytes(),
+            post: mid.post.id,
+        });
 
         let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
-        feeds.insert(b.verifying_key().to_bytes(), Some(feed_with_posts(&b, vec![mid.clone()])));
+        feeds.insert(
+            b.verifying_key().to_bytes(),
+            Some(feed_with_posts(&b, vec![mid.clone()])),
+        );
 
         let (chain, unresolved) = ancestor_chain(&feeds, start);
         assert_eq!(unresolved, Some(far));
         assert_eq!(
-            chain.iter().map(|(k, p)| (*k, p.post.id)).collect::<Vec<_>>(),
+            chain
+                .iter()
+                .map(|(k, p)| (*k, p.post.id))
+                .collect::<Vec<_>>(),
             vec![(b.verifying_key().to_bytes(), mid.post.id)]
         );
     }
@@ -2171,15 +2206,24 @@ mod tests {
         let mut p2 = keys::make_post(&a, "two".into(), None);
         p1.post.id = PostId([1u8; 16]);
         p2.post.id = PostId([2u8; 16]);
-        p1.post.in_reply_to = Some(PostRef { author: key, post: p2.post.id });
-        p2.post.in_reply_to = Some(PostRef { author: key, post: p1.post.id });
+        p1.post.in_reply_to = Some(PostRef {
+            author: key,
+            post: p2.post.id,
+        });
+        p2.post.in_reply_to = Some(PostRef {
+            author: key,
+            post: p1.post.id,
+        });
 
         let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
         feeds.insert(key, Some(feed_with_posts(&a, vec![p1.clone(), p2])));
 
         let (chain, unresolved) = ancestor_chain(
             &feeds,
-            Some(PostRef { author: key, post: p1.post.id }),
+            Some(PostRef {
+                author: key,
+                post: p1.post.id,
+            }),
         );
         assert_eq!(unresolved, None);
         assert_eq!(chain.len(), 2);
@@ -2207,8 +2251,14 @@ mod tests {
         pointers.push(announce(&real, PostId([7u8; 16]), 5));
 
         let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
-        feeds.insert(real.verifying_key().to_bytes(), Some(feed_following(&real, &[owner])));
-        feeds.insert(liar.verifying_key().to_bytes(), Some(feed_following(&liar, &[])));
+        feeds.insert(
+            real.verifying_key().to_bytes(),
+            Some(feed_following(&real, &[owner])),
+        );
+        feeds.insert(
+            liar.verifying_key().to_bytes(),
+            Some(feed_following(&liar, &[])),
+        );
         feeds.insert(unfetched.verifying_key().to_bytes(), None);
 
         assert_eq!(
@@ -2226,10 +2276,7 @@ mod tests {
         let v2_only = announce(&sk, PostId([1u8; 16]), 20);
         let v1_only = announce(&sk, PostId([1u8; 16]), 30);
 
-        let merged = dedup_generations(
-            vec![shared, v2_only],
-            vec![shared, v1_only],
-        );
+        let merged = dedup_generations(vec![shared, v2_only], vec![shared, v1_only]);
         assert_eq!(merged.len(), 3);
         assert_eq!(merged.iter().filter(|p| **p == shared).count(), 1);
     }
@@ -2243,9 +2290,15 @@ mod tests {
     fn account_gate_prefers_stuck_over_onboarding() {
         use super::{account_gate, AccountGate};
         assert_eq!(account_gate(false, true, false, true), AccountGate::Loading);
-        assert_eq!(account_gate(false, true, true, true), AccountGate::KeyStoreStuck);
+        assert_eq!(
+            account_gate(false, true, true, true),
+            AccountGate::KeyStoreStuck
+        );
         // Late answer arrived (no stored key): onboard despite the stale flag.
-        assert_eq!(account_gate(false, false, true, true), AccountGate::Onboarding);
+        assert_eq!(
+            account_gate(false, false, true, true),
+            AccountGate::Onboarding
+        );
         // Late answer arrived (stored key resumed): the app, timeout or not.
         assert_eq!(account_gate(true, false, true, true), AccountGate::App);
         assert_eq!(account_gate(true, true, true, true), AccountGate::App);
@@ -2260,7 +2313,10 @@ mod tests {
         let c = [3u8; 32];
         let legacy = [(a, 50), (b, 90)];
         let v2 = [(b, 10), (c, 70)];
-        assert_eq!(merged_listings(&legacy, &v2), vec![(c, 70), (a, 50), (b, 10)]);
+        assert_eq!(
+            merged_listings(&legacy, &v2),
+            vec![(c, 70), (a, 50), (b, 10)]
+        );
     }
 
     /// The fetch sample must include authors whose feed is absent AND
@@ -2281,10 +2337,14 @@ mod tests {
         feeds.insert(loaded, Some(feed_following(&sk, &[])));
         feeds.insert(tried, None);
 
-        let attempted: std::collections::BTreeSet<[u8; 32]> =
-            [tried].into_iter().collect();
-        let listings =
-            vec![(missing, 50), (pending, 40), (loaded, 30), (tried, 20), (beyond, 10)];
+        let attempted: std::collections::BTreeSet<[u8; 32]> = [tried].into_iter().collect();
+        let listings = vec![
+            (missing, 50),
+            (pending, 40),
+            (loaded, 30),
+            (tried, 20),
+            (beyond, 10),
+        ];
 
         assert_eq!(
             feeds_to_fetch(&listings, &feeds, &attempted, 4),

@@ -1,11 +1,12 @@
 //! Global UI state (Dioxus signals).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::FeedStateV1;
+use freebird_core::types::ProfileV1;
 use freenet_stdlib::client_api::WebApi;
 use inbox_contract::state::InboxStateV3;
 
@@ -43,8 +44,7 @@ pub static LEGACY_FEEDS: GlobalSignal<BTreeMap<[u8; 32], Option<LegacyFeedState>
     Signal::global(BTreeMap::new);
 
 /// Inbox (v2) states by owner key.
-pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV3>> =
-    Signal::global(BTreeMap::new);
+pub static INBOXES: GlobalSignal<BTreeMap<[u8; 32], InboxStateV3>> = Signal::global(BTreeMap::new);
 
 /// LEGACY inbox states by owner key — dual-read migration window (issues
 /// #23, #81): pointers written against the LIVE build stay visible until the
@@ -60,8 +60,9 @@ pub static ANCHORS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_anchor::Anch
 /// Avatars by author key. `None` value = fetched (or fetching) but absent —
 /// render the identicon. Write-rarely contract: fetch-on-view, no
 /// subscription, cached here for the session.
-pub static AVATARS: GlobalSignal<BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>> =
-    Signal::global(BTreeMap::new);
+pub static AVATARS: GlobalSignal<
+    BTreeMap<[u8; 32], Option<freebird_core::avatar::AuthorizedAvatar>>,
+> = Signal::global(BTreeMap::new);
 
 /// LEGACY avatars by author key — dual-read migration window (issue #81).
 /// Kept SEPARATE from `AVATARS` rather than merged into it: the rendering
@@ -252,8 +253,16 @@ impl View {
             Some("profile") => View::Profile,
             Some("discover") => View::Discover,
             Some("thread") => (|| {
-                let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
-                let post = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                let author = bs58::decode(parts.next()?)
+                    .into_vec()
+                    .ok()?
+                    .try_into()
+                    .ok()?;
+                let post = bs58::decode(parts.next()?)
+                    .into_vec()
+                    .ok()?
+                    .try_into()
+                    .ok()?;
                 Some(View::Thread(freebird_core::types::PostRef {
                     author,
                     post: freebird_core::types::PostId(post),
@@ -261,7 +270,11 @@ impl View {
             })()
             .unwrap_or(View::Home),
             Some("author") => (|| {
-                let author = bs58::decode(parts.next()?).into_vec().ok()?.try_into().ok()?;
+                let author = bs58::decode(parts.next()?)
+                    .into_vec()
+                    .ok()?
+                    .try_into()
+                    .ok()?;
                 Some(View::Author(author))
             })()
             .unwrap_or(View::Home),
@@ -295,7 +308,10 @@ mod tests {
     fn migration_marker_decode() {
         assert_eq!(V1Migration::decode(None), V1Migration::Pending);
         assert_eq!(V1Migration::decode(Some(b"done")), V1Migration::Done);
-        assert_eq!(V1Migration::decode(Some(b"1700")), V1Migration::Running(1700));
+        assert_eq!(
+            V1Migration::decode(Some(b"1700")),
+            V1Migration::Running(1700)
+        );
         // Garbage re-runs the (idempotent) migration rather than skipping it.
         assert_eq!(V1Migration::decode(Some(b"")), V1Migration::Pending);
         assert_eq!(V1Migration::decode(Some(b"\xff\xfe")), V1Migration::Pending);
@@ -332,4 +348,59 @@ pub fn own_author() -> Option<[u8; 32]> {
         .read()
         .as_ref()
         .map(|sk| sk.verifying_key().to_bytes())
+}
+
+/// Has this v2 record been written since the rotation? Version 0 is exactly
+/// the untouched seed — `api::seed_feed` is its only writer, `create_account`
+/// starts at 1, and every later write is `current + 1`.
+pub fn written_since_rotation(version: u32) -> bool {
+    version > 0
+}
+
+/// An author's effective profile during the dual-read window: their v2 record
+/// once they have written one, else the legacy (pre-#64) one.
+///
+/// Identity has no fallback of its own the way posts do (`legacy_posts`), so
+/// without this a v1 account reads back as a blank name and empty bio until
+/// `migrate_v1` lands — which is what prompts people to retype their name over
+/// the empty seed, racing the migration. The gate matches
+/// `actions::identity_to_migrate`'s, so nothing shifts under the user when the
+/// migration finally runs.
+pub fn effective_profile(author: &[u8; 32]) -> Option<ProfileV1> {
+    let v2 = FEEDS
+        .read()
+        .get(author)
+        .and_then(|f| f.as_ref())
+        .map(|f| f.profile.profile.clone());
+    match &v2 {
+        Some(p) if written_since_rotation(p.version) => v2,
+        _ => LEGACY_FEEDS
+            .read()
+            .get(author)
+            .and_then(|f| f.as_ref())
+            .map(|f| f.profile.profile.clone())
+            .or(v2),
+    }
+}
+
+/// An author's effective follow list, on the same rule as [`effective_profile`].
+///
+/// Load-bearing for writes as well as display: `actions::set_follow` starts
+/// from this set, so the first post-rotation follow or unfollow folds the
+/// legacy list into v2 instead of writing a one-entry list over it.
+pub fn effective_follows(author: &[u8; 32]) -> BTreeSet<[u8; 32]> {
+    let v2 = FEEDS
+        .read()
+        .get(author)
+        .and_then(|f| f.as_ref())
+        .map(|f| f.follows.follows.clone());
+    match &v2 {
+        Some(f) if written_since_rotation(f.version) => f.follows.clone(),
+        _ => LEGACY_FEEDS
+            .read()
+            .get(author)
+            .and_then(|f| f.as_ref())
+            .map(|f| f.follows.follows.follows.clone())
+            .unwrap_or_else(|| v2.map(|f| f.follows).unwrap_or_default()),
+    }
 }

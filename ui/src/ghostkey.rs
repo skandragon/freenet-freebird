@@ -46,7 +46,9 @@ pub async fn discover_vault_delegate() -> Result<freenet_stdlib::prelude::Delega
         return Err(format!("vault pointer HTTP {}", response.status()));
     }
     let text = wasm_bindgen_futures::JsFuture::from(
-        response.text().map_err(|e| format!("pointer body: {e:?}"))?,
+        response
+            .text()
+            .map_err(|e| format!("pointer body: {e:?}"))?,
     )
     .await
     .map_err(|e| format!("pointer body: {e:?}"))?;
@@ -104,8 +106,8 @@ pub fn attestation_from_sign_result(
     posting_sk: &SigningKey,
 ) -> Result<AttestationV2, String> {
     use ed25519_dalek::Signer;
-    let signature = Signature::from_slice(&signature)
-        .map_err(|e| format!("bad signature length: {e}"))?;
+    let signature =
+        Signature::from_slice(&signature).map_err(|e| format!("bad signature length: {e}"))?;
     let certificate = GhostkeyCertificateV1::from_armored_string(certificate_pem)
         .map_err(|e| format!("bad certificate: {e}"))?;
     let pop = posting_sk.sign(&pop_message(&signature));

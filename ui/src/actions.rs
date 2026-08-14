@@ -6,6 +6,7 @@ use directory_contract::{AuthorizedListingV3, ListingV1};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use freebird_core::attestation::AttestationV2;
 use freebird_core::delegate_api::FreebirdDelegateRequest;
+use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::{AttestationSlot, FeedStateV1, FeedStateV1Delta, PostsV1};
 use freebird_core::types::{
     AuthorizedFollows, AuthorizedPost, AuthorizedProfile, FollowsV1, PostId, PostRef, ProfileV1,
@@ -173,13 +174,20 @@ pub async fn publish_post(content: String, in_reply_to: Option<PostRef>) -> Resu
     apply_own_posts(vec![post.clone()]);
 
     if let Some(target) = in_reply_to {
-        send_inbox_pointer(&sk, att, target.author, target.post, post.post.id, post.post.time)
-            .await
-            // The post itself is already out — say so, or the error invites
-            // a duplicate repost.
-            .map_err(|e| {
-                format!("reply posted to your feed, but delivering it to the thread failed: {e}")
-            })?;
+        send_inbox_pointer(
+            &sk,
+            att,
+            target.author,
+            target.post,
+            post.post.id,
+            post.post.time,
+        )
+        .await
+        // The post itself is already out — say so, or the error invites
+        // a duplicate repost.
+        .map_err(|e| {
+            format!("reply posted to your feed, but delivering it to the thread failed: {e}")
+        })?;
     }
     Ok(())
 }
@@ -254,10 +262,55 @@ fn posts_to_migrate(
         .collect()
 }
 
+/// Legacy identity that still owes a v2 copy: the v1 profile and follow list,
+/// re-signed under the #64 domain tags (the v1 signatures don't verify here).
+///
+/// The gate is "has the v2 record been written since the rotation?", NOT a
+/// comparison of the two version numbers. Those counters are separate
+/// lineages: the rotation reseeds v2 at `seed_feed`'s 0 while the legacy one
+/// carries the account's entire v1 history, so `legacy > current` measures
+/// which counter ran longer, not which record is fresher. Comparing them
+/// reverts post-rotation profile edits and — because the follows CRDT
+/// replaces the set wholesale rather than merging — silently drops every
+/// follow made since the upgrade.
+///
+/// An untouched v2 record is version 0 exactly (see `written_since_rotation`).
+/// Above 0 the user has written it themselves, over the effective list
+/// `state::effective_follows` already folds the legacy one into, so it
+/// supersedes the legacy record and is left alone. Writing at `current + 1`
+/// is also what makes the delta land: the contract's LWW breaks equal-version
+/// ties by content hash, so an equal-version delta can be silently dropped.
+fn identity_to_migrate(
+    legacy: &LegacyFeedState,
+    current: &FeedStateV1,
+    sk: &SigningKey,
+) -> (Option<AuthorizedProfile>, Option<AuthorizedFollows>) {
+    let profile = (!written_since_rotation(current.profile.profile.version)).then(|| {
+        AuthorizedProfile::new(
+            ProfileV1 {
+                version: current.profile.profile.version + 1,
+                ..legacy.profile.profile.clone()
+            },
+            sk,
+        )
+    });
+    let follows = (!written_since_rotation(current.follows.follows.version)).then(|| {
+        AuthorizedFollows::new(
+            FollowsV1 {
+                follows: legacy.follows.follows.follows.clone(),
+                version: current.follows.follows.version + 1,
+            },
+            sk,
+        )
+    });
+    (profile, follows)
+}
+
 /// One-time forward migration of this account's v1-era data into the v2
 /// contracts (issue #56), so the `read_v1_*` dual-read flags can actually be
 /// turned off without losing it:
 ///
+/// - v1 profile + follow list → the v2 feed, re-signed (issue #82).
 /// - v1 feed posts → the v2 feed, re-signed (ids preserved).
 /// - v1-era replies → a v3 pointer in each target author's inbox.
 /// - follows → a v3 follow announcement in each followed author's inbox.
@@ -294,11 +347,16 @@ pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
     *V1_MIGRATION.write() = Some(V1Migration::Running(started_ms));
 
     let posts = posts_to_migrate(&legacy.posts.posts, &current.posts, &sk);
-    if !posts.is_empty() {
-        let mut delta = empty_delta();
-        delta.posts = Some(posts.clone());
-        api::update_own_feed(delta).await?;
-        apply_own_posts(posts);
+    let (profile, follows) = identity_to_migrate(&legacy, &current, &sk);
+    if !posts.is_empty() || profile.is_some() || follows.is_some() {
+        let delta = FeedStateV1Delta {
+            profile,
+            follows: follows.clone(),
+            attestation: None,
+            posts: (!posts.is_empty()).then_some(posts),
+        };
+        api::update_own_feed(delta.clone()).await?;
+        apply_own_delta(delta);
     }
 
     // Slot tier from the CURRENT (v2) attestation — a v1 AttestationV1 can't
@@ -324,10 +382,13 @@ pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
     }
 
     // Follow announcements only ever existed as inbox pointers, so the whole
-    // follower list dies with the window. Re-announce every current follow,
-    // stamped with the migration's start time (see `started_ms` above).
+    // follower list dies with the window. Re-announce every follow in the list
+    // the migration just settled on — the restored legacy one, or the v2 one
+    // when that was already newer — stamped with the migration's start time
+    // (see `started_ms` above).
     let announce_id = PostId::compute(&sk.verifying_key(), started_ms, "follow", &None);
-    for target in &current.follows.follows.follows {
+    let announce_to = follows.as_ref().unwrap_or(&current.follows);
+    for target in &announce_to.follows.follows {
         send_inbox_pointer(
             &sk,
             att.clone(),
@@ -376,17 +437,25 @@ pub async fn migrate_avatar() -> Result<(), String> {
     Ok(())
 }
 
-fn apply_own_posts(posts: Vec<freebird_core::types::AuthorizedPost>) {
+/// Optimistic local apply of a delta we just wrote, so the UI updates without
+/// waiting for the contract's notification back.
+fn apply_own_delta(delta: FeedStateV1Delta) {
     let Some(author) = own_author() else { return };
-    let Ok(vk) = VerifyingKey::from_bytes(&author) else { return };
+    let Ok(vk) = VerifyingKey::from_bytes(&author) else {
+        return;
+    };
     let params = keys::feed_params(&vk);
     if let Some(Some(state)) = FEEDS.write().get_mut(&author) {
         use freenet_scaffold::ComposableState;
-        let mut delta = empty_delta();
-        delta.posts = Some(posts);
         let clone = state.clone();
         let _ = state.apply_delta(&clone, &params, &Some(delta));
     }
+}
+
+fn apply_own_posts(posts: Vec<freebird_core::types::AuthorizedPost>) {
+    let mut delta = empty_delta();
+    delta.posts = Some(posts);
+    apply_own_delta(delta);
 }
 
 pub async fn publish_profile(name: String, bio: String) -> Result<(), String> {
@@ -433,6 +502,12 @@ pub async fn set_follow(target: [u8; 32], follow: bool) -> Result<(), String> {
     let sk = signing_key()?;
     let current = own_feed().ok_or("feed not loaded")?;
     let mut follows = current.follows.follows.clone();
+    // Start from the EFFECTIVE list, not the v2 one: before `migrate_v1` runs
+    // the v2 record is the empty seed, so editing it directly would write a
+    // one-entry list over a legacy list the user can see and believes they
+    // have (issue #82). This is also what lets them unfollow a v1-era account
+    // during the window — against the raw seed that is a no-op.
+    follows.follows = effective_follows(&sk.verifying_key().to_bytes());
     let changed = if follow {
         follows.follows.insert(target)
     } else {
@@ -493,7 +568,10 @@ pub async fn set_public_listing(on: bool) -> Result<(), String> {
         let mut difficulty = POW_DIFFICULTY.read().clone();
         freebird_pow::adopt_difficulty(
             &mut difficulty,
-            DIRECTORY.read().as_ref().and_then(|d| d.pow_difficulty.as_ref()),
+            DIRECTORY
+                .read()
+                .as_ref()
+                .and_then(|d| d.pow_difficulty.as_ref()),
         );
         let authorized = match att {
             Some(att) => AuthorizedListingV3::new(listing, &sk, Some(att)),
@@ -647,5 +725,144 @@ mod tests {
                 .collect(),
         };
         assert!(posts_to_migrate(&legacy, &done, &sk).is_empty());
+    }
+
+    fn profile(name: &str, version: u32) -> ProfileV1 {
+        ProfileV1 {
+            name: name.into(),
+            bio: format!("{name}'s bio"),
+            version,
+        }
+    }
+
+    fn follow_list(follows: &[[u8; 32]], version: u32) -> FollowsV1 {
+        FollowsV1 {
+            follows: follows.iter().copied().collect(),
+            version,
+        }
+    }
+
+    /// A pre-#64 feed: profile and follows signed over BARE CBOR.
+    fn legacy_feed(
+        sk: &SigningKey,
+        name: &str,
+        pv: u32,
+        follows: &[[u8; 32]],
+        fv: u32,
+    ) -> LegacyFeedState {
+        use freebird_core::feed::legacy::{LegacyAttestationSlot, LegacyPosts};
+        let p = profile(name, pv);
+        let f = follow_list(follows, fv);
+        LegacyFeedState {
+            profile: AuthorizedProfile {
+                signature: sk.sign(&freebird_core::to_cbor(&p).unwrap()),
+                profile: p,
+            },
+            follows: AuthorizedFollows {
+                signature: sk.sign(&freebird_core::to_cbor(&f).unwrap()),
+                follows: f,
+            },
+            attestation: LegacyAttestationSlot(None),
+            posts: LegacyPosts::default(),
+        }
+    }
+
+    fn v2_feed(sk: &SigningKey, name: &str, pv: u32, follows: &[[u8; 32]], fv: u32) -> FeedStateV1 {
+        FeedStateV1 {
+            profile: AuthorizedProfile::new(profile(name, pv), sk),
+            follows: AuthorizedFollows::new(follow_list(follows, fv), sk),
+            attestation: AttestationSlot(None),
+            posts: PostsV1::default(),
+        }
+    }
+
+    /// Issue #82: the display name, bio and follow list must cross the v1→v2
+    /// rotation. The v2 feed a rotation leaves behind is `seed_feed`'s empty
+    /// version 0, so both records migrate — re-signed, since the #64 domain
+    /// tags mean the v1 signatures no longer verify.
+    #[test]
+    fn migrated_identity_survives_the_rotation() {
+        let sk = SigningKey::from_bytes(&[11; 32]);
+        let vk = sk.verifying_key();
+        let target = [4u8; 32];
+        let legacy = legacy_feed(&sk, "alice", 2, &[target], 3);
+        // Precondition: the v1 signatures are exactly what v2 rejects.
+        assert!(legacy.profile.verify_signature(&vk).is_err());
+        assert!(legacy.follows.verify_signature(&vk).is_err());
+        // The rotated v2 feed: signed seed state, versioned below anything real.
+        let current = v2_feed(&sk, "", 0, &[], 0);
+
+        let (profile, follows) = identity_to_migrate(&legacy, &current, &sk);
+        let profile = profile.expect("display name and bio migrate");
+        let follows = follows.expect("follow list migrates");
+        // Content carries across verbatim; the version is renumbered onto the
+        // v2 counter (legacy 2/3 -> 1), since the two lineages are unrelated.
+        assert_eq!(profile.profile.name, legacy.profile.profile.name);
+        assert_eq!(profile.profile.bio, legacy.profile.profile.bio);
+        assert_eq!(profile.profile.version, 1);
+        assert_eq!(follows.follows.follows, legacy.follows.follows.follows);
+        assert_eq!(follows.follows.version, 1);
+        profile.verify_signature(&vk).unwrap();
+        follows.verify_signature(&vk).unwrap();
+
+        // Both are strictly newer than the seed, so the contract's LWW cannot
+        // drop them — an equal-version tie is broken by content hash.
+        use freenet_scaffold::ComposableState;
+        let params = keys::feed_params(&vk);
+        let mut live = current.clone();
+        let clone = live.clone();
+        live.apply_delta(
+            &clone,
+            &params,
+            &Some(FeedStateV1Delta {
+                profile: Some(profile),
+                follows: Some(follows),
+                attestation: None,
+                posts: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(live.profile.profile.name, "alice");
+        assert!(live.follows.follows.follows.contains(&target));
+    }
+
+    /// Issue #82 regression. A write made after the upgrade but before the
+    /// migration ran must survive it — and the realistic shape of that state
+    /// is a LOW v2 version, not a high one: the rotation reseeds the v2
+    /// counter at 0, so the user's first rename and first follow both land at
+    /// version 1 while the legacy counter still carries their whole v1
+    /// history. The old `legacy.version > current.version` gate read `2 > 1`
+    /// and `12 > 1` as "legacy is fresher" and sent both through — and since
+    /// the follows CRDT replaces the set wholesale rather than merging,
+    /// `fresh` was silently wiped.
+    #[test]
+    fn post_rotation_writes_are_never_replaced_by_the_legacy_record() {
+        let sk = SigningKey::from_bytes(&[12; 32]);
+        let fresh = [2u8; 32];
+        // A long v1 life: two renames, a dozen follow/unfollow toggles.
+        let legacy = legacy_feed(&sk, "alice", 2, &[[1u8; 32]], 12);
+        // Since the rotation: renamed once, followed one person. Both v1.
+        let current = v2_feed(&sk, "alice-renamed", 1, &[fresh], 1);
+        // Pin the shape of the bug: this is a state the old gate got wrong.
+        assert!(legacy.profile.profile.version > current.profile.profile.version);
+        assert!(legacy.follows.follows.version > current.follows.follows.version);
+
+        assert_eq!(identity_to_migrate(&legacy, &current, &sk), (None, None));
+    }
+
+    /// The two records are gated independently: a user who renamed themselves
+    /// but has not touched their follows since the rotation keeps the rename
+    /// and still gets their v1 follow list back.
+    #[test]
+    fn a_touched_profile_does_not_hold_back_an_untouched_follow_list() {
+        let sk = SigningKey::from_bytes(&[14; 32]);
+        let target = [4u8; 32];
+        let legacy = legacy_feed(&sk, "alice", 2, &[target], 3);
+        let current = v2_feed(&sk, "alice-renamed", 1, &[], 0);
+
+        let (profile, follows) = identity_to_migrate(&legacy, &current, &sk);
+        assert!(profile.is_none(), "the rename must stand");
+        let follows = follows.expect("an untouched follow list still migrates");
+        assert!(follows.follows.follows.contains(&target));
     }
 }

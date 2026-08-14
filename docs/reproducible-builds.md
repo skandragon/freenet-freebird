@@ -23,6 +23,17 @@ The current `feed`/`avatar`/`inbox`/`directory`/`freebird_delegate` bytes are
 path existed. Each will migrate to reproducible Docker-built bytes the next time
 it is legitimately rebuilt (see below), not before.
 
+### Corollary: no whitespace-only churn in contract crates
+
+`panic = 'abort'` still embeds `file:line` for every panic site, so a
+formatting pass that shifts line numbers changes the wasm bytes — and with
+them every derived address. Proven: `cargo fmt --all` on this repo rebuilt all
+four non-frozen contracts to different hashes (the delegate happened to
+survive). So `common/`, `contracts/`, `pow/` and `delegates/` are deliberately
+left un-`rustfmt`ed; reformat them only as part of a change that is already
+rotating those addresses. `ui/` and `tools/` compile into nothing
+address-derived and are formatted normally. CI runs no fmt check, by design.
+
 ## Why a plain build is not reproducible
 
 `rustc` bakes absolute paths into the wasm (the source dir, `CARGO_HOME`
