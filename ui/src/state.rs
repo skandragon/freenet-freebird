@@ -106,24 +106,28 @@ pub const V1_MIGRATION_KEY: &str = "v1_migration";
 /// persisted in the delegate under [`V1_MIGRATION_KEY`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum V1Migration {
-    /// Never started.
+    /// Not confirmed complete: run it.
+    ///
+    /// There is deliberately no in-progress state (issue #91). The only
+    /// thing the old `Running(started_ms)` stamp bought was a stable
+    /// `PostId` for the follow announcements across a resumed run, and its
+    /// Store was fire-and-forget — a dropped marker minted a fresh id and
+    /// left a duplicate "followed you" pointer in every followed author's
+    /// inbox. `actions::MIGRATION_ANNOUNCE_MS` derives that id from a
+    /// constant instead, so nothing needs the stamp.
     Pending,
-    /// Started at this wall-clock ms and not confirmed complete. The stamp
-    /// is REUSED by a retry so re-sent follow announcements keep the same
-    /// PostIds — the inbox dedups them instead of stacking duplicates.
-    Running(u64),
     /// Every write landed; never runs again.
     Done,
 }
 
 impl V1Migration {
-    /// Absent or unparseable = never started: the migration is idempotent,
-    /// so re-running is always safer than skipping.
+    /// Anything but `done` = run it: the migration is idempotent, so
+    /// re-running is always safer than skipping. That includes a pre-#91
+    /// in-progress stamp, which is a bare number.
     pub fn decode(value: Option<&[u8]>) -> Self {
         match value.and_then(|v| std::str::from_utf8(v).ok()) {
-            None => Self::Pending,
             Some("done") => Self::Done,
-            Some(s) => s.parse().map(Self::Running).unwrap_or(Self::Pending),
+            _ => Self::Pending,
         }
     }
 }
@@ -312,10 +316,9 @@ mod tests {
     fn migration_marker_decode() {
         assert_eq!(V1Migration::decode(None), V1Migration::Pending);
         assert_eq!(V1Migration::decode(Some(b"done")), V1Migration::Done);
-        assert_eq!(
-            V1Migration::decode(Some(b"1700")),
-            V1Migration::Running(1700)
-        );
+        // A pre-#91 in-progress stamp: re-runs, and now re-derives the same
+        // announcement ids while doing it.
+        assert_eq!(V1Migration::decode(Some(b"1700")), V1Migration::Pending);
         // Garbage re-runs the (idempotent) migration rather than skipping it.
         assert_eq!(V1Migration::decode(Some(b"")), V1Migration::Pending);
         assert_eq!(V1Migration::decode(Some(b"\xff\xfe")), V1Migration::Pending);
