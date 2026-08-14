@@ -361,8 +361,11 @@ pub async fn migrate_v1() -> Result<(), String> {
             attestation: None,
             posts: (!posts.is_empty()).then_some(posts),
         };
-        api::update_own_feed(delta.clone()).await?;
-        apply_own_delta(delta);
+        // No optimistic `apply_own_delta` here, unlike every other writer:
+        // the feed merge is a CRDT merge, so a local apply would survive the
+        // confirming re-read below and let the write confirm against itself.
+        // The GetResponse is what puts the migrated identity on screen.
+        api::update_own_feed(delta).await?;
     }
 
     // Slot tier from the CURRENT (v2) attestation — a v1 AttestationV1 can't
@@ -405,6 +408,8 @@ pub async fn migrate_v1() -> Result<(), String> {
         .await?;
     }
 
+    confirm_identity_migrated(&sk, &legacy).await?;
+
     api::kv_request(FreebirdDelegateRequest::Store {
         key: V1_MIGRATION_KEY.into(),
         value: b"done".to_vec(),
@@ -412,6 +417,43 @@ pub async fn migrate_v1() -> Result<(), String> {
     .await?;
     *V1_MIGRATION.write() = Some(V1Migration::Done);
     Ok(())
+}
+
+/// Re-reads before giving up. Six seconds total — long enough for a node to
+/// apply an Update and answer a GET, short enough not to hold a session's one
+/// migration attempt open on a network that is not going to answer.
+const CONFIRM_TRIES: u32 = 6;
+const CONFIRM_INTERVAL_MS: u32 = 1000;
+
+/// Require the network to actually hold the migrated identity before
+/// `migrate_v1` stamps `done` (issue #90).
+///
+/// `api::update_own_feed` returns when the Update reaches the socket, not
+/// when the contract accepts it — rejections arrive asynchronously and land
+/// in `FEED_WRITE_ERROR`, which nothing here can correlate to a request (the
+/// protocol carries no request ids, see #86). So instead of trusting the
+/// send, re-read the feed and re-run the function that decided what to write:
+/// `identity_to_migrate` returning nothing means the network holds it.
+///
+/// Only the identity is checked, not the posts. The feed keeps `MAX_POSTS`
+/// (300) and a longer v1 history is pruned on arrival, so requiring every
+/// migrated post back would never converge for a prolific account.
+///
+/// Failing to confirm is the SAFE direction: `V1Migration::Done` is terminal
+/// and the legacy feed is only readable while the dual-read window is open,
+/// while a repeat run is idempotent and costs nothing but a few writes.
+async fn confirm_identity_migrated(sk: &SigningKey, legacy: &LegacyFeedState) -> Result<(), String> {
+    let vk = sk.verifying_key();
+    for _ in 0..CONFIRM_TRIES {
+        api::refetch_own_feed(&vk).await?;
+        crate::sleep_ms(CONFIRM_INTERVAL_MS).await;
+        let Some(fresh) = own_feed() else { continue };
+        let (profile, follows) = identity_to_migrate(legacy, &fresh, sk);
+        if profile.is_none() && follows.is_none() {
+            return Ok(());
+        }
+    }
+    Err("the network never confirmed the migrated profile and follow list".into())
 }
 
 /// Re-sign our legacy profile picture into the rotated avatar contract
@@ -871,6 +913,43 @@ mod tests {
         assert!(legacy.follows.follows.version > current.follows.follows.version);
 
         assert_eq!(identity_to_migrate(&legacy, &current, &sk), (None, None));
+    }
+
+    /// Issue #90: `migrate_v1` stamps the terminal `done` marker only once
+    /// `confirm_identity_migrated` sees a re-read feed with nothing left to
+    /// migrate. Pin the predicate that gate rests on — it must keep asking
+    /// while the write has not landed, and stop the moment it has.
+    #[test]
+    fn the_done_gate_stays_shut_until_the_write_lands() {
+        use freenet_scaffold::ComposableState;
+        let sk = SigningKey::from_bytes(&[15; 32]);
+        let vk = sk.verifying_key();
+        let target = [4u8; 32];
+        let legacy = legacy_feed(&sk, "alice", 2, &[target], 3);
+        // What a re-read returns when the Update was rejected: the seed.
+        let rejected = v2_feed(&sk, "", 0, &[], 0);
+
+        let (profile, follows) = identity_to_migrate(&legacy, &rejected, &sk);
+        assert!(
+            profile.is_some() && follows.is_some(),
+            "a rejected write must not clear the gate"
+        );
+
+        let mut landed = rejected.clone();
+        let clone = landed.clone();
+        landed
+            .apply_delta(
+                &clone,
+                &keys::feed_params(&vk),
+                &Some(FeedStateV1Delta {
+                    profile,
+                    follows,
+                    attestation: None,
+                    posts: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(identity_to_migrate(&legacy, &landed, &sk), (None, None));
     }
 
     /// The two records are gated independently: a user who renamed themselves
