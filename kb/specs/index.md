@@ -1,10 +1,13 @@
 # kb / specs
 
 Intended behavior as atomic claims, each pointing at its implementation through
-the `covers:` globs in its frontmatter. Ordered here roughly along the lifetime
-of a contract: how its address comes to exist, what merges into its state, what
-it costs to validate, and what happens when its bytes change.
+the `covers:` globs in its frontmatter. Start at the architecture entry for the shape of
+the whole system; the rest are ordered along the lifetime of a contract — how
+its address comes to exist, what merges into its state, what it costs to
+validate, and what happens when its bytes change.
 
+- [system architecture](architecture.md) — the pieces, the platform constraints
+  that force that shape, and the questions to answer before adding a surface
 - [address derivation and the rotation guard](address-derivation.md) — every
   address derives from wasm bytes; the 2026-08-10 incident that proved it, the
   pinned-hash guard, generation constants, and the cumulative delegate registry
