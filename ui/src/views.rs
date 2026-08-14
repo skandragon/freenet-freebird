@@ -151,7 +151,7 @@ fn CopyButton(text: String, label: String) -> Element {
 
 /// Deterministic per-author color chip: two hues derived from the key.
 fn identicon_style(author: &[u8; 32]) -> String {
-    let h1 = (((author[0] as u16) << 8 | author[1] as u16) % 360) as u16;
+    let h1 = ((author[0] as u16) << 8 | author[1] as u16) % 360;
     let h2 = (h1 + 40 + (author[2] % 140) as u16) % 360;
     format!("background: linear-gradient(135deg, hsl({h1},65%,55%), hsl({h2},65%,38%))")
 }
@@ -437,7 +437,7 @@ fn account_gate(
 #[component]
 pub fn App() -> Element {
     use_effect(|| {
-        let theme = THEME.peek().clone();
+        let theme = *THEME.peek();
         apply_theme(theme);
         #[cfg(target_arch = "wasm32")]
         {
@@ -574,6 +574,11 @@ pub fn App() -> Element {
     // POSTING_KEY_LOADED and re-enters here as the resume case.
     // begin_legacy_probe runs synchronously so the account gate is already
     // raised before anything can render onboarding.
+    //
+    // The inner `if` cannot become a match guard: a failing guard would fall
+    // through to arms that don't match `Some(Some(_))`, so the match would no
+    // longer be exhaustive.
+    #[allow(clippy::collapsible_match)]
     use_effect(move || {
         let loaded = POSTING_KEY_LOADED.read().clone();
         match loaded {
@@ -1118,7 +1123,7 @@ fn Timeline() -> Element {
                 }
             }
         }
-        all.sort_by(|a, b| (b.1.post.time, b.1.post.id).cmp(&(a.1.post.time, a.1.post.id)));
+        all.sort_by_key(|e| std::cmp::Reverse((e.1.post.time, e.1.post.id)));
         // A reply whose parent is in the timeline is reachable via the
         // parent's thread — showing it top-level too duplicates it.
         let ids: std::collections::BTreeSet<([u8; 32], freebird_core::types::PostId)> =
@@ -1381,7 +1386,7 @@ fn AuthorPage(author: [u8; 32]) -> Element {
             }
         }
     }
-    posts.sort_by(|a, b| (b.post.time, b.post.id).cmp(&(a.post.time, a.post.id)));
+    posts.sort_by_key(|p| std::cmp::Reverse((p.post.time, p.post.id)));
     // Same rule as the home timeline: a reply whose parent is in the list is
     // reachable via the parent's thread — hide it top-level.
     {
@@ -1522,7 +1527,7 @@ fn merged_listings(legacy: &[([u8; 32], u64)], v2: &[([u8; 32], u64)]) -> Vec<([
         by_author.insert(a, t);
     }
     let mut v: Vec<([u8; 32], u64)> = by_author.into_iter().collect();
-    v.sort_by(|a, b| (b.1, b.0).cmp(&(a.1, a.0)));
+    v.sort_by_key(|e| std::cmp::Reverse((e.1, e.0)));
     v
 }
 
@@ -2239,16 +2244,17 @@ mod tests {
         let liar = SigningKey::generate(&mut OsRng);
         let unfetched = SigningKey::generate(&mut OsRng);
 
-        let mut pointers: Vec<InboxPointer> = Vec::new();
-        // Real follower announces twice (refollow) — must dedupe to one.
-        pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 1));
-        pointers.push(announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 2));
-        // Liar announces but their follow list doesn't contain owner.
-        pointers.push(announce(&liar, actions::FOLLOW_ANNOUNCE_TARGET, 3));
-        // Announcer whose feed hasn't arrived yet.
-        pointers.push(announce(&unfetched, actions::FOLLOW_ANNOUNCE_TARGET, 4));
-        // Ordinary reply pointer must not count as a follower.
-        pointers.push(announce(&real, PostId([7u8; 16]), 5));
+        let pointers: Vec<InboxPointer> = vec![
+            // Real follower announces twice (refollow) — must dedupe to one.
+            announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 1),
+            announce(&real, actions::FOLLOW_ANNOUNCE_TARGET, 2),
+            // Liar announces but their follow list doesn't contain owner.
+            announce(&liar, actions::FOLLOW_ANNOUNCE_TARGET, 3),
+            // Announcer whose feed hasn't arrived yet.
+            announce(&unfetched, actions::FOLLOW_ANNOUNCE_TARGET, 4),
+            // Ordinary reply pointer must not count as a follower.
+            announce(&real, PostId([7u8; 16]), 5),
+        ];
 
         let mut feeds: BTreeMap<[u8; 32], Option<FeedStateV1>> = BTreeMap::new();
         feeds.insert(

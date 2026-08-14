@@ -127,7 +127,7 @@ pub fn directory_params_v1() -> crate::legacy::LegacyDirectoryParameters {
 fn contract_key(wasm: &[u8], params_cbor: Vec<u8>) -> ContractKey {
     ContractKey::from_params_and_code(
         Parameters::from(params_cbor),
-        &ContractCode::from(wasm.to_vec()),
+        ContractCode::from(wasm.to_vec()),
     )
 }
 

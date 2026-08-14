@@ -3,3 +3,6 @@
 # derived address (see check-addresses in the Makefile). Bump deliberately.
 channel = "1.95.0"
 targets = ["wasm32-unknown-unknown"]
+# `make lint` needs clippy present even where rustup defaults to the minimal
+# profile (CI runners). Components do not affect codegen, so no wasm bytes move.
+components = ["clippy"]

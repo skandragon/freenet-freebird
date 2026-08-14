@@ -23,6 +23,13 @@ jobs:
           tool: wasm-tools
       - run: make check-imports-vendored
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: make lint
+
   test:
     runs-on: ubuntu-latest
     steps:
