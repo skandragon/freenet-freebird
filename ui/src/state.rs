@@ -153,9 +153,11 @@ pub static LEGACY_PROBE_FAILED: GlobalSignal<bool> = Signal::global(|| false);
 /// of an eternal spinner.
 pub static KEY_STORE_UNREACHABLE: GlobalSignal<bool> = Signal::global(|| false);
 
-/// Latest ghostkey-delegate sign flow result:
 /// Ok((scoped_payload, signature, certificate_pem)) or Err(user message).
-pub static GHOSTKEY_SIGN_RESULT: GlobalSignal<Option<Result<(Vec<u8>, Vec<u8>, String), String>>> =
+pub type GhostkeySignResult = Result<(Vec<u8>, Vec<u8>, String), String>;
+
+/// Latest ghostkey-delegate sign flow result.
+pub static GHOSTKEY_SIGN_RESULT: GlobalSignal<Option<GhostkeySignResult>> =
     Signal::global(|| None);
 pub static GHOSTKEY_HAS_IDENTITY: GlobalSignal<Option<bool>> = Signal::global(|| None);
 
@@ -285,6 +287,8 @@ impl View {
 
 pub static VIEW: GlobalSignal<View> = Signal::global(View::default);
 
+// Items follow this module; moving them above it would be pure churn.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,7 +31,7 @@ PLATFORM ?= linux/amd64
 PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
 DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
 
-.PHONY: all contracts delegate ui test check-imports check-imports-vendored check-addresses check-built check-legacy-wasm pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
+.PHONY: all contracts delegate ui test lint check-imports check-imports-vendored check-addresses check-built check-legacy-wasm pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
 
 all: test contracts delegate ui
 
@@ -199,6 +199,18 @@ test:
 	$(CARGO) test --workspace --exclude freebird-ui --exclude inbox-contract --exclude directory-contract --locked
 	$(CARGO) test -p inbox-contract -p directory-contract --locked
 	$(CARGO) test -p freebird-ui --locked
+
+# Clippy only — deliberately NO `cargo fmt --check`. rustfmt would rewrite
+# contract sources, and a release wasm embeds panic-location line numbers, so
+# a formatting sweep can shift bytes and rotate every derived address. Format
+# by hand, locally, and never across contracts/ or common/.
+#
+# Split the same way as `test`: a joint --workspace resolve unifies the
+# contract crates' default features and duplicates their entry-point symbols.
+lint:
+	$(CARGO) clippy --workspace --exclude freebird-ui --exclude inbox-contract --exclude directory-contract --all-targets --locked -- -D warnings
+	$(CARGO) clippy -p inbox-contract -p directory-contract --all-targets --locked -- -D warnings
+	$(CARGO) clippy -p freebird-ui --all-targets --locked -- -D warnings
 
 # Site first, then the control cell: the advertised build must never get
 # ahead of the bundle users can actually load.

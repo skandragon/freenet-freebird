@@ -528,9 +528,9 @@ mod tests {
         fake.ptr.replier = r.key;
         fake.ptr.fingerprint = r.cred.fingerprint();
         let fake = AuthorizedReplyPointer::new(fake.ptr, &other.sk);
-        let mut delta = delta_of(vec![&r], vec![fake]);
+        let delta = delta_of(vec![&r], vec![fake]);
         let clone = s.clone();
-        assert!(s.apply_delta(&clone, &p, &mut delta).is_err());
+        assert!(s.apply_delta(&clone, &p, &delta).is_err());
     }
 
     /// Regression (review finding #1): one Ghost Key attesting a SECOND

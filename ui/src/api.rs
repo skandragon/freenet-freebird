@@ -1463,7 +1463,7 @@ fn spawn_local_task<F: std::future::Future<Output = ()> + 'static>(fut: F) {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(fut);
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = fut;
+    drop(fut);
 }
 
 fn dispatch_ghostkey(payload: &[u8]) {
@@ -1514,9 +1514,11 @@ pub enum TrackedKind {
 
 pub static TRACKED: GlobalSignal<BTreeMap<String, TrackedKind>> = Signal::global(BTreeMap::new);
 
+/// Per-author `(generation, instance id)` of the newest anchor cell seen.
+type AnchorOrder = BTreeMap<[u8; 32], (u64, [u8; 32])>;
+
 /// Newest anchor-cell order key seen per author (LWW guard for ANCHORS).
-static ANCHOR_ORDER: GlobalSignal<BTreeMap<[u8; 32], (u64, [u8; 32])>> =
-    Signal::global(BTreeMap::new);
+static ANCHOR_ORDER: GlobalSignal<AnchorOrder> = Signal::global(BTreeMap::new);
 
 fn track(key: ContractKey, kind: TrackedKind) {
     track_id(*key.id(), kind);
@@ -1530,6 +1532,8 @@ fn lookup(key: &ContractKey) -> Option<TrackedKind> {
     TRACKED.read().get(&key.id().to_string()).copied()
 }
 
+// Items follow this module; moving them above it would be pure churn.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::{
