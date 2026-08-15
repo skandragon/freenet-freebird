@@ -6,6 +6,7 @@ timestamp: 2026-08-14T00:00:00Z
 covers:
   - Makefile
   - .github/workflows/ci.yml
+  - ui/src/fixtures.rs
 ---
 
 ## The three-resolve split
@@ -33,6 +34,39 @@ dependency, so nothing duplicates. [#51]
   container and asserts the reference hashes. It does not diff the grandfathered
   vendored bytes, so it can never force a rotation.
 - `lint` — clippy with warnings denied, same three-resolve split.
+
+## Legacy fixtures: pinning the mirror to the old contract's behavior
+
+`ui/src/legacy.rs` mirrors the wire types of the build in
+`scripts/live-build.txt`. Every test in that module signs with the mirror and
+verifies with the mirror, so it passes for any self-consistent shape; the
+wire-format KATs are what pin the shape. Neither pins the *behavior* the
+deployed contract enforces — whether it accepts a record we would build, or
+merges a stream of deltas the way our `merge` does.
+
+`ui/fixtures/` closes that. `make fixtures` drives the ACTUAL vendored
+`*_v1.wasm` on a node: PUT a seed state, send deltas built from the mirror
+types, capture what the old contract merged. The committed bytes are therefore
+bytes the deployed contract validated and wrote, and the two decode tests run
+against them with no node, in CI. Both are load-bearing — verified by mutation:
+renaming a mirrored field fails the decode test, and inverting the LWW
+comparison in `merge` fails only the semantics test.
+
+MUST regenerate against an **isolated local node**, never the 7509 tunnel. The
+legacy directory is one global address for the whole network, so synthetic
+listings PUT through the live node land in every user's Discover. See the
+`local-dev` skill; `make fixtures` defaults to port 7511 for that reason.
+
+The corpus is synthetic and deterministic — authors are seed bytes, times are
+literals — so it carries no live user data and regenerates byte-identically.
+
+Attested records are deliberately absent. `AttestationV1::verify` takes a
+`master_override` that contracts pass as `None`, so the deployed wasm anchors
+on ghostkey_lib's compiled-in Freenet master; a chain minted by
+`freebird-core`'s `test-fixtures` feature verifies only under an override the
+real bytes never take. Building a test-master variant of the old contract would
+produce different bytes and stop being the old contract. The attested paths
+stay on the unit tests that can pass an override.
 
 ## No formatting check, deliberately
 

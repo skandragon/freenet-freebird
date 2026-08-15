@@ -53,3 +53,9 @@ web-sys = { version = "0.3", features = [
     "HtmlCanvasElement",
     "CanvasRenderingContext2d",
 ] }
+
+# Native test-only: the legacy-fixture generator drives a local node over the
+# same websocket API the browser build uses. Never compiled into the wasm.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "net"] }
+tokio-tungstenite = "0.27"
