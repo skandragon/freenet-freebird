@@ -323,6 +323,21 @@ pub async fn publish_anchor(sk: &SigningKey) -> Result<(), String> {
     .await
 }
 
+/// Re-GET our own feed alone, to see what the network actually holds.
+///
+/// `fetch_feed` already tracked and subscribed it, so this asks again and
+/// nothing more — no second subscribe, and none of the inbox/anchor/legacy
+/// GETs that would be pure noise in a poll loop.
+pub async fn refetch_own_feed(vk: &VerifyingKey) -> Result<(), String> {
+    send(ClientRequest::ContractOp(ContractRequest::Get {
+        key: keys::feed_instance_id(vk),
+        return_contract_code: false,
+        subscribe: false,
+        blocking_subscribe: false,
+    }))
+    .await
+}
+
 /// GET + subscribe someone's feed, inbox, and anchor cell by author key.
 /// During the dual-read window (`read_v1_inbox` flag, default on) the
 /// legacy v1 inbox is fetched too, so pre-migration replies stay visible.
