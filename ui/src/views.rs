@@ -1,6 +1,7 @@
 //! UI components. One file — the MVP surface is small.
 
 use dioxus::prelude::*;
+use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::FeedStateV1;
 use freebird_core::types::{AuthorizedPost, PostRef};
 
@@ -1704,9 +1705,15 @@ fn FollowBox() -> Element {
 /// their signed follow list — no forged "X follows you", and unfollows age
 /// out because the claim re-verifies against the live list. Anonymous
 /// followers announce and appear like anyone else (issue #23).
+///
+/// Dual-read (issue #93): a follower who has not yet run `migrate_v1` has an
+/// empty v2 follow list, so their claim only confirms against their legacy
+/// list. `state::follows_of` picks the current list of the two — the rule
+/// itself is unchanged, only which signed list counts.
 fn confirmed_followers(
     pointers: &[InboxPointer],
     feeds: &std::collections::BTreeMap<[u8; 32], Option<FeedStateV1>>,
+    legacy: &std::collections::BTreeMap<[u8; 32], Option<LegacyFeedState>>,
     owner: &[u8; 32],
 ) -> Vec<[u8; 32]> {
     let mut out: Vec<[u8; 32]> = pointers
@@ -1717,10 +1724,9 @@ fn confirmed_followers(
     out.sort();
     out.dedup();
     out.retain(|k| {
-        feeds
-            .get(k)
-            .and_then(|f| f.as_ref())
-            .is_some_and(|f| f.follows.follows.follows.contains(owner))
+        let v2 = feeds.get(k).and_then(|f| f.as_ref()).map(|f| &f.follows.follows);
+        let old = legacy.get(k).and_then(|f| f.as_ref()).map(|f| &f.follows.follows);
+        follows_of(v2, old).contains(owner)
     });
     out
 }
@@ -1733,7 +1739,8 @@ fn FollowersBox() -> Element {
     let followers = {
         let pointers = merged_pointers(&author);
         let feeds = FEEDS.read();
-        confirmed_followers(&pointers, &feeds, &author)
+        let legacy = LEGACY_FEEDS.read();
+        confirmed_followers(&pointers, &feeds, &legacy, &author)
     };
     let own_follows: std::collections::BTreeSet<[u8; 32]> = effective_follows(&author);
 
@@ -2103,6 +2110,37 @@ mod tests {
         }
     }
 
+    /// A v2 feed still at the untouched rotation seed (version 0) — what an
+    /// author who has not yet run `migrate_v1` reads back as.
+    fn seed_feed(sk: &SigningKey) -> FeedStateV1 {
+        let mut feed = feed_following(sk, &[]);
+        feed.follows = AuthorizedFollows::new(
+            FollowsV1 {
+                follows: Default::default(),
+                version: 0,
+            },
+            sk,
+        );
+        feed
+    }
+
+    /// A pre-#64 feed. Signed with the current scheme rather than bare CBOR:
+    /// legacy signatures are checked at ingest (`api::dispatch`), never here.
+    fn legacy_feed_following(sk: &SigningKey, follows: &[[u8; 32]]) -> LegacyFeedState {
+        LegacyFeedState {
+            profile: AuthorizedProfile::new(ProfileV1::default(), sk),
+            follows: AuthorizedFollows::new(
+                FollowsV1 {
+                    follows: follows.iter().copied().collect(),
+                    version: 1,
+                },
+                sk,
+            ),
+            attestation: freebird_core::feed::legacy::LegacyAttestationSlot(None),
+            posts: Default::default(),
+        }
+    }
+
     fn announce(sk: &SigningKey, target_post: PostId, time: u64) -> InboxPointer {
         let vk = sk.verifying_key();
         InboxPointer {
@@ -2241,6 +2279,8 @@ mod tests {
         let real = SigningKey::generate(&mut OsRng);
         let liar = SigningKey::generate(&mut OsRng);
         let unfetched = SigningKey::generate(&mut OsRng);
+        let unmigrated = SigningKey::generate(&mut OsRng);
+        let left = SigningKey::generate(&mut OsRng);
 
         let pointers: Vec<InboxPointer> = vec![
             // Real follower announces twice (refollow) — must dedupe to one.
@@ -2250,6 +2290,10 @@ mod tests {
             announce(&liar, actions::FOLLOW_ANNOUNCE_TARGET, 3),
             // Announcer whose feed hasn't arrived yet.
             announce(&unfetched, actions::FOLLOW_ANNOUNCE_TARGET, 4),
+            // v1-era follower: seed v2 feed, follow only in the legacy list.
+            announce(&unmigrated, actions::FOLLOW_ANNOUNCE_TARGET, 6),
+            // Migrated, then unfollowed: stale legacy list must not resurrect.
+            announce(&left, actions::FOLLOW_ANNOUNCE_TARGET, 7),
             // Ordinary reply pointer must not count as a follower.
             announce(&real, PostId([7u8; 16]), 5),
         ];
@@ -2264,10 +2308,27 @@ mod tests {
             Some(feed_following(&liar, &[])),
         );
         feeds.insert(unfetched.verifying_key().to_bytes(), None);
+        feeds.insert(unmigrated.verifying_key().to_bytes(), Some(seed_feed(&unmigrated)));
+        feeds.insert(left.verifying_key().to_bytes(), Some(feed_following(&left, &[])));
 
+        let mut legacy: BTreeMap<[u8; 32], Option<LegacyFeedState>> = BTreeMap::new();
+        legacy.insert(
+            unmigrated.verifying_key().to_bytes(),
+            Some(legacy_feed_following(&unmigrated, &[owner])),
+        );
+        legacy.insert(
+            left.verifying_key().to_bytes(),
+            Some(legacy_feed_following(&left, &[owner])),
+        );
+
+        let mut expected = vec![
+            real.verifying_key().to_bytes(),
+            unmigrated.verifying_key().to_bytes(),
+        ];
+        expected.sort();
         assert_eq!(
-            confirmed_followers(&pointers, &feeds, &owner),
-            vec![real.verifying_key().to_bytes()]
+            confirmed_followers(&pointers, &feeds, &legacy, &owner),
+            expected
         );
     }
 

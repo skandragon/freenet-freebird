@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use ed25519_dalek::SigningKey;
 use freebird_core::feed::legacy::LegacyFeedState;
 use freebird_core::feed::FeedStateV1;
-use freebird_core::types::ProfileV1;
+use freebird_core::types::{FollowsV1, ProfileV1};
 use freenet_stdlib::client_api::WebApi;
 use inbox_contract::state::InboxStateV3;
 
@@ -401,13 +401,25 @@ pub fn effective_follows(author: &[u8; 32]) -> BTreeSet<[u8; 32]> {
         .get(author)
         .and_then(|f| f.as_ref())
         .map(|f| f.follows.follows.clone());
-    match &v2 {
+    let legacy = LEGACY_FEEDS
+        .read()
+        .get(author)
+        .and_then(|f| f.as_ref())
+        .map(|f| f.follows.follows.clone());
+    follows_of(v2.as_ref(), legacy.as_ref())
+}
+
+/// The precedence rule behind [`effective_follows`], as a pure function over
+/// the two signed lists so callers that already hold the maps borrowed
+/// (`views::confirmed_followers`) apply exactly the same rule. Both lists are
+/// author-signed and verified at ingest, so either is trustworthy; what the
+/// rule decides is *which* one is current — a migrated author's v2 list wins,
+/// so an unfollow made after migrating is not undone by the stale legacy list.
+pub fn follows_of(v2: Option<&FollowsV1>, legacy: Option<&FollowsV1>) -> BTreeSet<[u8; 32]> {
+    match v2 {
         Some(f) if written_since_rotation(f.version) => f.follows.clone(),
-        _ => LEGACY_FEEDS
-            .read()
-            .get(author)
-            .and_then(|f| f.as_ref())
-            .map(|f| f.follows.follows.follows.clone())
-            .unwrap_or_else(|| v2.map(|f| f.follows).unwrap_or_default()),
+        _ => legacy
+            .map(|f| f.follows.clone())
+            .unwrap_or_else(|| v2.map(|f| f.follows.clone()).unwrap_or_default()),
     }
 }
