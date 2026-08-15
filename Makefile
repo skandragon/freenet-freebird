@@ -31,7 +31,7 @@ PLATFORM ?= linux/amd64
 PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
 DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
 
-.PHONY: all contracts delegate ui test lint check-imports check-imports-vendored check-addresses check-built check-legacy-wasm pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
+.PHONY: all contracts delegate ui test lint check-imports check-imports-vendored check-addresses check-built check-legacy-wasm check-site-staged pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
 
 all: test contracts delegate ui
 
@@ -181,9 +181,32 @@ check-imports-vendored:
 # `make contracts`/`make delegate`) is a deliberate, reviewed act guarded by
 # check-addresses — done only when a contract's source or Cargo.lock actually
 # changes; the ui build never does.
+#
+# The output dir is wiped first: dx hashes each bundle into its filename and
+# never removes the previous one, and publish-ui.sh ships the directory
+# wholesale — so every stale build's 2-4MB wasm rode along inside the website
+# contract (issue #83: 62 files / 3.6MB vs 3 files / 735KB). Only the bundle
+# named in index.html is ever fetched; the rest is freight every hosting node
+# stores and every first-time visitor waits on. The cost is re-emitting the
+# assets each build, which is nothing next to the wasm compile.
+UI_SITE_DIR := $(CARGO_TARGET)/dx/freebird-ui/release/web/public
 ui:
 	$(MAKE) check-addresses
+	rm -rf $(UI_SITE_DIR)
 	cd ui && $(DX) build --release
+	$(MAKE) check-site-staged
+
+# Backstop for the wipe above: the staged site must carry exactly one app
+# bundle. If this ever fires, something republished into a dirty output dir
+# and the extra megabytes would go on the network permanently.
+check-site-staged:
+	@n=$$(ls $(UI_SITE_DIR)/assets/*_bg-*.wasm 2>/dev/null | wc -l | tr -d ' '); \
+	  [ "$$n" = 1 ] || { \
+	    echo "ERROR: $$n app wasm bundles staged in $(UI_SITE_DIR) (expected 1)."; \
+	    echo "Stale bundles ship inside the website contract — see issue #83."; \
+	    echo "Fix: rm -rf $(UI_SITE_DIR) && make ui"; \
+	    exit 1; }
+	@echo "site staged: one app bundle, $$(du -sh $(UI_SITE_DIR) | cut -f1)"
 
 # The UI tests build separately: a joint --workspace build feature-unifies the
 # contract crates (default features re-enable their #[no_mangle] entry points)
