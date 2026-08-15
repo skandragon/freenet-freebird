@@ -27,6 +27,22 @@ use crate::state::*;
 /// are blake3 output; colliding with this ASCII tag is a 2^-128 event.
 pub const FOLLOW_ANNOUNCE_TARGET: PostId = PostId(*b"freebird:follow!");
 
+/// Stamp for `migrate_v1`'s follow announcements: 2026-08-13T00:00:00Z, the
+/// v1→v2 rotation. A CONSTANT on purpose (issue #91).
+///
+/// `PostId::compute` binds the time, so stamping these with the run's own
+/// clock made the id per-run. The run's start time came from the delegate
+/// marker, whose Store is fire-and-forget (`api::kv_request` discards the
+/// answer) — so a dropped marker gave the next session a fresh `now_ms()`, a
+/// fresh id, and a second "followed you" pointer in every followed author's
+/// inbox. The inbox dedups by `reply_post`, not by content, so it could not
+/// collapse them; each repeat burned one of the migrator's MAX_PER_ANON_KEY
+/// (3) slots there, evicting their real replies.
+///
+/// Deriving the id from a constant makes the announcement a pure function of
+/// the account, so any number of re-runs collapse to one pointer.
+const MIGRATION_ANNOUNCE_MS: u64 = 1_786_579_200_000;
+
 fn empty_delta() -> FeedStateV1Delta {
     FeedStateV1Delta {
         profile: None,
@@ -323,9 +339,9 @@ fn identity_to_migrate(
 /// them, so the window closes cleanly only once enough of the network has
 /// run this. Nothing is destroyed either way — the v1 state stays where it is.
 ///
-/// `started_ms` is the in-progress marker's stamp, reused across retries so
-/// a resumed run re-derives identical follow announcements.
-pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
+/// Re-runnable: every write it makes is idempotent, and the marker it
+/// stamps at the end is the only thing that stops it.
+pub async fn migrate_v1() -> Result<(), String> {
     let sk = signing_key()?;
     let author = sk.verifying_key().to_bytes();
     let legacy = LEGACY_FEEDS
@@ -335,16 +351,6 @@ pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
         .flatten()
         .ok_or("legacy feed not loaded")?;
     let current = own_feed().ok_or("feed not loaded")?;
-
-    // Mark in-progress BEFORE the first write: an interrupted run must resume
-    // with the SAME stamp, or its follow announcements get fresh PostIds and
-    // pile up as duplicate pointers in every followed author's inbox.
-    api::kv_request(FreebirdDelegateRequest::Store {
-        key: V1_MIGRATION_KEY.into(),
-        value: started_ms.to_string().into_bytes(),
-    })
-    .await?;
-    *V1_MIGRATION.write() = Some(V1Migration::Running(started_ms));
 
     let posts = posts_to_migrate(&legacy.posts.posts, &current.posts, &sk);
     let (profile, follows) = identity_to_migrate(&legacy, &current, &sk);
@@ -384,9 +390,8 @@ pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
     // Follow announcements only ever existed as inbox pointers, so the whole
     // follower list dies with the window. Re-announce every follow in the list
     // the migration just settled on — the restored legacy one, or the v2 one
-    // when that was already newer — stamped with the migration's start time
-    // (see `started_ms` above).
-    let announce_id = PostId::compute(&sk.verifying_key(), started_ms, "follow", &None);
+    // when that was already newer.
+    let announce_id = PostId::compute(&sk.verifying_key(), MIGRATION_ANNOUNCE_MS, "follow", &None);
     let announce_to = follows.as_ref().unwrap_or(&current.follows);
     for target in &announce_to.follows.follows {
         send_inbox_pointer(
@@ -395,7 +400,7 @@ pub async fn migrate_v1(started_ms: u64) -> Result<(), String> {
             *target,
             FOLLOW_ANNOUNCE_TARGET,
             announce_id,
-            started_ms,
+            MIGRATION_ANNOUNCE_MS,
         )
         .await?;
     }
@@ -681,6 +686,24 @@ mod tests {
         };
         let signature = sk.sign(&freebird_core::to_cbor(&post).unwrap());
         AuthorizedPost { post, signature }
+    }
+
+    /// Issue #91: the migration's follow announcement must not be stamped
+    /// with anything per-run, and its constant must stay in the past — the
+    /// inbox drops pointers beyond `now + MAX_FUTURE_MS`, so a stamp nudged
+    /// into the future would make every migrated announcement vanish with no
+    /// error anywhere.
+    #[test]
+    fn migration_announcement_is_a_pure_function_of_the_account() {
+        let vk = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let id = PostId::compute(&vk, MIGRATION_ANNOUNCE_MS, "follow", &None);
+        assert_eq!(
+            id,
+            PostId::compute(&vk, MIGRATION_ANNOUNCE_MS, "follow", &None)
+        );
+        // The failure mode it replaces: a per-run stamp gives a per-run id.
+        assert_ne!(id, PostId::compute(&vk, keys::now_ms(), "follow", &None));
+        assert!(MIGRATION_ANNOUNCE_MS < keys::now_ms());
     }
 
     #[test]

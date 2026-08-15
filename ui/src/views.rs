@@ -635,12 +635,10 @@ pub fn App() -> Element {
     // a migration complete that never read its source.
     let mut migration_started = use_signal(|| false);
     use_effect(move || {
-        let started_ms = match *V1_MIGRATION.read() {
-            Some(V1Migration::Pending) => keys::now_ms(),
-            Some(V1Migration::Running(ms)) => ms,
-            // Done, or the delegate hasn't answered yet.
-            _ => return,
-        };
+        // Done, or the delegate hasn't answered yet.
+        if *V1_MIGRATION.read() != Some(V1Migration::Pending) {
+            return;
+        }
         let Some(author) = own_author() else { return };
         let feeds_loaded = FEEDS.read().get(&author).is_some_and(Option::is_some)
             && LEGACY_FEEDS
@@ -650,7 +648,7 @@ pub fn App() -> Element {
         if feeds_loaded && !*migration_started.peek() {
             migration_started.set(true);
             spawn(async move {
-                if let Err(e) = actions::migrate_v1(started_ms).await {
+                if let Err(e) = actions::migrate_v1().await {
                     api::log(&format!(
                         "v1 migration incomplete, retries next session: {e}"
                     ));
