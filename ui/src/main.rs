@@ -1,6 +1,8 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod actions;
 mod api;
+#[cfg(test)]
+mod fixtures;
 mod ghostkey;
 mod keys;
 mod legacy;

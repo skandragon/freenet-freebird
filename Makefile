@@ -31,7 +31,7 @@ PLATFORM ?= linux/amd64
 PLATFORM_ARG := $(if $(PLATFORM),--platform $(PLATFORM),)
 DOCKER_RUN := docker run --rm $(PLATFORM_ARG) -u $$(id -u):$$(id -g) -v $(CURDIR):/build -w /build -e CARGO_TARGET_DIR=/tmp/target $(DOCKER_IMG)
 
-.PHONY: all contracts delegate ui test lint check-imports check-imports-vendored check-addresses check-built check-legacy-wasm check-site-staged pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
+.PHONY: all contracts delegate ui test fixtures lint check-imports check-imports-vendored check-addresses check-built check-legacy-wasm check-site-staged pin-hashes publish clean wasm-repro build-docker-image build-docker repro-hashes verify-repro
 
 all: test contracts delegate ui
 
@@ -222,6 +222,26 @@ test:
 	$(CARGO) test --workspace --exclude freebird-ui --exclude inbox-contract --exclude directory-contract --locked
 	$(CARGO) test -p inbox-contract -p directory-contract --locked
 	$(CARGO) test -p freebird-ui --locked
+
+# Regenerate the legacy fixtures in ui/fixtures/ (see ui/src/fixtures.rs).
+#
+# These are captured by driving the ACTUAL vendored *_v1.wasm on a node, so
+# the committed bytes are bytes the DEPLOYED contract validated and merged —
+# the one check that pins ui/src/legacy.rs to the old contract's BEHAVIOR and
+# not merely to its wire shape. Everything else in that module signs and
+# verifies through the same mirror and so passes for any self-consistent shape.
+#
+# NODE must be an ISOLATED local node, never the 7509 tunnel: the legacy
+# directory is one global address for the whole network, so these synthetic
+# listings would land in every user's Discover. Stand one up per the local-dev
+# skill; the default port is deliberately not 7509.
+#
+# Not part of `test` or CI — the decode tests run against the committed bytes
+# with no node at all.
+fixtures:
+	FREEBIRD_FIXTURE_NODE=$(if $(NODE),$(NODE),ws://127.0.0.1:7511/v1/contract/command?encodingProtocol=native) \
+	  $(CARGO) test -p freebird-ui --locked -- --ignored generate_legacy_fixtures --nocapture
+	$(CARGO) test -p freebird-ui --locked fixtures::tests
 
 # Clippy only — deliberately NO `cargo fmt --check`. rustfmt would rewrite
 # contract sources, and a release wasm embeds panic-location line numbers, so
