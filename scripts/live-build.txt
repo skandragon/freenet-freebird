@@ -11,4 +11,4 @@
 # UPDATE THIS ONLY AS PART OF A PUBLISH: after `make publish`, set it to the
 # commit that was published and re-vendor the `_v1` blobs from it (they are
 # then, by definition, the previous live generation for the NEXT release).
-d873a2a
+03e8157
