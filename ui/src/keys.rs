@@ -348,9 +348,19 @@ mod tests {
             // repost" reasoning was wrong in practice (issue #81): re-seating
             // needs every listed author to return and every replier to
             // repost, so Discover went empty and threads lost their replies.
-            // The window now reads what the network actually holds.
+            //
+            // 03e8157 was published 2026-08-16 (build 87), so the live build
+            // is now THIS commit and the `_v1` blobs were re-vendored from
+            // it. Every feed/inbox/avatar `_v1` row below is therefore
+            // identical to its current-generation row, and the directory's
+            // is code(current) + the frozen `-v2` params mirror — an address
+            // no build has ever written to. That is the resting state
+            // between releases, and why every window is closed
+            // (`api::WINDOW_DEFAULT`). The next rotation moves the current
+            // rows, leaves the `_v1` rows at 03e8157, re-snapshots the
+            // mirrors in `crate::legacy`, and re-opens the windows it needs.
             "9fGcxYMNAdMET8h9mBsBobCHqHKV2YzxCfAN68rB8JBQ",
-            "Lci4MiN15tQ41PKqkzbj2mi9qXMuphQG8vU4tqt5CJG",
+            "97js9EMKXpgUnT2F4pDyE8BjgoLLfC6oDqvDPfbozhN2",
             "8qkgr35PQcjn3TfNZYiJEexSf9FZsetdunpYx53n2ztF",
             // The PoW difficulty cell (#66) is deliberately NOT pinned here:
             // freebird-pow's `test-publisher` feature swaps the compiled
@@ -360,11 +370,11 @@ mod tests {
             // wasm bytes + derivation by the control-cell entry above, and
             // the publisher key by freebird-pow's publisher_key_matches_control.
             "3@8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
-            "8Drbx64Ahoc6o6MkBZQ15xGBaDCiNLT9t2TXJf6sSR5Q",
+            "8iQ3nkukYF4Ux7Cixrtm8CBwc9J7ZZRZCxawxo14gatV",
             "3@6rqG9SwSeXdG7BagLgoEFLZ2A7UVwsMA3yxcYgsVrsv3",
-            "sCJ9HQJGnHE1NGEWEC73CpWBPymT2ievqDW4iXh7Pgb",
+            "6rqG9SwSeXdG7BagLgoEFLZ2A7UVwsMA3yxcYgsVrsv3",
             "2@F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
-            "577KsAVancBcWwQfbpYrF9DN4FPzBBXrvuEALf2Gf67g",
+            "F3dpVgrpZMwXKT92z17gaVCYg3CraPNgy3NdvAGsRGRa",
             "7ZSANRfpAfZWZttBsAzGEpvZHKmqQMvSp1S8FtLgeYf9",
         ];
         assert_eq!(got, golden, "derived contract addresses ROTATED");
@@ -382,16 +392,34 @@ mod tests {
     /// bug the mirror exists to prevent). The real oracle is the CBOR golden
     /// in `legacy::tests::legacy_params_wire_format_kat`.
     ///
-    /// If a future release rotates only SOME roles, the un-rotated ones'
-    /// `_v1` blob is legitimately identical to the current one and the
-    /// matching assertion below must be dropped along with that role's
-    /// legacy GET — a window onto your own address retains nothing.
+    /// Stated as an equivalence rather than a list of `assert_ne!`s, because
+    /// which roles have a distinct legacy address changes every release: a
+    /// publish re-vendors `_v1` from the build it just published, so between
+    /// releases every blob equals its current counterpart, and a rotation
+    /// then separates only the roles it touched. The rule that holds in both
+    /// states is the one below — a window may be open only where the address
+    /// actually differs. Hand-editing a list of `assert_ne!`s each cycle is
+    /// how the window came to point at a dead generation in issue #81.
+    ///
+    /// The directory is exempt from the reverse direction: its address is
+    /// code + params, so a frozen params mirror can hold it apart from the
+    /// current address even when the blobs match. That is a phantom, not a
+    /// window, which is why it stays closed too.
     #[test]
-    fn each_generation_derives_a_distinct_address() {
+    fn a_window_is_open_only_where_the_address_differs() {
         let a = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
-        assert_ne!(feed_key(&a), feed_key_v1(&a));
-        assert_ne!(inbox_key(&a), inbox_key_v1(&a));
-        assert_ne!(avatar_key(&a), avatar_key_v1(&a));
-        assert_ne!(directory_key(), directory_key_v1());
+        for (distinct, role) in [
+            (feed_key(&a) != feed_key_v1(&a), "feed"),
+            (inbox_key(&a) != inbox_key_v1(&a), "inbox"),
+            (avatar_key(&a) != avatar_key_v1(&a), "avatar"),
+            (directory_key() != directory_key_v1(), "directory"),
+        ] {
+            assert!(
+                !crate::api::WINDOW_DEFAULT || distinct,
+                "{role}: dual-read window is open onto an address that is not \
+                 a distinct live generation — it GETs our own contract (or a \
+                 phantom) and retains nothing"
+            );
+        }
     }
 }

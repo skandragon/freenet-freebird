@@ -338,9 +338,25 @@ pub async fn refetch_own_feed(vk: &VerifyingKey) -> Result<(), String> {
     .await
 }
 
+/// Default for every `read_v1_*` dual-read flag.
+///
+/// OFF since the 03e8157 publish. `_v1` is re-vendored from the live build as
+/// part of publishing, so between releases the legacy blob IS the current one
+/// and the GET would fetch our own address — a window onto yourself retains
+/// nothing. The directory's would be worse than useless: its params mirror
+/// still names seed `-v2` while the contract is at `-v3`, so code+params
+/// address a contract no build has ever written to.
+///
+/// A rotation re-opens the windows it needs, in the same change that
+/// re-snapshots the outgoing wire types in `crate::legacy` — see
+/// kb/specs/dual-read-window.md. The publisher can also flip one on via the
+/// control cell, which is only meaningful once a rotation has moved the
+/// current address away from the legacy one.
+pub(crate) const WINDOW_DEFAULT: bool = false;
+
 /// GET + subscribe someone's feed, inbox, and anchor cell by author key.
-/// During the dual-read window (`read_v1_inbox` flag, default on) the
-/// legacy v1 inbox is fetched too, so pre-migration replies stay visible.
+/// During a dual-read window (`read_v1_inbox` flag) the legacy inbox is
+/// fetched too, so pre-migration replies stay visible.
 pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
     // Pending placeholder so effects don't re-spawn the fetch every render
@@ -371,7 +387,7 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
         blocking_subscribe: false,
     }))
     .await?;
-    if flag_bool("read_v1_inbox", true) {
+    if flag_bool("read_v1_inbox", WINDOW_DEFAULT) {
         track(keys::inbox_key_v1(&vk), TrackedKind::LegacyInbox(author));
         send(ClientRequest::ContractOp(ContractRequest::Get {
             key: keys::inbox_instance_id_v1(&vk),
@@ -381,7 +397,7 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
         }))
         .await?;
     }
-    if flag_bool("read_v1_feed", true) {
+    if flag_bool("read_v1_feed", WINDOW_DEFAULT) {
         LEGACY_FEEDS.write().entry(author).or_insert(None);
         track(keys::feed_key_v1(&vk), TrackedKind::LegacyFeed(author));
         send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -402,7 +418,7 @@ pub async fn fetch_feed(author: [u8; 32]) -> Result<(), String> {
 /// on the previous build lives only there (issue #81).
 pub async fn fetch_avatar(author: [u8; 32]) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(&author).map_err(|e| e.to_string())?;
-    let legacy = flag_bool("read_v1_avatar", true);
+    let legacy = flag_bool("read_v1_avatar", WINDOW_DEFAULT);
     // Seat the "requested" sentinels only AFTER both sends succeed. Seating
     // first looks harmless but strands the caller: `send` fails while the
     // socket is still connecting, the entry is nonetheless present, every
@@ -509,7 +525,7 @@ pub async fn fetch_directory() -> Result<(), String> {
         blocking_subscribe: false,
     }))
     .await?;
-    if flag_bool("read_v1_directory", true) {
+    if flag_bool("read_v1_directory", WINDOW_DEFAULT) {
         track(keys::directory_key_v1(), TrackedKind::LegacyDirectory);
         send(ClientRequest::ContractOp(ContractRequest::Get {
             key: keys::directory_instance_id_v1(),
